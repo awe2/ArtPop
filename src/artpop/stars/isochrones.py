@@ -15,7 +15,8 @@ from .. import MIST_PATH
 from ..log import logger
 from ..filters import phot_system_list, get_filter_names
 from ..filters import load_zero_point_converter
-from ..util import check_units, fetch_mist_grid_if_needed
+from ..util import (check_units, fetch_mist_grid_if_needed,
+                    mist_version_layout, DEFAULT_MIST_VERSION)
 
 
 __all__ = ['fetch_mist_iso_cmd', 'Isochrone', 'MISTIsochrone']
@@ -525,8 +526,23 @@ class Isochrone(object):
         return mass
 
 
+def _feh_token(feh, version):
+    """Encode [Fe/H] the way this MIST release names its files."""
+    sign = 'm' if feh < 0 else 'p'
+    if str(version) == '1.2':
+        return f'{sign}{abs(feh):.2f}'            # m1.50
+    return f'{sign}{int(round(abs(feh) * 100)):03d}'   # m150
+
+
+def _afe_token(a_over_fe):
+    """Encode [a/Fe] for MIST v2.5 file names: -0.2 -> 'm2', +0.4 -> 'p4'."""
+    sign = 'm' if a_over_fe < 0 else 'p'
+    return f'{sign}{int(round(abs(a_over_fe) * 10))}'
+
+
 def fetch_mist_iso_cmd(log_age, feh, phot_system, mist_path=MIST_PATH,
-                       v_over_vcrit=0.4):
+                       v_over_vcrit=0.4, version=DEFAULT_MIST_VERSION,
+                       a_over_fe=0.0):
     """
     Fetch MIST isochrone grid.
 
@@ -544,23 +560,31 @@ def fetch_mist_iso_cmd(log_age, feh, phot_system, mist_path=MIST_PATH,
     v_over_vcrit : float, optional
         Rotation rate divided by the critical surface linear velocity. Current
         options are 0.4 (default) and 0.0.
+    version : str, optional
+        MIST release, ``'1.2'`` (default) or ``'2.5'``.
+    a_over_fe : float, optional
+        Alpha enhancement [a/Fe]. MIST v2.5 grids it at -0.2, 0.0, 0.2, 0.4 and
+        0.6; v1.2 has only 0.0 and any other value is an error there.
 
     Returns
     -------
     iso_cmd : `~numpy.ndarray`
         Structured ``numpy`` array with isochrones and stellar magnitudes.
     """
+    key, layout = mist_version_layout(version)
+    p = phot_str_helper[phot_system.lower()]
+
+    if not layout['has_a_over_fe'] and abs(a_over_fe) > 1e-8:
+        raise ValueError(
+            f'MIST v{key} provides [a/Fe] = 0.0 only; use version="2.5" for '
+            f'a_over_fe={a_over_fe}.')
 
     # fetch the mist grid if necessary
-    fetch_mist_grid_if_needed(phot_system, v_over_vcrit, mist_path)
+    path = fetch_mist_grid_if_needed(p, v_over_vcrit, mist_path, version=key)
 
-    v = f'{v_over_vcrit:.1f}'
-    ver = 'v1.2'
-    p = phot_str_helper[phot_system.lower()]
-    path = os.path.join(mist_path, 'MIST_' + ver + f'_vvcrit{v}_' + p)
-    sign = 'm' if feh < 0 else 'p'
-    fn = f'MIST_{ver}_feh_{sign}{abs(feh):.2f}_afe_p0.0_vvcrit{v}_{p}.iso.cmd'
-    fn = os.path.join(path, fn)
+    fn = os.path.join(path, layout['iso_file'].format(
+        v=f'{float(v_over_vcrit):.1f}', p=p,
+        feh=_feh_token(feh, key), afe=_afe_token(a_over_fe)))
     iso_cmd = IsoCmdReader(fn, verbose=False)
     iso_cmd = iso_cmd.isocmds[iso_cmd.age_index(log_age)]
     return iso_cmd
@@ -608,14 +632,31 @@ class MISTIsochrone(Isochrone):
     _feh_min = _feh_grid.min()
     _feh_max = _feh_grid.max()
 
+    # [a/Fe] grid, MIST v2.5 only (v1.2 is solar-scaled, [a/Fe] = 0, throughout)
+    _a_over_fe_grid = np.array([-0.2, 0.0, 0.2, 0.4, 0.6])
+
     def __init__(self, log_age, feh, phot_system, mist_path=MIST_PATH,
-                 ab_or_vega='ab', v_over_vcrit=0.4):
+                 ab_or_vega='ab', v_over_vcrit=0.4,
+                 version=DEFAULT_MIST_VERSION, a_over_fe=0.0):
 
         # verify age are metallicity are within model grids
         if log_age < self._log_age_min or log_age > self._log_age_max:
             raise Exception(f'log_age = {log_age} not in range of age grid')
         if feh < self._feh_min or feh > self._feh_max:
             raise Exception(f'feh = {feh} not in range of feh grid')
+
+        self.version, _layout = mist_version_layout(version)
+        # [a/Fe] is not interpolated: MIST grids it coarsely (0.2 dex) and the
+        # alpha elements move the isochrone in a different way than [Fe/H], so
+        # snapping to a grid point is honest where a linear blend would not be.
+        if abs(a_over_fe) > 1e-8 and not _layout['has_a_over_fe']:
+            raise Exception(
+                f'MIST v{self.version} is solar-scaled ([a/Fe] = 0) only; pass '
+                f'version="2.5" to use a_over_fe = {a_over_fe}.')
+        if not np.isclose(self._a_over_fe_grid, a_over_fe, atol=1e-8).any():
+            raise Exception(f'a_over_fe = {a_over_fe} is not on the MIST grid '
+                            f'{self._a_over_fe_grid.tolist()}')
+        self.a_over_fe = float(a_over_fe)
 
         self.feh = feh
         self.mist_path = mist_path
@@ -689,12 +730,16 @@ class MISTIsochrone(Isochrone):
         msg = 'PARSEC isochrones do not with MISTIsochrone.'
         raise Exception(msg + ' Use artpop.Isochrone instead.')
 
+    def _iso_kw(self):
+        """Grid-selection arguments shared by every fetch this object makes."""
+        return dict(mist_path=self.mist_path, v_over_vcrit=self.v_over_vcrit,
+                    version=self.version, a_over_fe=self.a_over_fe)
+
     def _fetch_iso(self, phot_system):
         """Fetch MIST isochrone grid, interpolating on [Fe/H] if necessary."""
         if self.feh in self._feh_grid:
-            args = [self.log_age, self.feh, phot_system, self.mist_path,
-                    self.v_over_vcrit]
-            iso = fetch_mist_iso_cmd(*args)
+            iso = fetch_mist_iso_cmd(self.log_age, self.feh, phot_system,
+                                     **self._iso_kw())
         else:
             iso = self._interp_on_feh(phot_system)
         return iso
@@ -708,10 +753,13 @@ class MISTIsochrone(Isochrone):
                      'using [Fe/H] = {} and {}'.\
                      format(self.feh, feh_lo, feh_hi))
 
-        mist_0 = fetch_mist_iso_cmd(
-            self.log_age, feh_lo, phot_system, self.mist_path)
-        mist_1 = fetch_mist_iso_cmd(
-            self.log_age, feh_hi, phot_system, self.mist_path)
+        # NB these used to drop v_over_vcrit, so an object built with
+        # v_over_vcrit=0.0 silently interpolated between two vvcrit=0.4 grids
+        # whenever its [Fe/H] was off-grid.
+        mist_0 = fetch_mist_iso_cmd(self.log_age, feh_lo, phot_system,
+                                    **self._iso_kw())
+        mist_1 = fetch_mist_iso_cmd(self.log_age, feh_hi, phot_system,
+                                    **self._iso_kw())
 
         y0, y1 = np.array(mist_0.tolist()), np.array(mist_1.tolist())
 
@@ -730,6 +778,7 @@ class MISTIsochrone(Isochrone):
             y1 = np.append(y1, y1[-1] + delta, axis=0)
 
         y = y0 * (1 - weight) + y1 * weight
-        iso = np.core.records.fromarrays(y.transpose(), dtype=mist_0.dtype)
+        # np.core.records was removed in NumPy 2
+        iso = np.rec.fromarrays(y.transpose(), dtype=mist_0.dtype)
 
         return iso

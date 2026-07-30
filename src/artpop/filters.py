@@ -19,10 +19,21 @@ __all__ = ['phot_system_list',
            'load_zero_point_converter']
 
 
+# np.trapz was removed in NumPy 2.0 in favour of np.trapezoid; support both so
+# the filter-property calculations work across the versions ArtPop is used with.
+_trapezoid = getattr(np, 'trapezoid', None) or np.trapz
+
+
 # list of photometric systems with pre-calculated filter properties
+#
+# 'WFIRST' is MIST v1.2's grid, built on a May 2018 preliminary filter set --
+# its own header calls it "WFIRST hypothetical (Vega)". 'Roman' is MIST v2.5's,
+# built on the flight filter curves and delivered in AB. They are different
+# systems with different filter names, not two spellings of one, so both are
+# listed and neither is aliased to the other.
 phot_system_list = [
     'HST_WFC3', 'HST_ACSWF', 'SDSSugriz', 'CFHTugriz', 'DECam', 'HSC',
-    'JWST', 'LSST', 'UBVRIplus', 'UKIDSS', 'WFIRST', 'GALEX'
+    'JWST', 'LSST', 'UBVRIplus', 'UKIDSS', 'WFIRST', 'GALEX', 'Roman'
 ]
 
 
@@ -75,7 +86,7 @@ class FilterSystem(object):
             Effective effective throughput.
         """
         lam, trans = self._get_trans(bandpass)
-        theff = np.trapz(trans, np.log(lam))
+        theff = _trapezoid(trans, np.log(lam))
         return theff
 
     def lam_eff(self, bandpass):
@@ -93,8 +104,8 @@ class FilterSystem(object):
                 The effective wavelength.
         """
         lam, trans = self._get_trans(bandpass)
-        log_leff = np.trapz(np.log(lam) * trans, np.log(lam))
-        log_leff /= np.trapz(trans, np.log(lam))
+        log_leff = _trapezoid(np.log(lam) * trans, np.log(lam))
+        log_leff /= _trapezoid(trans, np.log(lam))
         leff =  np.exp(log_leff) * u.angstrom
         return leff
 
@@ -113,8 +124,8 @@ class FilterSystem(object):
                 The pivot wavelength.
         """
         lam, trans = self._get_trans(bandpass)
-        lpivot = np.trapz(lam * trans, lam)
-        lpivot /= np.trapz(trans, np.log(lam))
+        lpivot = _trapezoid(lam * trans, lam)
+        lpivot /= _trapezoid(trans, np.log(lam))
         lpivot = np.sqrt(lpivot) * u.angstrom
         return lpivot
 
@@ -133,7 +144,7 @@ class FilterSystem(object):
                 The bandpass width.
         """
         lam, trans = self._get_trans(bandpass)
-        norm = np.trapz(trans, lam)
+        norm = _trapezoid(trans, lam)
         width = (norm / trans.max()) * u.angstrom
         return width
 

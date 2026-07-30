@@ -100,3 +100,64 @@ class TestZeroPointNames(TestCase):
         missing = [m for m in ctx.output if 'No AB / Vega conversion' in m]
         self.assertEqual([], missing)
 
+
+
+class TestMISTVersions(TestCase):
+    """
+    v1.2 and v2.5 are different grids, not two spellings of one.
+
+    v1.2's WFIRST is a May 2018 preliminary filter set delivered in Vega; v2.5's
+    Roman is the flight filter set delivered in AB, adds F213 (the K-band filter
+    v1.2 has no bolometric corrections for), and grids [a/Fe] rather than
+    assuming solar-scaled. So both must keep working, and neither may silently
+    stand in for the other.
+    """
+
+    def test_url_and_path_construction(self):
+        """Layouts differ in every particular; assert both, without network."""
+        from artpop.util import mist_grid_dir, MIST_GRID_LAYOUT, MIST_HOST
+        v12 = MIST_GRID_LAYOUT['1.2']
+        self.assertEqual(
+            'https://mist.science/data/tarballs_v1.2/'
+            'MIST_v1.2_vvcrit0.4_WFIRST.txz',
+            v12['url'].format(host=MIST_HOST, v='0.4', p='WFIRST'))
+        v25 = MIST_GRID_LAYOUT['2.5']
+        self.assertEqual(
+            'https://mist.science/data/tarballs_v2.5/isos/Roman.txz',
+            v25['url'].format(host=MIST_HOST, v='0.4', p='Roman'))
+        # v2.5 unpacks flat, so ArtPop has to create the directory itself
+        self.assertTrue(v25['flat_tarball'])
+        self.assertFalse(v12['flat_tarball'])
+        self.assertTrue(mist_grid_dir('Roman', version='2.5')
+                        .endswith('MIST_v2.5_Roman'))
+        self.assertTrue(mist_grid_dir('WFIRST', 0.4, version='1.2')
+                        .endswith('MIST_v1.2_vvcrit0.4_WFIRST'))
+        with self.assertRaises(ValueError):
+            mist_grid_dir('Roman', version='9.9')
+
+    def test_feh_and_afe_tokens(self):
+        """The two releases encode [Fe/H] in file names differently."""
+        from artpop.stars.isochrones import _feh_token, _afe_token
+        self.assertEqual('m1.50', _feh_token(-1.5, '1.2'))
+        self.assertEqual('p0.00', _feh_token(0.0, '1.2'))
+        self.assertEqual('m150', _feh_token(-1.5, '2.5'))
+        self.assertEqual('p000', _feh_token(0.0, '2.5'))
+        self.assertEqual('m025', _feh_token(-0.25, '2.5'))
+        self.assertEqual('m2', _afe_token(-0.2))
+        self.assertEqual('p0', _afe_token(0.0))
+        self.assertEqual('p6', _afe_token(0.6))
+
+    def test_a_over_fe_is_rejected_off_grid(self):
+        """[a/Fe] snaps to MIST's grid; it is not interpolated."""
+        with self.assertRaises(Exception):
+            MISTIsochrone(10, -1.5, 'Roman', version='2.5', a_over_fe=0.3)
+        # v1.2 is solar-scaled only
+        with self.assertRaises(Exception):
+            MISTIsochrone(10, -1.5, 'WFIRST', version='1.2', a_over_fe=0.4)
+
+    def test_v12_default_unchanged(self):
+        """The default is still v1.2, solar-scaled, Vega-converted WFIRST."""
+        iso = MISTIsochrone(10, -1.5, 'WFIRST')
+        self.assertEqual('1.2', iso.version)
+        self.assertEqual(0.0, iso.a_over_fe)
+        self.assertAlmostEqual(1.287404, iso.zpt_offsets['H158'], places=6)
