@@ -146,13 +146,50 @@ class ZeroPointConverter(object):
     ----------
     zpt_table : `~astropy.table.Table`
         MIST zero point table, which can be `downloaded here
-        <http://waps.cfa.harvard.edu/MIST/BC_tables/zeropoints.txt>`_.
+        <https://mist.science/BC_tables/zeropoints.txt>`_.
     """
 
     def __init__(self, zpt_table):
         for f, system, v_to_st, v_to_ab in zpt_table:
             setattr(self, f, [system, v_to_st, v_to_ab])
         self.zpt_table = zpt_table
+
+    def _resolve(self, bandpass):
+        """
+        Look up a filter's zero point row, tolerating the two naming conventions.
+
+        MIST's ``zeropoints.txt`` prefixes some filters with their photometric
+        system (``WFIRST_H158``) while the isochrone columns -- and therefore
+        every filter name ArtPop passes around -- are bare (``H158``). Other
+        systems agree in both places (``LSST_u``). Where they disagree the lookup
+        used to raise `AttributeError`, which
+        `~artpop.stars.isochrones.MISTIsochrone` caught and turned into a zero
+        offset, silently leaving those magnitudes in their native system even
+        when the caller asked for AB.
+
+        The bare name is tried FIRST and the prefixed one only as a fallback:
+        going the other way would turn ``LSST_u`` into ``LSST_LSST_u``. Resolving
+        forwards, via `phot_system_lookup`, is unambiguous -- stripping prefixes
+        instead would collide ``SDSS_u``, ``CFHT_u`` and ``LSST_u`` onto ``u``.
+        """
+        try:
+            return getattr(self, bandpass)
+        except AttributeError:
+            pass
+        try:
+            system = phot_system_lookup(bandpass)
+        except KeyError:
+            raise KeyError(
+                f"no zero point entry for filter '{bandpass}', and it is not in "
+                "the photometric-system lookup table either")
+        prefixed = f'{system}_{bandpass}'
+        try:
+            return getattr(self, prefixed)
+        except AttributeError:
+            raise KeyError(
+                f"no zero point entry for filter '{bandpass}' (tried "
+                f"'{bandpass}' and '{prefixed}'); is it missing from "
+                "zeropoints.txt?")
 
     def to_vega(self, bandpass):
         """
@@ -168,7 +205,7 @@ class ZeroPointConverter(object):
         zpt_convert : float
             Zero point conversion magnitude.
         """
-        system, v_to_st, v_to_ab = getattr(self, bandpass)
+        system, v_to_st, v_to_ab = self._resolve(bandpass)
         if system == 'Vega':
             zpt_convert = 0.
         elif system == 'AB':
@@ -189,7 +226,7 @@ class ZeroPointConverter(object):
         zpt_convert : float
             Zero point conversion magnitude.
         """
-        system, v_to_st, v_to_ab = getattr(self, bandpass)
+        system, v_to_st, v_to_ab = self._resolve(bandpass)
         if system == 'AB':
             zpt_convert = 0.
         elif system == 'Vega':
@@ -210,7 +247,7 @@ class ZeroPointConverter(object):
         zpt_convert : float
             Zero point conversion magnitude.
         """
-        system, v_to_st, v_to_ab = getattr(self, bandpass)
+        system, v_to_st, v_to_ab = self._resolve(bandpass)
         if system == 'AB':
             zpt_convert = v_to_st - v_to_ab
         elif system == 'Vega':

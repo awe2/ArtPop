@@ -647,14 +647,27 @@ class MISTIsochrone(Isochrone):
             self._iso_full = append_fields(self._iso_full, filt, mags)
 
         # covert magnitudes to ab or vega as necessary
+        #
+        # The offsets applied are kept in `zpt_offsets` so callers (and tests)
+        # can see which system each column actually ended up in. A missing
+        # zero point row is still only a warning -- zeropoints.txt does not
+        # cover every filter ArtPop supports -- but it now names the filter's
+        # photometric system, because "no conversion found" reads like "no
+        # conversion needed" and that is how MIST's Vega-native WFIRST columns
+        # were silently served as if they were AB.
         self.zpt_convert = load_zero_point_converter()
+        self.zpt_offsets = {}
         for filt in filters:
             converter = getattr(self.zpt_convert, f'to_{ab_or_vega.lower()}')
             try:
                 m_convert = converter(filt)
-            except AttributeError:
+            except KeyError as exc:
                 m_convert = 0.0
-                logger.warning(f'No AB / Vega conversion found for {filt}.')
+                logger.warning(
+                    f'No AB / Vega conversion found for {filt}; its magnitudes '
+                    f'are left in whatever system MIST provides, which may NOT '
+                    f'be {ab_or_vega.upper()}. ({exc})')
+            self.zpt_offsets[filt] = m_convert
             self._iso_full[filt] = self._iso_full[filt] + m_convert
 
         super(MISTIsochrone, self).__init__(
