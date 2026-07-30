@@ -571,6 +571,16 @@ def fetch_mist_iso_cmd(log_age, feh, phot_system, mist_path=MIST_PATH,
     iso_cmd : `~numpy.ndarray`
         Structured ``numpy`` array with isochrones and stellar magnitudes.
     """
+    fn = mist_iso_path(feh, phot_system, mist_path, v_over_vcrit, version,
+                       a_over_fe)
+    iso_cmd = IsoCmdReader(fn, verbose=False)
+    iso_cmd = iso_cmd.isocmds[iso_cmd.age_index(log_age)]
+    return iso_cmd
+
+
+def mist_iso_path(feh, phot_system, mist_path=MIST_PATH, v_over_vcrit=0.4,
+                  version=DEFAULT_MIST_VERSION, a_over_fe=0.0):
+    """Path to one MIST isochrone file, fetching the grid if it is not present."""
     key, layout = mist_version_layout(version)
     p = phot_str_helper[phot_system.lower()]
 
@@ -582,12 +592,39 @@ def fetch_mist_iso_cmd(log_age, feh, phot_system, mist_path=MIST_PATH,
     # fetch the mist grid if necessary
     path = fetch_mist_grid_if_needed(p, v_over_vcrit, mist_path, version=key)
 
-    fn = os.path.join(path, layout['iso_file'].format(
+    return os.path.join(path, layout['iso_file'].format(
         v=f'{float(v_over_vcrit):.1f}', p=p,
         feh=_feh_token(feh, key), afe=_afe_token(a_over_fe)))
-    iso_cmd = IsoCmdReader(fn, verbose=False)
-    iso_cmd = iso_cmd.isocmds[iso_cmd.age_index(log_age)]
-    return iso_cmd
+
+
+def mist_photometric_system(fn):
+    """
+    The magnitude system a MIST grid file declares for itself.
+
+    Its third header line is authoritative and version-independent::
+
+        # photometric system   = LSST (AB)
+        # photometric system   = WFIRST hypothetical (Vega)
+        # photometric system   = Roman (AB)
+
+    Reading it beats inferring the system from ``zeropoints.txt``, which is keyed
+    by filter name and does not cover every grid -- MIST v2.5's Roman filters
+    have no rows there at all, yet the grid is already AB and needs no
+    conversion. Returns ``'AB'``, ``'Vega'`` or None if the line is unparseable.
+    """
+    try:
+        with open(fn) as f:
+            for _ in range(3):
+                line = f.readline()
+    except OSError:
+        return None
+    if 'photometric system' not in line:
+        return None
+    if line.rstrip().endswith('(AB)'):
+        return 'AB'
+    if line.rstrip().endswith('(Vega)'):
+        return 'Vega'
+    return None
 
 
 class MISTIsochrone(Isochrone):
@@ -680,12 +717,18 @@ class MISTIsochrone(Isochrone):
         # iterate over photometric systems and fetch remaining isochrones
         filter_dict = get_filter_names()
         filters = filter_dict[phot_system[0]].copy()
+        # what magnitude system each grid says it is in (see
+        # `mist_photometric_system`); keyed by filter so mixed-system
+        # populations resolve per column
+        self.mist_photo_sys = {f: self._grid_system(phot_system[0])
+                               for f in filters}
         for p in phot_system[1:]:
             filt = filter_dict[p].copy()
             filters.extend(filt)
             _iso = self._fetch_iso(p)
             mags = [_iso[f].data for f in filt]
             self._iso_full = append_fields(self._iso_full, filt, mags)
+            self.mist_photo_sys.update({f: self._grid_system(p) for f in filt})
 
         # covert magnitudes to ab or vega as necessary
         #
@@ -696,18 +739,27 @@ class MISTIsochrone(Isochrone):
         # photometric system, because "no conversion found" reads like "no
         # conversion needed" and that is how MIST's Vega-native WFIRST columns
         # were silently served as if they were AB.
+        want = ab_or_vega.lower()
         self.zpt_convert = load_zero_point_converter()
         self.zpt_offsets = {}
         for filt in filters:
-            converter = getattr(self.zpt_convert, f'to_{ab_or_vega.lower()}')
+            native = self.mist_photo_sys.get(filt)
+            if native is not None and native.lower() == want:
+                # the grid already declares the system asked for. MIST v2.5's
+                # Roman filters have no zeropoints.txt rows at all, so without
+                # this they would warn on every build despite needing nothing.
+                self.zpt_offsets[filt] = 0.0
+                continue
+            converter = getattr(self.zpt_convert, f'to_{want}')
             try:
                 m_convert = converter(filt)
             except KeyError as exc:
                 m_convert = 0.0
                 logger.warning(
                     f'No AB / Vega conversion found for {filt}; its magnitudes '
-                    f'are left in whatever system MIST provides, which may NOT '
-                    f'be {ab_or_vega.upper()}. ({exc})')
+                    f'are left in whatever system MIST provides'
+                    + (f' ({native})' if native else '')
+                    + f', which may NOT be {ab_or_vega.upper()}. ({exc})')
             self.zpt_offsets[filt] = m_convert
             self._iso_full[filt] = self._iso_full[filt] + m_convert
 
@@ -734,6 +786,13 @@ class MISTIsochrone(Isochrone):
         """Grid-selection arguments shared by every fetch this object makes."""
         return dict(mist_path=self.mist_path, v_over_vcrit=self.v_over_vcrit,
                     version=self.version, a_over_fe=self.a_over_fe)
+
+    def _grid_system(self, phot_system):
+        """'AB' or 'Vega', as this photometric system's grid file declares it."""
+        feh = self.feh if self.feh in self._feh_grid else self._feh_grid[
+            np.abs(self._feh_grid - self.feh).argmin()]
+        return mist_photometric_system(
+            mist_iso_path(feh, phot_system, **self._iso_kw()))
 
     def _fetch_iso(self, phot_system):
         """Fetch MIST isochrone grid, interpolating on [Fe/H] if necessary."""
