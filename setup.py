@@ -38,7 +38,15 @@ setup(
     author_email='artpopcode@gmail.com',
     packages=find_packages(where="src"),
     package_dir={"": "src"},
-    package_data={"artpop": ["data/*.pkl", "data/*.txt"]},
+    # filter_curves/ lives at the repo root, where tools/build_filter_data.py
+    # walks it, and is NOT installed from there. A K-correction needs the
+    # curves themselves at runtime, so artpop.filters.filter_curve_dir()
+    # looks under data/filter_curves/ as well as at the repo root and
+    # raises naming both rather than returning silently. Syncing the curves
+    # into src/artpop/data/filter_curves/ before a build is what makes an
+    # installed copy work; this line is what ships them once they are there.
+    package_data={"artpop": ["data/*.pkl", "data/*.txt",
+                             "data/filter_curves/*/*.csv"]},
     include_package_data=True,
     url='https://github.com/ArtificialStellarPopulations/ArtPop',
     install_requires=[

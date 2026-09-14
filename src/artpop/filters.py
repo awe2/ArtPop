@@ -8,11 +8,13 @@ from astropy import units as u
 from astropy.table import Table
 
 # Project
-from . import data_dir
+from . import data_dir, package_dir
 
 
 __all__ = ['phot_system_list',
            'FilterSystem',
+           'filter_curve_dir',
+           'load_filter_system',
            'get_filter_names',
            'get_filter_properties',
            'phot_system_lookup',
@@ -63,13 +65,27 @@ class FilterSystem(object):
             table = Table(data=data, names=['wave', 'trans'])
             setattr(self, name, table)
 
-    def _get_trans(self, bandpass):
+    def get_trans(self, bandpass):
         """
         Get the filter throughput curve for the given bandpass.
+
+        Returns
+        -------
+        lam, trans : `~numpy.ndarray`
+            Wavelengths in angstroms and the (dimensionless) throughput.
+
+        Notes
+        -----
+        Public because a K-correction needs ``T(lambda)`` itself, not the
+        Fukugita summaries: redshifting a source is exactly blueshifting the
+        filter, so the whole curve is the operand. ``_get_trans`` remains as an
+        alias for the internal callers that predate this.
         """
-        lam = getattr(self, bandpass)['wave']
-        trans = getattr(self, bandpass)['trans']
+        lam = np.asarray(getattr(self, bandpass)['wave'], dtype=float)
+        trans = np.asarray(getattr(self, bandpass)['trans'], dtype=float)
         return lam, trans
+
+    _get_trans = get_trans
 
     def effective_throughput(self, bandpass):
         """
@@ -400,3 +416,87 @@ def load_zero_point_converter():
     fn = os.path.join(data_dir, 'zeropoints.txt')
     table= ascii.read(fn)
     return ZeroPointConverter(table)
+
+
+# ---------------------------------------------------------------------------
+# transmission curves on disk
+# ---------------------------------------------------------------------------
+# `filter_curves/` lives at the repo root, where `tools/build_filter_data.py`
+# walks it. Nothing else in the package ever needed it, so it is not installed
+# (setup.py ships only `data/*`) -- and the failure mode of that is a silent
+# absence of curves at import time, not an error. The search order below makes
+# the repo layout work today and lets an install work as soon as the curves are
+# synced under `data/filter_curves/`; ARTPOP_FILTER_CURVES overrides both.
+_CURVE_SEARCH = [
+    lambda: os.environ.get('ARTPOP_FILTER_CURVES'),
+    lambda: os.path.join(data_dir, 'filter_curves'),
+    lambda: os.path.abspath(os.path.join(
+        package_dir, os.pardir, os.pardir, 'filter_curves')),
+]
+
+
+def filter_curve_dir():
+    """
+    Directory holding the ``<system>/<band>.csv`` transmission curves.
+
+    Raises
+    ------
+    FileNotFoundError
+        Naming every location searched, because "no curves" must never read as
+        "no curves needed".
+    """
+    tried = []
+    for get in _CURVE_SEARCH:
+        cand = get()
+        if cand is None:
+            continue
+        tried.append(cand)
+        if os.path.isdir(cand):
+            return cand
+    raise FileNotFoundError(
+        'no filter_curves directory found; searched ' + ', '.join(tried)
+        + '. Set ARTPOP_FILTER_CURVES to point at it.')
+
+
+def load_filter_system(phot_system, bands=None, curve_dir=None):
+    """
+    Build a `FilterSystem` for one photometric system from its shipped curves.
+
+    Parameters
+    ----------
+    phot_system : str
+        A member of `phot_system_list`.
+    bands : list of str, optional
+        Restrict to these filters. Default: every curve in the directory,
+        sorted, which is *not* the ``filter_properties`` order -- pass ``bands``
+        when order matters.
+    curve_dir : str, optional
+        Override `filter_curve_dir`.
+
+    Returns
+    -------
+    fs : `~artpop.filters.FilterSystem`
+    """
+    if phot_system not in phot_system_list:
+        raise ValueError(f'{phot_system} is not a valid photometric system')
+    root = os.path.join(curve_dir or filter_curve_dir(), phot_system)
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f'no transmission curves for {phot_system} '
+                                f'under {root}')
+    have = {f[:-4] for f in os.listdir(root) if f.endswith('.csv')}
+    # MIST's own column order, so a caller that reads results positionally sees
+    # the same order `filter_properties` uses. Alphabetical would put LSST as
+    # g,i,r,u,y,z -- correct but unreadable, and a trap for positional readers.
+    try:
+        canonical = [f for f in get_filter_names()[phot_system] if f in have]
+    except Exception:                                   # noqa: BLE001
+        canonical = []
+    names = canonical + sorted(have - set(canonical))
+    if bands is not None:
+        missing = [b for b in bands if b not in names]
+        if missing:
+            raise FileNotFoundError(f'no transmission curve for {missing} '
+                                    f'under {root}')
+        names = list(bands)
+    files = [os.path.join(root, n + '.csv') for n in names]
+    return FilterSystem(files, names, delimiter=',', skiprows=1)

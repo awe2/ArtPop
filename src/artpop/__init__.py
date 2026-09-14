@@ -22,6 +22,7 @@ if not __ARTPOP_SETUP__:
                   'location, create a MIST_PATH environment variable.')
             os.mkdir(MIST_PATH)
     from .filters import *
+    from .kcorrect import *
     from .stars import *
     from .image import *
     from .space import *

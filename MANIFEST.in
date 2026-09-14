@@ -1,2 +1,3 @@
 include README.rst LICENSE
 recursive-include src/artpop/data *
+recursive-include filter_curves *.csv

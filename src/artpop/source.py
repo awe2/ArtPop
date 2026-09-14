@@ -157,20 +157,32 @@ class SersicSP(Source):
     labels : list-like, optional
         Labels for the stars. For example, EEP values (int or float) or name
         of evolutionary phase (str).
+    eta : float, optional
+        Distance-duality parameter. The physical size is converted to an angle
+        with ``D_A = D_L / [(1+z)^2 eta^2]``, Etherington's relation, which
+        follows from photon conservation in any metric theory and is not a
+        cosmological model. Exposed so a violation of duality can itself be
+        probed. Default: 1.0.
+    distance_angular : float or `~astropy.units.Quantity`, optional
+        Override the angular-diameter distance outright, for callers who want
+        distance, redshift and size to be literally independent. If a float is
+        given the units are assumed to be Mpc.
     """
 
     def __init__(self, sp, r_eff, n, theta, ellip, xy_dim, pixel_scale,
-                 num_r_eff=10, dx=0, dy=0, labels=None):
+                 num_r_eff=10, dx=0, dy=0, labels=None, eta=1.0,
+                 distance_angular=None):
 
         self.sp = sp
         self.mag_limit = sp.mag_limit
         self.mag_limit_band = sp.mag_limit_band
         self.smooth_model = None
+        self.distance_angular = _angular_distance(sp, eta, distance_angular)
 
         if self.mag_limit is not None and sp.frac_num_sampled < 1.0:
             _r_eff = check_units(r_eff, 'kpc').to('Mpc').value
             _theta = check_units(theta, 'deg').to('radian').value
-            _distance = check_units(sp.distance, 'Mpc').to('Mpc').value
+            _distance = self.distance_angular.to('Mpc').value
             _pixel_scale = check_units(pixel_scale, u.arcsec / u.pixel)
 
             if _r_eff <= 0:
@@ -189,8 +201,16 @@ class SersicSP(Source):
             self.smooth_model = Sersic2D(
                 x_0=x_0, y_0=y_0, n=n, r_eff=r_pix, theta=_theta, ellip=ellip)
 
+        # `distance` here is the ANGULAR-DIAMETER distance, not sp.distance:
+        # sersic_xy's only use of it is arctan2(r_eff, distance), i.e. an angle.
+        # Handing it D_A rather than editing that arctan2 is deliberate --
+        # ALVISS monkey-patches over `sersic_xy` with its own memory-efficient
+        # sampler (alviss_inject.py:138), so any fix written into the function
+        # body would be replaced at import time and silently lost. At z = 0 the
+        # two distances are the same object, so this is a no-op.
         self.xy_kw = dict(num_stars=sp.num_stars, r_eff=r_eff, n=n,
-                          theta=theta, ellip=ellip, distance=sp.distance,
+                          theta=theta, ellip=ellip,
+                          distance=self.distance_angular,
                           xy_dim=xy_dim, num_r_eff=num_r_eff, dx=dx, dy=dy,
                           pixel_scale=pixel_scale, random_state=sp.rng)
 
@@ -229,6 +249,30 @@ class SersicSP(Source):
         mu_e = m_tot + 2.5 * np.log10(2 * area) + 2.5 * np.log10(f_n)
         amplitude = 10**(0.4 * (zpt - mu_e)) * self.pixel_scale.value**2
         return mu_e, amplitude, param_name
+
+
+def _angular_distance(sp, eta=1.0, distance_angular=None):
+    """
+    The distance that converts a physical size to an angle.
+
+    Flux runs on the luminosity distance and angles run on the
+    angular-diameter distance; the two are equal only at z = 0, which is why
+    ArtPop has been able to use one number for both. ``D_A = D_L/[(1+z)^2
+    eta^2]`` is Etherington's distance-duality relation -- photon conservation
+    in any metric theory, not a cosmological model -- and ``eta`` is exposed so
+    that a duality violation can itself be probed. ``distance_angular``
+    overrides the relation entirely, for anyone who wants the decoupling of
+    distance, redshift and size to be literal.
+
+    Surface-brightness dimming is **not** coded anywhere. It emerges from this
+    function (solid angle) together with `dist_mod` (flux), and the fact that
+    it comes out to exactly ``10 log10(1+z)`` is asserted rather than assumed.
+    """
+    if distance_angular is not None:
+        return check_units(distance_angular, 'Mpc')
+    if hasattr(sp, 'distance_angular'):
+        return sp.distance_angular(eta=eta)
+    return check_units(sp.distance, 'Mpc')
 
 
 def _check_label_type(ssp, label_type, has_phases=True):
@@ -336,15 +380,19 @@ class MISTSersicSSP(SersicSP):
                  total_mass=None, a_lam=0.0, add_remnants=True, mag_limit=None,
                  mag_limit_band=None, imf='kroupa', imf_kw=None,
                  mist_path=MIST_PATH, num_r_eff=10, mass_tolerance=0.01,
-                 dx=0, dy=0, label_type=None, random_state=None):
+                 dx=0, dy=0, label_type=None, random_state=None,
+                 eta=1.0, distance_angular=None, **kwargs):
 
+        # **kwargs reaches MISTSSP and through it MISTIsochrone, so `redshift`,
+        # `a_v_host`, `a_v_mw`, `version`, `a_over_fe` and `sampling` all work
+        # here rather than only on a hand-built MISTSSP.
         self.ssp_kw = dict(log_age=log_age, feh=feh, phot_system=phot_system,
                            distance=distance, a_lam=a_lam, total_mass=total_mass,
                            num_stars=num_stars, imf=imf, mist_path=mist_path,
                            imf_kw=imf_kw, random_state=random_state,
                            mag_limit=mag_limit, mag_limit_band=mag_limit_band,
                            add_remnants=add_remnants,
-                           mass_tolerance=mass_tolerance)
+                           mass_tolerance=mass_tolerance, **kwargs)
 
         ssp = MISTSSP(**self.ssp_kw)
         labels = _check_label_type(ssp, label_type)
@@ -352,7 +400,7 @@ class MISTSersicSSP(SersicSP):
         super(MISTSersicSSP, self).__init__(
             sp=ssp, r_eff=r_eff, n=n, theta=theta, ellip=ellip, xy_dim=xy_dim,
             pixel_scale=pixel_scale, num_r_eff=num_r_eff, dx=dx, dy=dy,
-            labels=labels)
+            labels=labels, eta=eta, distance_angular=distance_angular)
 
 
 class PlummerSP(Source):
@@ -379,19 +427,30 @@ class PlummerSP(Source):
     labels : list-like, optional
         Labels for the stars. For example, EEP values (int or float) or name
         of evolutionary phase (str).
+    eta : float, optional
+        Distance-duality parameter. The physical size is converted to an angle
+        with ``D_A = D_L / [(1+z)^2 eta^2]``, Etherington's relation, which
+        follows from photon conservation in any metric theory and is not a
+        cosmological model. Exposed so a violation of duality can itself be
+        probed. Default: 1.0.
+    distance_angular : float or `~astropy.units.Quantity`, optional
+        Override the angular-diameter distance outright, for callers who want
+        distance, redshift and size to be literally independent. If a float is
+        given the units are assumed to be Mpc.
     """
 
     def __init__(self, sp, scale_radius, xy_dim, pixel_scale, dx=0, dy=0,
-                 labels=None):
+                 labels=None, eta=1.0, distance_angular=None):
 
         self.sp = sp
         self.mag_limit = sp.mag_limit
         self.mag_limit_band = sp.mag_limit_band
         self.smooth_model = None
+        self.distance_angular = _angular_distance(sp, eta, distance_angular)
 
         if self.mag_limit is not None and sp.frac_num_sampled < 1.0:
             _rs = check_units(scale_radius, 'kpc').to('Mpc').value
-            _distance = check_units(sp.distance, 'Mpc').to('Mpc').value
+            _distance = self.distance_angular.to('Mpc').value
             _pixel_scale = check_units(pixel_scale, u.arcsec / u.pixel)
 
             self.r_sky = np.arctan2(_rs, _distance) * u.radian.to('arcsec')
@@ -405,8 +464,9 @@ class PlummerSP(Source):
 
             self.smooth_model = Plummer2D(x_0=x_0, y_0=y_0, scale_radius=r_pix)
 
+        # angular-diameter distance; see the note in SersicSP.__init__
         self.xy_kw = dict(num_stars=sp.num_stars, scale_radius=scale_radius,
-                          distance=sp.distance, xy_dim=xy_dim,
+                          distance=self.distance_angular, xy_dim=xy_dim,
                           pixel_scale=pixel_scale, dx=dx, dy=dy,
                           random_state=sp.rng)
 
@@ -522,7 +582,8 @@ class MISTPlummerSSP(PlummerSP):
                  total_mass=None, a_lam=0.0, add_remnants=True, mag_limit=None,
                  mag_limit_band=None, imf='kroupa', imf_kw=None,
                  mist_path=MIST_PATH, mass_tolerance=0.01, dx=0, dy=0,
-                 label_type=None, random_state=None):
+                 label_type=None, random_state=None,
+                 eta=1.0, distance_angular=None, **kwargs):
 
         self.ssp_kw = dict(log_age=log_age, feh=feh, phot_system=phot_system,
                            distance=distance, total_mass=total_mass, a_lam=a_lam,
@@ -530,14 +591,15 @@ class MISTPlummerSSP(PlummerSP):
                            imf_kw=imf_kw, random_state=random_state,
                            mag_limit=mag_limit, mag_limit_band=mag_limit_band,
                            add_remnants=add_remnants,
-                           mass_tolerance=mass_tolerance)
+                           mass_tolerance=mass_tolerance, **kwargs)
 
         ssp = MISTSSP(**self.ssp_kw)
         labels = _check_label_type(ssp, label_type)
 
         super(MISTPlummerSSP, self).__init__(
             sp=ssp, scale_radius=scale_radius, xy_dim=xy_dim,
-            pixel_scale=pixel_scale, dx=dx, dy=dy, labels=labels)
+            pixel_scale=pixel_scale, dx=dx, dy=dy, labels=labels,
+            eta=eta, distance_angular=distance_angular)
 
 
 class UniformSSP(Source):
@@ -623,6 +685,15 @@ class UniformSSP(Source):
             self.ssp_kw['phot_system'] = isochrone.phot_system
             self.ssp_kw['v_over_vcrit'] = isochrone.v_over_vcrit
             self.ssp_kw['mist_path'] = isochrone.mist_path
+            # this branch rebuilds the isochrone from scalars, so anything not
+            # copied across is silently dropped -- which for the redshift and
+            # dust corrections would mean a uniform population rendered at
+            # z = 0 while its caller believed otherwise
+            self.ssp_kw['version'] = isochrone.version
+            self.ssp_kw['a_over_fe'] = isochrone.a_over_fe
+            for attr in ('redshift', 'a_v_host', 'a_v_mw', 'r_v',
+                         'extinction_law'):
+                self.ssp_kw[attr] = getattr(isochrone, attr)
             self.sp = MISTSSP(**self.ssp_kw)
             labels = _check_label_type(self.sp, label_type)
         else:

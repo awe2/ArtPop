@@ -14,7 +14,8 @@ from .imf import IMFIntegrator
 from .. import MIST_PATH
 from ..log import logger
 from ..filters import phot_system_list, get_filter_names
-from ..filters import load_zero_point_converter
+from ..filters import load_zero_point_converter, phot_system_lookup
+from ..kcorrect import KCorrectionGrid
 from ..util import (check_units, fetch_mist_grid_if_needed,
                     mist_version_layout, DEFAULT_MIST_VERSION)
 
@@ -45,10 +46,21 @@ class Isochrone(object):
         Stellar luminosities.
     log_Teff : `~numpy.ndarray`, optional
         Stellar effective temperatures.
+    log_g : `~numpy.ndarray`, optional
+        Stellar surface gravities. Needed for any spectral-library lookup
+        (a K-correction, for instance), which is why it is carried here
+        rather than left buried in the source table.
+    feh : `~numpy.ndarray` or float, optional
+        Per-star (or scalar) [Fe/H]. Same reason as ``log_g``.
+    redshift : float, optional
+        The redshift the magnitudes in ``mags`` are already corrected to.
+        Recorded, not applied: `Isochrone` does not know how to compute a
+        K-correction, but everything downstream needs to know whether one has
+        been applied and to what ``z``. Default: 0.0.
     """
 
     def __init__(self, mini, mact, mags, eep=None, log_L=None,
-                 log_Teff=None):
+                 log_Teff=None, log_g=None, feh=None, redshift=0.0):
         self.mini = np.asarray(mini)
         self.mact = np.asarray(mact)
         if (np.diff(self.mini) < 0).sum() > 0:
@@ -56,6 +68,9 @@ class Isochrone(object):
         self.eep = None if eep is None else np.asarray(eep)
         self.log_L = None if log_L is None else np.asarray(log_L)
         self.log_Teff = None if log_Teff is None else np.asarray(log_Teff)
+        self.log_g = None if log_g is None else np.asarray(log_g)
+        self.feh = feh if np.isscalar(feh) or feh is None else np.asarray(feh)
+        self.redshift = float(redshift)
         if type(mags) == dict or type(mags) == np.ndarray:
             self.mag_table = Table(mags)
         elif type(mags) == Table:
@@ -301,6 +316,37 @@ class Isochrone(object):
         m_nearest = self.mini[arg_nearest]
         return m_nearest, arg_nearest
 
+    def imf_bin_edges(self, m_min_norm=None):
+        """
+        Per-row half-bin initial-mass edges used by `imf_weights`.
+
+        Each isochrone row is treated as owning the mass interval between the
+        midpoints to its neighbours (the FSPS binning convention). The first
+        row's lower edge extends down to ``m_min_norm`` (or the isochrone's
+        minimum mass) and the last row's upper edge is its own mass.
+
+        Parameters
+        ----------
+        m_min_norm : None or float, optional
+            Lower edge of the first bin. Must be less than or equal to the
+            minimum mass of the isochrone, which is used if None is given.
+
+        Returns
+        -------
+        m1, m2 : `~numpy.ndarray`
+            Lower and upper mass edge per isochrone row.
+        """
+        mini = np.asarray(self.mini, dtype=float)
+        m_min = m_min_norm if m_min_norm else mini.min()
+        # written to be bit-identical to the historical per-row loop
+        # (a - 0.5*(a - b) differs from 0.5*(a + b) in floating point)
+        m1 = np.concatenate(([m_min], mini[1:] - 0.5 * (mini[1:] - mini[:-1])))
+        m2 = np.concatenate((mini[:-1] + 0.5 * (mini[1:] - mini[:-1]),
+                             [mini[-1]]))
+        if np.any(m2 < m1):
+            raise Exception('Masses must be monotonically increasing.')
+        return m1, m2
+
     def imf_weights(self, imf, m_min_norm=None, m_max_norm=None,
                     norm_type='mass', **kwargs):
         """
@@ -340,25 +386,15 @@ class Isochrone(object):
             norm = mfint.m_integrate(m_min = m_min,m_max = m_max)
         elif norm_type == 'number':
             norm = mfint.integrate(m_min = m_min,m_max = m_max)
-        wght = []
-        mini = self.mini
         # Assume mass is constant in each bin and integrate.
         # This means an integral over mass is simply SUM(m * wght)
         # This trick was stolen from Charlie Conroy's FSPS code :)
-        for i in range(len(mini)):
-            if i == 0:
-                m1 = m_min
-            else:
-                m1 = mini[i] - 0.5 * (mini[i] - mini[i-1])
-            if i == len(mini) - 1:
-                m2 = mini[i]
-            else:
-                m2 = mini[i] + 0.5 * (mini[i+1] - mini[i])
-            if m2 < m1:
-                raise Exception('Masses must be monotonically increasing.')
-
-            wght.append(mfint.integrate(m_min = m1, m_max = m2))
-        wght = np.array(wght) / norm
+        # The bin edges are shared with imf_bin_edges so that anything sampling
+        # masses within a row's bin integrates over exactly the same interval.
+        m1, m2 = self.imf_bin_edges(m_min_norm=m_min)
+        wght = np.array([mfint.integrate(m_min=lo, m_max=hi)
+                         for lo, hi in zip(m1, m2)])
+        wght = wght / norm
         return wght
 
     def ssp_color(self, blue, red, imf='kroupa', **kwargs):
@@ -655,6 +691,46 @@ class MISTIsochrone(Isochrone):
     v_over_vcrit : float, optional
         Rotation rate divided by the critical surface linear velocity. Current
         options are 0.4 (default) and 0.0.
+    version : str, optional
+        MIST release, ``'1.2'`` (default) or ``'2.5'``.
+    a_over_fe : float, optional
+        Alpha enhancement [a/Fe]; must be on the MIST grid.
+    redshift : float, optional
+        Redshift of the population. Adds a **per-star** K-correction to the
+        magnitude columns, computed from the spectral libraries MIST itself
+        integrated. Independent of distance: nothing here derives one from the
+        other. ``0.0`` (default) is a no-op, bit for bit.
+    a_v_host : float, optional
+        V-band extinction from dust **inside the host galaxy**, which reddens
+        the star's spectrum in its own rest frame -- the frame MIST's own
+        ``A_V`` axis works in. Default: 0.0.
+    a_v_mw : float, optional
+        V-band extinction from **Milky Way foreground** dust, which attenuates
+        observer-frame wavelengths. At ``z = 0`` this is identical to
+        ``a_v_host``; at ``z > 0`` it is not, and treating them as one is the
+        approximation this parameter exists to remove. Default: 0.0.
+    r_v : float, optional
+        ``A_V / E(B-V)`` for both screens. Default: 3.1, which is what MIST's
+        BC tables use.
+    extinction_law : str, optional
+        ``'F99'`` (default), ``'CCM89'`` or ``'grey'``. See
+        `~artpop.kcorrect.extinction_curve`.
+    kcorr_grid : `~artpop.kcorrect.KCorrectionGrid`, optional
+        Use this prebuilt grid instead of building or loading one. Only valid
+        for a single photometric system.
+    kcorr_kw : dict, optional
+        Extra arguments for `~artpop.kcorrect.KCorrectionGrid.cached`, e.g.
+        ``z_grid`` or ``resolution``.
+
+    Attributes
+    ----------
+    delta_mag : dict
+        The per-star magnitude offset applied in each filter, so what moved is
+        always inspectable.
+    kcorr_info : dict
+        Per photometric system: which spectral-library backend served each row
+        (C3K, Tremblay or the blackbody fallback) and how many rows had their
+        [Fe/H] clipped to the library's range. Nothing is served silently.
     """
 
     # the age grid
@@ -674,7 +750,9 @@ class MISTIsochrone(Isochrone):
 
     def __init__(self, log_age, feh, phot_system, mist_path=MIST_PATH,
                  ab_or_vega='ab', v_over_vcrit=0.4,
-                 version=DEFAULT_MIST_VERSION, a_over_fe=0.0):
+                 version=DEFAULT_MIST_VERSION, a_over_fe=0.0,
+                 redshift=0.0, a_v_host=0.0, a_v_mw=0.0, r_v=3.1,
+                 extinction_law='F99', kcorr_grid=None, kcorr_kw=None):
 
         # verify age are metallicity are within model grids
         if log_age < self._log_age_min or log_age > self._log_age_max:
@@ -763,6 +841,21 @@ class MISTIsochrone(Isochrone):
             self.zpt_offsets[filt] = m_convert
             self._iso_full[filt] = self._iso_full[filt] + m_convert
 
+        # redshift and the two dust frames, applied DIFFERENTIALLY on top of
+        # MIST's shipped columns. See `_apply_band_offsets` for why that is the
+        # only defensible way to do it, and why it is done here rather than at
+        # the population level.
+        self.redshift = float(redshift)
+        self.a_v_host = float(a_v_host)
+        self.a_v_mw = float(a_v_mw)
+        self.r_v = float(r_v)
+        self.extinction_law = extinction_law
+        self.delta_mag = {f: 0.0 for f in filters}
+        self.kcorr_info = None
+        self._mags_rest = None
+        if self.redshift != 0.0 or self.a_v_host != 0.0 or self.a_v_mw != 0.0:
+            self._apply_band_offsets(filters, kcorr_grid, kcorr_kw or {})
+
         super(MISTIsochrone, self).__init__(
             mini = self._iso_full['initial_mass'],
             mact = self._iso_full['star_mass'],
@@ -770,12 +863,126 @@ class MISTIsochrone(Isochrone):
             eep = self._iso_full['EEP'],
             log_L = self._iso_full['log_L'],
             log_Teff = self._iso_full['log_Teff'],
+            log_g = self._iso_full['log_g'],
+            feh = self.feh,
+            redshift = self.redshift,
         )
+
+    @property
+    def feh_star(self):
+        """
+        Per-row [Fe/H], which is not the requested scalar.
+
+        MIST's own column drifts -- it reaches +0.042 even in the
+        ``feh_p0.00`` file -- and it is the star's actual abundance, so it is
+        the physically right key for a spectral-library lookup. `feh` stays the
+        requested scalar because `_fetch_iso` and `ssp_kw` both depend on it.
+        """
+        names = self._iso_full.dtype.names
+        if names is not None and '[Fe/H]' in names:
+            return np.asarray(self._iso_full['[Fe/H]'], dtype=float)
+        return np.full(len(self._iso_full), float(self.feh))
+
+    def _apply_band_offsets(self, filters, kcorr_grid, kcorr_kw):
+        """
+        Add ``Delta m(z, A_host, A_MW)`` to every magnitude column, per star.
+
+        Why differential, and why here.
+
+        Regenerating the magnitudes from MIST's bolometric-correction tables is
+        the obvious alternative and it does not work: with straightforward
+        interpolation the round trip closes only to 0.05-0.15 mag, which is
+        larger than the entire effect being modelled at z = 0.05
+        (HANDOFF_REDSHIFT.md s1a). Adding a *difference* on top of the shipped
+        columns cancels that error to first order and preserves MIST's z = 0
+        calibration exactly.
+
+        Applying it to the isochrone rather than the population is what makes
+        the rest of the stack correct without further care. Everything
+        downstream reads `mag_table`: ``ssp_mag``/``ssp_color``/``ssp_sbf_mag``,
+        the sampled stars' ``abs_mags``, and -- the one that matters --
+        ``integrated_abs_mags`` and ``_integrated_log_lumlum``, which are
+        built as ``10**(-0.4 m)`` and ``10**(-0.8 m)`` from these same columns.
+        The second of those is a second moment, so it needs ``10**(-0.8 K)``,
+        not ``10**(-0.4 K)``; getting that wrong is invisible to every flux
+        test. Applying K here makes both powers right by construction. It also
+        means the ``mag_limit`` row split is computed on corrected magnitudes,
+        so the bright and faint sets stay exact complements.
+
+        The correction is per STAR, never per galaxy: at z = 0.05 it varies by
+        0.12-0.45 mag across the stars of a single population, so it changes
+        the shape of the CMD rather than its zero point. That is also why the
+        SBF K-correction (f^2-weighted, dominated by the RGB tip) differs from
+        the integrated-light one by 0.06-0.20 mag and flips sign in the NIR.
+        """
+        log_teff = np.asarray(self._iso_full['log_Teff'], dtype=float)
+        log_g = np.asarray(self._iso_full['log_g'], dtype=float)
+        feh_star = self.feh_star
+
+        # keep the pre-correction columns: every diagnostic and every test that
+        # asks "what did this actually move?" needs them
+        self._mags_rest = Table(self._iso_full[filters].copy())
+
+        by_system = {}
+        lookup = phot_system_lookup()
+        for filt in filters:
+            by_system.setdefault(lookup[filt], []).append(filt)
+
+        grid_kw = dict(a_v_host=self.a_v_host, a_v_mw=self.a_v_mw,
+                       extinction_law=self.extinction_law, r_v=self.r_v)
+        grid_kw.update(kcorr_kw)
+        info = {}
+        for system, bands in by_system.items():
+            grid = kcorr_grid
+            if grid is None:
+                grid = KCorrectionGrid.cached(system, bands=bands, **grid_kw)
+            delta, inf = grid.offsets(log_teff, log_g, feh_star,
+                                      self.redshift, bands=bands)
+            info[system] = inf
+            for filt in bands:
+                self.delta_mag[filt] = delta[filt]
+                self._iso_full[filt] = self._iso_full[filt] + delta[filt]
+        self.kcorr_info = info
 
     @property
     def isochrone_full(self):
         """MIST entire isochrone in a structured `~numpy.ndarray`."""
         return self._iso_full
+
+    @property
+    def mag_table_rest(self):
+        """
+        The magnitude columns before any redshift or dust correction.
+
+        `None` when nothing was applied, in which case `mag_table` is already
+        the rest-frame table.
+        """
+        return self._mags_rest
+
+    def set_redshift(self, redshift, a_v_host=None, a_v_mw=None):
+        """
+        Recompute the magnitude columns at a new redshift (and/or dust).
+
+        The pre-correction columns are kept, so this restores them and applies
+        the new correction rather than correcting an already-corrected table --
+        which would be wrong by the old offset and would look almost right.
+        """
+        filters = list(self.mag_table.colnames)
+        if self._mags_rest is not None:
+            for filt in filters:
+                self._iso_full[filt] = self._mags_rest[filt]
+        self.redshift = float(redshift)
+        if a_v_host is not None:
+            self.a_v_host = float(a_v_host)
+        if a_v_mw is not None:
+            self.a_v_mw = float(a_v_mw)
+        self.delta_mag = {f: 0.0 for f in filters}
+        self.kcorr_info = None
+        self._mags_rest = None
+        if self.redshift != 0.0 or self.a_v_host != 0.0 or self.a_v_mw != 0.0:
+            self._apply_band_offsets(filters, None, {})
+        self.mag_table = Table(self._iso_full[filters])
+        return self
 
     @staticmethod
     def from_parsec(fn, **kwargs):

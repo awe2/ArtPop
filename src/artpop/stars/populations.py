@@ -41,10 +41,18 @@ class StellarPopulation(metaclass=abc.ABCMeta):
         locations of the breaks).
     """
 
-    def __init__(self, distance=10.0 * u.pc, a_lam=0.0, imf='kroupa', imf_kw=None):
+    def __init__(self, distance=10.0 * u.pc, a_lam=0.0, imf='kroupa',
+                 imf_kw=None, redshift=0.0):
         self.imf = imf
         self.imf_kw = {} if imf_kw is None else imf_kw
         self.distance = check_units(distance, 'Mpc')
+        # `distance` is the LUMINOSITY distance and `redshift` is free of it:
+        # nothing here derives one from the other, in either direction, so
+        # mu(z) stays something data can constrain rather than something this
+        # simulator assumed. See `distance_angular` for the single place the
+        # two are related, and why that is a metric identity and not a
+        # cosmology.
+        self.redshift = float(redshift)
         self.a_lam = a_lam
 
     def build_pop(self, num_stars=None, **kwargs):
@@ -53,8 +61,44 @@ class StellarPopulation(metaclass=abc.ABCMeta):
 
     @property
     def dist_mod(self):
-        """The distance modulus."""
+        """
+        The distance modulus, ``5 log10(D_L / 10 pc)``.
+
+        Purely a function of the luminosity distance. The band-shift term is
+        **not** here -- it is per star, not per galaxy, so it lives on the
+        isochrone's magnitude columns (`MISTIsochrone._apply_band_offsets`).
+        Folding a galaxy-averaged K in here instead would look reasonable and
+        would bias SBF distances by ~10%.
+        """
         return 5 * np.log10(self.distance.to('pc').value) - 5
+
+    def distance_angular(self, eta=1.0):
+        """
+        Angular-diameter distance, ``D_A = D_L / [(1 + z)^2 eta^2]``.
+
+        This is **Etherington's distance-duality relation** -- a consequence of
+        photon conservation in any metric theory, not a cosmological model. It
+        does not smuggle in a cosmology and it does not constrain ``D_L`` given
+        ``z``. It is the only place in this design where two of the three free
+        parameters (``distance``, ``redshift``, ``r_eff``) are related, which
+        is why it is a method with a visible ``eta`` rather than a hidden
+        conversion.
+
+        Parameters
+        ----------
+        eta : float, optional
+            Distance-duality parameter, so a violation can itself be probed.
+            Default: 1.0, i.e. duality holds.
+
+        Returns
+        -------
+        d_a : `~astropy.units.Quantity`
+            The angular-diameter distance. At ``z = 0`` this is exactly
+            ``distance``, bit for bit.
+        """
+        if self.redshift == 0.0 and eta == 1.0:
+            return self.distance
+        return self.distance / ((1.0 + self.redshift) ** 2 * float(eta) ** 2)
 
     @property
     def num_pops(self):
@@ -158,6 +202,44 @@ class StellarPopulation(metaclass=abc.ABCMeta):
         """
         self.distance = check_units(distance, 'Mpc')
 
+    def set_redshift(self, redshift):
+        """
+        Change the redshift of the stellar population.
+
+        Unlike `set_distance`, this is not a scalar swap: the band-shift
+        correction is per star and is baked into the isochrone's magnitude
+        columns, so the isochrone is recomputed and every star's absolute
+        magnitude is re-derived from it.
+
+        Raises
+        ------
+        Exception
+            If the population has an integrated (smooth) component, i.e. if a
+            ``mag_limit`` was given. Both the bright/faint row split and the
+            analytic sums over the faint rows are functions of ``z``, so
+            changing it after the fact would leave a population whose sampled
+            stars had been corrected and whose smooth component had not --
+            precisely the kind of silent inconsistency this correction exists
+            to avoid. Rebuild with ``redshift=`` instead.
+        """
+        z = float(redshift)
+        if z == self.redshift:
+            return
+        if getattr(self, 'has_integrated_component', False):
+            raise Exception(
+                'cannot set_redshift on a population with an integrated '
+                'component: the mag_limit row split and the smooth-component '
+                'moments both depend on z. Rebuild the population with '
+                f'redshift={z} instead.')
+        iso = self.isochrone
+        if not hasattr(iso, 'set_redshift'):
+            raise Exception(f'{type(iso).__name__} cannot recompute its '
+                            'magnitudes at a new redshift')
+        iso.set_redshift(z)
+        self.redshift = z
+        for filt in self.filters:
+            self.abs_mags[filt] = iso.interpolate(filt, self.initial_masses)
+
     def star_mags(self, bandpass, select=None):
         """
         Get the stellar apparent magnitudes.
@@ -222,7 +304,13 @@ class StellarPopulation(metaclass=abc.ABCMeta):
         if integrated is not None:
             f_int = 10**(-0.4*integrated)
             log_dddd = 4 * np.log10(self.distance.to('cm').value)
-            ff_int = 10**(self._integrated_log_lumlum[bandpass] - log_dddd)
+            # _integrated_log_lumlum is stored unextincted; extinction must be
+            # applied here so that mbar dims by +a_lam like every flux-like
+            # quantity (matching f_int, which inherits a_lam through
+            # mag_integrated_component). Applied at call time so an a_lam
+            # assigned after the population is built is still honored.
+            ff_int = 10**(self._integrated_log_lumlum[bandpass] - log_dddd
+                          - 0.8 * self.a_lam[bandpass])
         else:
             f_int = 0.0
             ff_int = 0.0
@@ -382,12 +470,20 @@ class SSP(StellarPopulation):
     def __init__(self, isochrone, num_stars=None, total_mass=None,
                  distance=10*u.pc, a_lam=0.0, mag_limit=None, mag_limit_band=None,
                  imf='kroupa', imf_kw=None, mass_tolerance=0.01,
-                 add_remnants=True, random_state=None):
+                 add_remnants=True, random_state=None, sampling='lf'):
+        if sampling not in ('lf', 'mass'):
+            raise ValueError(f"sampling must be 'lf' or 'mass', got {sampling!r}")
         self.isochrone = isochrone
         self.filters = isochrone.filters
-        super(SSP, self).__init__(distance=distance, a_lam=a_lam, imf=imf, imf_kw=imf_kw)
+        # taken from the isochrone rather than accepted as a second argument,
+        # so the population's z and the z its magnitudes were corrected at
+        # cannot disagree
+        super(SSP, self).__init__(distance=distance, a_lam=a_lam, imf=imf,
+                                  imf_kw=imf_kw,
+                                  redshift=getattr(isochrone, 'redshift', 0.0))
         self.mag_limit = mag_limit
         self.mag_limit_band = mag_limit_band
+        self.sampling = sampling
         self.rng = check_random_state(random_state)
         self.build_pop(num_stars, total_mass, mass_tolerance, add_remnants)
         self._r = {'M_star': f'{self.total_mass.value:.2e} M_sun'}
@@ -417,6 +513,16 @@ class SSP(StellarPopulation):
             and black holes.
         """
 
+        # Luminosity-function (isochrone-row) sampling is the default when a
+        # mag_limit is given: the sampled set is selected by ROW BRIGHTNESS,
+        # which the limit actually constrains, rather than by a mass threshold,
+        # which it does not (on an old isochrone the entire white-dwarf cooling
+        # track sits above the mass threshold but below the magnitude limit,
+        # so the mass path allocates millions of stars to render a handful).
+        # The mag_limit=None path below is unchanged from stock ArtPop.
+        if self.mag_limit is not None and getattr(self, 'sampling', 'lf') == 'lf':
+            return self._build_pop_lf(num_stars, total_mass, add_remnants)
+
         # get isochrone object and info
         m_min, m_max = self.isochrone.m_min, self.isochrone.m_max
         imf_kw = self.imf_kw.copy()
@@ -440,11 +546,15 @@ class SSP(StellarPopulation):
 
         if num_stars is not None:
 
-            # sample imf
-            num_stars_sample = int(num_stars * f_num_sampled)
-            self.initial_masses = sample_imf(
-                num_stars_sample, m_min=m_min, m_max=m_max, imf=self.imf,
-                random_state=self.rng, imf_kw=imf_kw)
+            if f_num_sampled > 0:
+                # sample imf
+                num_stars_sample = int(num_stars * f_num_sampled)
+                self.initial_masses = sample_imf(
+                    num_stars_sample, m_min=m_min, m_max=m_max, imf=self.imf,
+                    random_state=self.rng, imf_kw=imf_kw)
+            else:
+                # fully smooth: no star qualifies for individual sampling
+                self.initial_masses = np.array([])
 
             # star masses are interpolated from "actual" mass
             self.star_masses = iso.interpolate('mact', self.initial_masses)
@@ -469,21 +579,34 @@ class SSP(StellarPopulation):
             # we increase the sampled mass to account for mass loss
             sampled_mass /= mass_loss
 
-            # sample initial masses
-            mean_mass = imfint.m_integrate(m_min, m_max)
-            mean_mass /= imfint.integrate(m_min, m_max)
-            num_stars_iter = int(mass_tolerance * sampled_mass / mean_mass)
-            self.initial_masses = build_galaxy(
-                sampled_mass, m_min=m_min, m_max=m_max, imf=self.imf,
-                random_state=self.rng, num_stars_iter=num_stars_iter, **imf_kw)
+            if f_num_sampled > 0:
+                # sample initial masses
+                mean_mass = imfint.m_integrate(m_min, m_max)
+                mean_mass /= imfint.integrate(m_min, m_max)
+                num_stars_iter = int(mass_tolerance * sampled_mass / mean_mass)
+                self.initial_masses = build_galaxy(
+                    sampled_mass, m_min=m_min, m_max=m_max, imf=self.imf,
+                    random_state=self.rng, num_stars_iter=num_stars_iter,
+                    **imf_kw)
 
-            # star masses are interpolated from "actual" mass
-            self.star_masses = iso.interpolate('mact', self.initial_masses)
-            self.sampled_mass = self.star_masses.sum()
+                # star masses are interpolated from "actual" mass
+                self.star_masses = iso.interpolate('mact', self.initial_masses)
+                self.sampled_mass = self.star_masses.sum()
 
-            # calculate approximate number of stars in integrated component
-            factor = (1 - f_num_sampled) / f_num_sampled
-            self.num_stars_integrated = int(self.num_stars * factor)
+                # calculate approximate number of stars in integrated component
+                factor = (1 - f_num_sampled) / f_num_sampled
+                self.num_stars_integrated = int(self.num_stars * factor)
+            else:
+                # fully smooth: every star lives in the integrated component.
+                # The stock expressions above divide by f_num_sampled and
+                # cannot represent this case.
+                self.initial_masses = np.array([])
+                self.star_masses = np.array([])
+                self.sampled_mass = 0.0
+                mean_all = (imfint.m_integrate(iso.m_min, iso.m_max)
+                            / imfint.integrate(iso.m_min, iso.m_max))
+                self.num_stars_integrated = int(
+                    total_mass * remnants_factor / mass_loss / mean_all)
 
         else:
 
@@ -553,6 +676,157 @@ class SSP(StellarPopulation):
                     vals_interp = iso.interpolate(attr, self.initial_masses)
                     setattr(self, attr, vals_interp)
 
+        # row-sampling bookkeeping (populated by the LF path; trivial here)
+        n_rows = len(np.asarray(iso.mini))
+        self.sampled_row_mask = (np.ones(n_rows, dtype=bool)
+                                 if self.mag_limit is None else None)
+        self.row_counts = None
+        self.n_total_expected = None
+
+    def _lf_row_split(self):
+        """
+        Number-normalized IMF weight per isochrone row and the mask of rows
+        brighter than ``mag_limit``.
+
+        The comparison uses unextincted apparent magnitudes
+        (``mag_table + dist_mod``, no ``a_lam``): ``mag_limit`` is an
+        intrinsic apparent-magnitude limit, consistent with
+        ``sample_fraction`` and with callers that assign extinction after the
+        population is built.
+
+        Returns
+        -------
+        w : `~numpy.ndarray`
+            IMF weight per row (fraction of all stars formed in
+            ``[m_min, m_max]`` that live in that row; sums to 1).
+        bright : `~numpy.ndarray` of bool
+            True for rows at or brighter than ``mag_limit``.
+        """
+        if self.mag_limit_band is None:
+            raise Exception('Must give bandpass of limiting magnitude.')
+        iso = self.isochrone
+        w = iso.imf_weights(self.imf, m_max_norm=iso.m_max,
+                            norm_type='number')
+        mags = np.asarray(iso.mag_table[self.mag_limit_band]) + self.dist_mod
+        bright = mags <= self.mag_limit
+        return w, bright
+
+    def _build_pop_lf(self, num_stars=None, total_mass=None,
+                      add_remnants=True):
+        """
+        Build a mag-limited population by sampling the luminosity function.
+
+        Stars brighter than ``mag_limit`` are drawn per isochrone row with
+        probability proportional to the row's IMF weight (per-row Poisson
+        counts, realized as a Poisson total plus a categorical row draw), and
+        each star's initial mass is drawn uniformly within its row's half-bin
+        so magnitudes are continuous. Every row fainter than the limit —
+        including the entire white-dwarf cooling track — goes into the smooth
+        component analytically. The sampled and smooth sets are therefore
+        exact complements in row space: nothing is allocated and then culled,
+        the number of stars sampled is the number rendered, and the total
+        flux and luminosity-squared moments are independent of where the
+        limit falls (in expectation).
+        """
+        iso = self.isochrone
+        remnants_factor = self._remnants_factor() if add_remnants else 1.0
+
+        w, bright = self._lf_row_split()
+        faint = ~bright
+        self.has_integrated_component = bool(faint.any())
+
+        # live (surviving) mass per star formed, in the row-binned
+        # representation used for every analytic sum below, so that mass
+        # bookkeeping is internally consistent
+        mact = np.asarray(iso.mact, dtype=float)
+        live_mass_per_star = float(np.sum(w * mact))
+
+        if num_stars is not None:
+            n_total = float(num_stars)
+        elif total_mass is not None:
+            total_mass = check_units(total_mass, 'Msun').to('Msun').value
+            n_total = total_mass * remnants_factor / live_mass_per_star
+        else:
+            raise Exception('you must give total mass *or* number of stars')
+
+        w_bright = float(w[bright].sum())
+        if self.has_integrated_component:
+            self.frac_num_sampled = w_bright
+            self.frac_mass_sampled = float(
+                np.sum(w[bright] * mact[bright])) / live_mass_per_star
+        else:
+            # exact unity so `frac_num_sampled < 1.0` gates (source.py) do
+            # not fire on float round-off
+            self.frac_num_sampled = 1.0
+            self.frac_mass_sampled = 1.0
+
+        # informational, kept for API compatibility with the mass path
+        self.sampled_mass_lower_limit = (
+            float(np.asarray(iso.mini)[bright].min()) if bright.any()
+            else iso.m_max)
+
+        # draw the sampled stars: Poisson total, categorical row assignment,
+        # then a uniform initial mass within each star's row half-bin (the
+        # same bins the weights integrate, so the split stays an exact
+        # complement)
+        lam = n_total * w_bright
+        n_sampled = int(self.rng.poisson(lam)) if lam > 0 else 0
+        if n_sampled > 0:
+            cdf = np.cumsum(w[bright])
+            cdf /= cdf[-1]
+            idx = np.searchsorted(cdf, self.rng.uniform(size=n_sampled))
+            rows = np.flatnonzero(bright)[idx]
+            m1, m2 = iso.imf_bin_edges()
+            self.initial_masses = self.rng.uniform(m1[rows], m2[rows])
+        else:
+            rows = np.array([], dtype=int)
+            self.initial_masses = np.array([])
+        self.row_counts = np.bincount(rows, minlength=len(w))
+        self.sampled_row_mask = bright
+        self.n_total_expected = n_total
+
+        self.star_masses = iso.interpolate('mact', self.initial_masses)
+        self.sampled_mass = self.star_masses.sum()
+
+        self.abs_mags = {}
+        for filt in self.filters:
+            self.abs_mags[filt] = iso.interpolate(filt, self.initial_masses)
+
+        self.num_stars_integrated = max(
+            int(round(n_total * (1.0 - w_bright))), 0)
+
+        # smooth component: exact complement-row sums (expectation values)
+        if self.has_integrated_component:
+            faint_live_mass = n_total * float(np.sum(w[faint] * mact[faint]))
+            self.total_mass = (
+                (self.sampled_mass + faint_live_mass) / remnants_factor)
+
+            log_dddd = 4 * np.log10((10 * u.pc).to('cm').value)
+            self.integrated_abs_mags = {}
+            self._integrated_log_lumlum = {}
+            for filt in iso.filters:
+                f_row = 10**(-0.4 * np.asarray(iso.mag_table[filt],
+                                               dtype=float))
+                flux = n_total * float(np.sum(w[faint] * f_row[faint]))
+                self.integrated_abs_mags[filt] = -2.5 * np.log10(flux)
+                ff = n_total * float(np.sum(w[faint] * f_row[faint]**2))
+                self._integrated_log_lumlum[filt] = np.log10(ff) + log_dddd
+        else:
+            self.total_mass = self.sampled_mass / remnants_factor
+
+        self.live_star_mass = self.total_mass * remnants_factor
+        self.ssp_labels = np.ones(len(self.star_masses), dtype=int)
+
+        self.total_mass *= u.Msun
+        self.sampled_mass *= u.Msun
+        self.live_star_mass *= u.Msun
+
+        for attr in ['eep', 'log_L', 'log_Teff']:
+            if hasattr(iso, attr):
+                if getattr(iso, attr) is not None:
+                    vals_interp = iso.interpolate(attr, self.initial_masses)
+                    setattr(self, attr, vals_interp)
+
     def sample_fraction(self, mag_limit, mag_limit_band):
         """
         Calculate the fraction of stars by mass and number that will be
@@ -588,6 +862,14 @@ class SSP(StellarPopulation):
                     mag_limit - self.dist_mod, mag_limit_band).min()
                 f_num_sampled  = imfint.integrate(m_lim, iso.m_max, True)
                 f_mass_sampled = imfint.m_integrate(m_lim, iso.m_max, True)
+            elif mag_limit <= mags.min():
+                # a limit brighter than the isochrone tip means no star
+                # qualifies for individual sampling: the population is fully
+                # smooth. Falling through with the defaults (m_lim = m_min,
+                # f = 1) would silently sample *every* star instead.
+                m_lim = iso.m_max
+                f_num_sampled = 0.0
+                f_mass_sampled = 0.0
             else:
                 logger.warning(f'mag_lim = {mag_limit} is outside mag range.')
         return m_lim, f_num_sampled, f_mass_sampled
@@ -596,6 +878,9 @@ class SSP(StellarPopulation):
         assert StellarPopulation in ssp.__class__.__mro__, 'invalid type(s)'
         assert self.filters == ssp.filters, 'must have same filters'
         assert self.distance == ssp.distance, 'SSPs must have same distance'
+        # flux and luminosity-luminosity addition across SSPs is only meaningful
+        # if both were corrected to the same redshift
+        assert self.redshift == ssp.redshift, 'SSPs must have same redshift'
         new = deepcopy(self)
 
         if (
@@ -768,7 +1053,7 @@ class MISTSSP(SSP):
                  total_mass=None, distance=10*u.pc, a_lam=0.0, mag_limit=None,
                  mag_limit_band=None, imf='kroupa', mist_path=MIST_PATH,
                  imf_kw=None, mass_tolerance=0.05, add_remnants=True,
-                 random_state=None, **kwargs):
+                 random_state=None, sampling='lf', **kwargs):
 
         self.feh = feh
         self.log_age = log_age
@@ -788,7 +1073,8 @@ class MISTSSP(SSP):
             mass_tolerance=mass_tolerance,
             add_remnants=add_remnants,
             a_lam=a_lam,
-            random_state=random_state
+            random_state=random_state,
+            sampling=sampling
         )
 
         self._r.update({'log(age/yr)': self.log_age,

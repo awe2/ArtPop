@@ -1,6 +1,8 @@
 # Standard library
 import os
+import shutil
 import tarfile
+import tempfile
 
 # Third-party
 import requests
@@ -263,16 +265,44 @@ def fetch_mist_grid_if_needed(phot_system, v_over_vcrit=0.4,
             if chunk:
                 f.write(chunk)
     logger.info(f'Extracting grid from {os.path.basename(url)}.')
-    # A flat tarball is unpacked into the directory we name; one that carries
-    # its own top-level directory is unpacked beside it, as before.
-    dest = grid_path if layout['flat_tarball'] else mist_path
-    os.makedirs(dest, exist_ok=True)
-    with tarfile.open(tarball) as tar:
-        # numeric_owner=False + no chown: extracting as root would otherwise try
-        # to restore the archive's uid/gid and abort.
-        try:
-            tar.extractall(dest, filter='data')
-        except TypeError:                      # filter= is Python 3.12+
-            tar.extractall(dest)
+
+    # Extract into a staging directory and move it into place only once the
+    # tar has closed, so `grid_path` is either ABSENT or COMPLETE and never the
+    # half-populated thing the `isdir` check above would happily accept
+    # forever. A v2.5 grid is ~150 files / several GB and takes minutes to
+    # unpack; an in-place extractall that gets killed part-way leaves a
+    # directory that looks fetched, and every later run then dies on a
+    # FileNotFoundError for whichever [Fe/H] never landed.
+    staging = tempfile.mkdtemp(prefix=os.path.basename(grid_path) + '.staging.',
+                               dir=mist_path)
+    try:
+        # A flat tarball is unpacked into the directory we name; one that
+        # carries its own top-level directory is unpacked beside it, as before.
+        with tarfile.open(tarball) as tar:
+            # numeric_owner=False + no chown: extracting as root would otherwise
+            # try to restore the archive's uid/gid and abort.
+            try:
+                tar.extractall(staging, filter='data')
+            except TypeError:                  # filter= is Python 3.12+
+                tar.extractall(staging)
+        # flat tarballs unpacked loose into `staging`; the others brought their
+        # own top-level directory, which is the one to move
+        unpacked = (staging if layout['flat_tarball']
+                    else os.path.join(staging, os.path.basename(grid_path)))
+        if not os.path.isdir(unpacked):
+            raise Exception(
+                f'{os.path.basename(url)} did not contain the expected '
+                f'directory {os.path.basename(grid_path)}.')
+        stale = None
+        if os.path.exists(grid_path):          # overwrite=True, or a bad grid
+            stale = grid_path + '.stale'
+            shutil.rmtree(stale, ignore_errors=True)
+            os.replace(grid_path, stale)
+        os.replace(unpacked, grid_path)        # atomic within one filesystem
+        if stale is not None:
+            shutil.rmtree(stale, ignore_errors=True)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    # only now, with a complete grid in place, is the tarball redundant
     os.remove(tarball)
     return grid_path
