@@ -919,7 +919,11 @@ class SSP(StellarPopulation):
         new.total_mass = new.total_mass + ssp.total_mass
         new.sampled_mass = new.sampled_mass + ssp.sampled_mass
         new.live_star_mass = new.live_star_mass + ssp.live_star_mass
-        new.frac_mass_sampled = new.sampled_mass / new.live_star_mass
+        # A binned SFH can hand us empty bins (ALVISS prior v2: a narrow late
+        # peak leaves the oldest bins with zero mass and zero stars); the
+        # fractions are then 0, not a ZeroDivisionError (2026-09-18).
+        new.frac_mass_sampled = (new.sampled_mass / new.live_star_mass
+                                 if new.live_star_mass > 0 else 0.0)
 
         new_num_stars_total = new.num_stars + new.num_stars_integrated
         ssp_num_stars_total = ssp.num_stars + ssp.num_stars_integrated
@@ -929,13 +933,14 @@ class SSP(StellarPopulation):
         new.initial_masses = np.concatenate(
             [new.initial_masses, ssp.initial_masses])
         new.star_masses = np.concatenate([new.star_masses, ssp.star_masses])
-        new.frac_num_sampled = new.num_stars / total_num_stars
+        new.frac_num_sampled = (new.num_stars / total_num_stars
+                                if total_num_stars > 0 else 0.0)
 
         new.ssp_num_fracs = []
         new.ssp_mass_fracs = []
         for n, m in zip(new.ssp_total_num_stars, new.ssp_total_masses):
-            new.ssp_num_fracs.append(n / total_num_stars)
-            new.ssp_mass_fracs.append(m / new.total_mass)
+            new.ssp_num_fracs.append(n / total_num_stars if total_num_stars > 0 else 0.0)
+            new.ssp_mass_fracs.append(m / new.total_mass if new.total_mass > 0 else 0.0)
 
         # Loop over optional attributes.
         # Both SSPs must have the attribute to add them.
