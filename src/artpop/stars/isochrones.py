@@ -9,7 +9,7 @@ from astropy.table import Table
 from astropy import units as u
 
 # Project
-from ._read_mist_models import IsoCmdReader
+from ._read_mist_models import IsoCmdReader, read_isocmd, isocmd_block
 from .imf import IMFIntegrator
 from .. import MIST_PATH
 from ..log import logger
@@ -609,9 +609,11 @@ def fetch_mist_iso_cmd(log_age, feh, phot_system, mist_path=MIST_PATH,
     """
     fn = mist_iso_path(feh, phot_system, mist_path, v_over_vcrit, version,
                        a_over_fe)
-    iso_cmd = IsoCmdReader(fn, verbose=False)
-    iso_cmd = iso_cmd.isocmds[iso_cmd.age_index(log_age)]
-    return iso_cmd
+    # Through the binary cache (see `_read_mist_models.read_isocmd`): the text
+    # file is parsed once and memory-mapped afterwards; the returned block is
+    # bit-identical to what `IsoCmdReader` gives.
+    reader = read_isocmd(fn, mist_path)
+    return isocmd_block(reader, reader.age_index(log_age))
 
 
 def mist_iso_path(feh, phot_system, mist_path=MIST_PATH, v_over_vcrit=0.4,

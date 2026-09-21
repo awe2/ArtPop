@@ -161,3 +161,80 @@ class TestMISTVersions(TestCase):
         self.assertEqual('1.2', iso.version)
         self.assertEqual(0.0, iso.a_over_fe)
         self.assertAlmostEqual(1.287404, iso.zpt_offsets['H158'], places=6)
+
+
+class TestMISTBinaryCache(TestCase):
+    """The parsed-grid binary cache is a bit-identical no-op (ALVISS E-1 / V-12)."""
+
+    def setUp(self):
+        import os
+        import tempfile
+        from artpop.stars import _read_mist_models as m
+        from artpop.stars.isochrones import mist_iso_path
+        self._env = os.environ.get('ARTPOP_MIST_CACHE')
+        self.tmp = tempfile.mkdtemp(prefix='artpop_mist_cache_')
+        os.environ['ARTPOP_MIST_CACHE'] = self.tmp
+        m._read_isocmd_keyed.cache_clear()
+        self.m = m
+        self.fn = mist_iso_path(-1.5, 'LSST')
+
+    def tearDown(self):
+        import os
+        import shutil
+        if self._env is None:
+            os.environ.pop('ARTPOP_MIST_CACHE', None)
+        else:
+            os.environ['ARTPOP_MIST_CACHE'] = self._env
+        self.m._read_isocmd_keyed.cache_clear()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_cache_bit_identical(self):
+        import os
+        m = self.m
+        ref = m.IsoCmdReader(self.fn)
+        first = m.read_isocmd(self.fn)               # parses and writes
+        npy, meta = m.isocmd_cache_paths(self.fn, self.tmp)
+        self.assertTrue(os.path.isfile(npy) and os.path.isfile(meta))
+        m._read_isocmd_keyed.cache_clear()
+        cached = m.read_isocmd(self.fn)              # served from disk
+        self.assertIsInstance(cached, m.CachedIsoCmd)
+        self.assertEqual(cached.num_ages, ref.num_ages)
+        self.assertEqual(cached.ages, ref.ages)
+        self.assertEqual(cached.hdr_list, ref.hdr_list)
+        self.assertEqual((cached.version, cached.photo_sys, cached.abun,
+                          cached.Av_extinction, cached.rot),
+                         (ref.version, ref.photo_sys, ref.abun,
+                          ref.Av_extinction, ref.rot))
+        for i in range(ref.num_ages):
+            b = cached.block(i)
+            self.assertEqual(b.dtype, ref.isocmds[i].dtype)
+            self.assertTrue(np.array_equal(b, ref.isocmds[i]))
+        for age in (5.0, 7.13, 9.5, 10.3):
+            self.assertEqual(cached.age_index(age), ref.age_index(age))
+
+    def test_cache_invalidated_and_disabled(self):
+        import os
+        m = self.m
+        m.read_isocmd(self.fn)
+        npy, meta = m.isocmd_cache_paths(self.fn, self.tmp)
+        # a different source stamp -> the sidecar is stale and is rebuilt
+        import json
+        d = json.load(open(meta))
+        d['mtime_ns'] -= 1
+        json.dump(d, open(meta, 'w'))
+        m._read_isocmd_keyed.cache_clear()
+        self.assertIsNone(m._load_cached(self.fn, self.tmp))
+        self.assertIsInstance(m.read_isocmd(self.fn), m.CachedIsoCmd)
+        # ARTPOP_MIST_CACHE=0 bypasses the cache completely
+        os.environ['ARTPOP_MIST_CACHE'] = '0'
+        m._read_isocmd_keyed.cache_clear()
+        self.assertIsNone(m.isocmd_cache_root('~/.artpop/mist'))
+        self.assertIsInstance(m.read_isocmd(self.fn), m.IsoCmdReader)
+        # both routes give the same isochrone through the public function
+        from artpop.stars.isochrones import fetch_mist_iso_cmd
+        text = fetch_mist_iso_cmd(9.0, -1.5, 'LSST')
+        os.environ['ARTPOP_MIST_CACHE'] = self.tmp
+        m._read_isocmd_keyed.cache_clear()
+        cached = fetch_mist_iso_cmd(9.0, -1.5, 'LSST')
+        self.assertEqual(text.dtype, cached.dtype)
+        self.assertTrue(np.array_equal(text, cached))
