@@ -919,6 +919,68 @@ class TestRedshiftMIST(TestCase):
 
 
 @skipUnless(_HAVE_C3K, f'C3K not staged under {spectra_path()}')
+class TestC3KEmptyCells(TestCase):
+    """
+    Tier B (S-51, 2026-09-28): C3K's empty cells. FSPS ships C3K on a full
+    (log g, Teff) rectangle and marks cells with no ATLAS12 model with a
+    constant f_nu = 1e-33, below FSPS's own missing threshold (1e-30). MIST
+    v2.5's BC table fills exactly those cells with blackbody BCs, so the K
+    table serves them with a blackbody at the cell's Teff and flags every row
+    that touches one. Before this, the floor was integrated as a flat-f_nu
+    "star".
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.grid = KCorrectionGrid.build('LSST', z_grid=np.array([0.0, 0.05]))
+        cls.lib = C3KLibrary()
+
+    def test_e1_empty_cells_are_fsps_floor(self):
+        """E1: 399 cells at [Fe/H] = 0 hold the 1e-33 floor and nothing else."""
+        from artpop.kcorrect import c3k_missing_mask
+        g, t, f = self.lib.grid(0.0)
+        miss = c3k_missing_mask(f, self.lib.wave)
+        self.assertEqual(int(miss.sum()), 399)
+        self.assertTrue(np.all(np.asarray(f)[miss] == np.float32(1e-33)))
+        i0 = int(np.argmin(abs(self.grid.feh_grid - 0.0)))
+        np.testing.assert_array_equal(self.grid.c3k_bbfill[i0], miss)
+
+    def test_e2_empty_node_holds_the_blackbody_offset(self):
+        """E2: at an empty node the table holds a blackbody's Delta m at that
+        cell's Teff; at a genuine node, the model's own Delta m."""
+        from artpop.kcorrect import c3k_missing_mask
+        g, t, f = self.lib.grid(0.0)
+        lam = np.asarray(self.lib.wave, dtype=float)
+        miss = c3k_missing_mask(f, lam)
+        fs = load_filter_system('LSST', bands=['LSST_r'])
+        tw, tt = fs.get_trans('LSST_r')
+        i0 = int(np.argmin(abs(self.grid.feh_grid - 0.0)))
+        b = self.grid.bands.index('LSST_r')
+        ig, it = map(int, np.argwhere(miss)[len(np.argwhere(miss)) // 2])
+        bb = planck_lam(lam, 10 ** t[it]) * lam ** 2
+        want = band_offset(lam, bb, tw, tt, 0.05, flux_unit='f_nu')
+        self.assertAlmostEqual(float(self.grid.c3k[i0, ig, it, 1, b]), want, places=5)
+        jg, jt = map(int, np.argwhere(~miss)[0])
+        want = band_offset(lam, np.asarray(f[jg, jt], float), tw, tt, 0.05, flux_unit='f_nu')
+        self.assertAlmostEqual(float(self.grid.c3k[i0, jg, jt, 1, b]), want, places=5)
+
+    def test_e3_rows_touching_empty_cells_are_flagged(self):
+        """E3: a 45 kK, log g 3.3 row (next to the Eddington limit) is flagged;
+        a 5000 K dwarf is not; the flag is only ever set on C3K rows."""
+        _, info = self.grid.interpolate([np.log10(4.5e4), np.log10(5e3)],
+                                        [3.3, 4.5], [0.0, 0.0], 0.05)
+        self.assertEqual(info['c3k_bbfill'].tolist(), [True, False])
+        self.assertEqual(info['n_c3k_bbfill'], 1)
+
+    def test_e4_cache_key_is_versioned(self):
+        """E4: a table written before the fix can never be loaded for it."""
+        from artpop.kcorrect import KCORR_TABLE_VERSION
+        self.assertGreaterEqual(KCORR_TABLE_VERSION, 2)
+        self.assertTrue(KCorrectionGrid.cache_key('LSST').startswith(
+            f'kcorr_v{KCORR_TABLE_VERSION}_'))
+
+
+@skipUnless(_HAVE_C3K, f'C3K not staged under {spectra_path()}')
 class TestDustAxes(TestCase):
     """
     Tier D: A_V_host and A_V_mw as axes of the K table (F3_dust.ipynb 4.6).

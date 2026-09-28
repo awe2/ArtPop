@@ -25,7 +25,8 @@ from .filters import filter_curve_dir, load_filter_system
 __all__ = ['SpectralLibrary', 'C3KLibrary', 'TremblayWDLibrary',
            'BlackbodyLibrary', 'KCorrectionGrid', 'band_offset',
            'k_correction', 'band_weights', 'extinction_curve', 'air_to_vac',
-           'planck_lam',
+           'planck_lam', 'c3k_missing_mask', 'c3k_fill_blackbody',
+           'C3K_MISSING_FLUX', 'KCORR_TABLE_VERSION',
            'spectra_path', 'kcorr_cache_dir', 'C3K_HULL', 'WD_HULL',
            'DEFAULT_Z_GRID', 'DEFAULT_AV_HOST_GRID', 'DEFAULT_AV_MW_GRID',
            'SOURCE_NAMES', 'SOURCE_C3K',
@@ -95,6 +96,53 @@ DEFAULT_AV_MW_GRID = np.array([0.0, 0.25, 0.5])
 # blackbody fallback rather than an extrapolation.
 C3K_HULL = dict(teff=(2500.0, 50000.0), logg=(-1.0, 5.5))
 WD_HULL = dict(teff=(1500.0, 140000.0), logg=(6.5, 9.5))
+
+# C3K cells with NO model. FSPS ships C3K on the full (log g, Teff) rectangle
+# and marks cells where ATLAS12 has no model -- past the Eddington limit, and
+# log g 5.5 above ~15 kK -- with a constant f_nu = 1e-33 at every wavelength,
+# below FSPS's own missing threshold `tiny30` = 1e-30 (fsps sps_vars.f90;
+# getspec.f90: "the flux at 5000A should never be zero unless a spec is
+# missing"). 399 of 1120 cells at [Fe/H] = 0. MIST v2.5's own BC table fills
+# exactly those cells with BLACKBODY bolometric corrections (its fills match
+# blackbody BCs to <= 0.034 mag; measured 2026-09-28), so the K table does the
+# same: an empty cell is served by a blackbody at that cell's Teff, and every
+# row that touches one is flagged in `kcorr_info` (`n_c3k_bbfill`).
+C3K_MISSING_FLUX = 1e-30
+
+# Bumped whenever a table's CONTENTS change for the same arguments, so a cache
+# written by older code is never loaded silently. 2: C3K's empty cells served
+# by a blackbody (2026-09-28); tables before that read the 1e-33 floor as a
+# flat-f_nu star (ledger S-51).
+KCORR_TABLE_VERSION = 2
+
+
+def c3k_missing_mask(flux, wave):
+    """
+    ``(n_logg, n_logt)`` True where a C3K block holds no model: FSPS's test,
+    f_nu at 5000 A <= `C3K_MISSING_FLUX`.
+    """
+    i5 = int(np.argmin(np.abs(np.asarray(wave, dtype=float) - 5000.0)))
+    return np.asarray(flux[:, :, i5], dtype=float) <= C3K_MISSING_FLUX
+
+
+def c3k_fill_blackbody(flux, wave, logt):
+    """
+    A copy of a C3K block with every empty cell replaced by a blackbody at
+    that cell's Teff (f_nu, shape only -- K depends only on shape), and the
+    mask of the cells replaced. The library's own block is never modified.
+    """
+    missing = c3k_missing_mask(flux, wave)
+    if not missing.any():
+        return flux, missing
+    lam = np.asarray(wave, dtype=float)
+    out = np.array(flux, copy=True)
+    for j in np.flatnonzero(missing.any(axis=0)):
+        # planck_lam is B_lambda; B_nu ~ B_lambda lambda^2 (shape only)
+        bb = planck_lam(lam, 10 ** float(logt[j])) * lam ** 2
+        bb = (bb / bb.max()).astype(out.dtype)
+        out[missing[:, j], j] = bb
+    return out, missing
+
 
 C3K_FEH_GRID = np.array([-2.50, -2.25, -2.00, -1.75, -1.50, -1.25, -1.00,
                          -0.75, -0.50, -0.25, 0.00, 0.25, 0.50])
@@ -587,6 +635,9 @@ def _grid_offsets(lib, feh, curves, bands, z_grid, a_v_host, a_v_mw, ext):
     """
     logg, logt, flux = lib.grid(feh)
     lam = np.asarray(lib.wave, dtype=float)
+    if isinstance(lib, C3KLibrary):
+        # empty cells -> blackbody at the cell's Teff, as MIST v2.5 did
+        flux, _ = c3k_fill_blackbody(flux, lam, logt)
     qw = _trapz_weights(lam)
     n_b, n_z = len(bands), len(z_grid)
 
@@ -632,7 +683,7 @@ class KCorrectionGrid:
     extrapolated.
     """
 
-    _ARRAYS = ('z_grid', 'feh_grid', 'c3k_logg', 'c3k_logt', 'c3k',
+    _ARRAYS = ('z_grid', 'feh_grid', 'c3k_logg', 'c3k_logt', 'c3k', 'c3k_bbfill',
                'wd_logg', 'wd_logt', 'wd', 'bb_logt', 'bb',
                'av_host_grid', 'av_mw_grid')
 
@@ -645,11 +696,14 @@ class KCorrectionGrid:
 
     def __init__(self, bands, z_grid, feh_grid, c3k_logg, c3k_logt, c3k,
                  wd_logg, wd_logt, wd, bb_logt, bb, meta=None,
-                 av_host_grid=None, av_mw_grid=None):
+                 av_host_grid=None, av_mw_grid=None, c3k_bbfill=None):
         self.bands = list(bands)
         self.z_grid = np.asarray(z_grid, dtype=float)
         self.feh_grid = np.asarray(feh_grid, dtype=float)
         self.c3k_logg, self.c3k_logt, self.c3k = c3k_logg, c3k_logt, c3k
+        # (n_feh, n_logg, n_logt): C3K cells with no model, served by a blackbody
+        self.c3k_bbfill = (np.zeros(np.shape(c3k)[:3], dtype=bool) if c3k_bbfill is None
+                           else np.asarray(c3k_bbfill, dtype=bool))
         self.wd_logg, self.wd_logt, self.wd = wd_logg, wd_logt, wd
         self.bb_logt, self.bb = bb_logt, bb
         # empty = the dust pair is baked in (meta['a_v_host'], meta['a_v_mw']);
@@ -726,13 +780,15 @@ class KCorrectionGrid:
             arr = np.stack([o[2] for o in outs], axis=-2)
             return lg_, lt_, arr.reshape(arr.shape[:-2] + (axes[0].size, axes[1].size, arr.shape[-1]))
 
-        blocks, feh_grid = [], c3k_lib.feh_grid
+        blocks, fills, feh_grid = [], [], c3k_lib.feh_grid
         for feh in feh_grid:
             logg, logt, arr = over_pairs(c3k_lib, feh)
             blocks.append(arr)
+            fills.append(c3k_missing_mask(c3k_lib.grid(feh)[2], c3k_lib.wave))
             if verbose:
                 logger.info(f'K grid: C3K [Fe/H] = {feh:+.2f} done')
         c3k = np.stack(blocks)                       # (n_feh, n_g, n_t, n_z, [n_h, n_m,] n_b)
+        c3k_bbfill = np.stack(fills)                 # (n_feh, n_g, n_t)
         c3k_logg, c3k_logt = logg, logt
 
         wd_lib = TremblayWDLibrary(path=spectra)
@@ -760,7 +816,8 @@ class KCorrectionGrid:
         return cls(bands, z_grid, feh_grid, c3k_logg, c3k_logt, c3k,
                    wd_logg, wd_logt, wd, bb_logt, bb, meta,
                    av_host_grid=None if axes is None else axes[0],
-                   av_mw_grid=None if axes is None else axes[1])
+                   av_mw_grid=None if axes is None else axes[1],
+                   c3k_bbfill=c3k_bbfill)
 
     # -- persistence ------------------------------------------------------
     @staticmethod
@@ -791,7 +848,7 @@ class KCorrectionGrid:
                 h.update(np.ascontiguousarray(ax, dtype='<f8').tobytes())
             dust = (f'_avhax{axes[0].size}x{axes[0][-1]:.2f}'
                     f'_avmwax{axes[1].size}x{axes[1][-1]:.2f}')
-        return (f'kcorr_{phot_system}_{resolution}_afe{a_over_fe:+.1f}'
+        return (f'kcorr_v{KCORR_TABLE_VERSION}_{phot_system}_{resolution}_afe{a_over_fe:+.1f}'
                 f'{dust}_{str(extinction_law).lower()}_rv{r_v:.2f}'
                 f'_z{len(z_grid)}-{h.hexdigest()[:8]}.npz')
 
@@ -944,7 +1001,9 @@ class KCorrectionGrid:
         offsets : `~numpy.ndarray`, shape ``(n_star, n_band)``
             Column order is `bands`.
         info : dict
-            ``source`` (0 = C3K, 1 = Tremblay, 2 = blackbody), ``fallback``
+            ``source`` (0 = C3K, 1 = Tremblay, 2 = blackbody), ``c3k_bbfill``
+            (bool: a C3K row whose cell touches a C3K cell with no model, served
+            by a blackbody as MIST v2.5 did) with its tally ``n_c3k_bbfill``, ``fallback``
             (bool, the blackbody rows), ``feh_clipped`` (bool) and the tallies.
             Nothing is served silently: every row outside the production hull
             is flagged here, which is what test B5 asserts on.
@@ -1000,6 +1059,22 @@ class KCorrectionGrid:
                                 + at(in_c3k.sum())))
             source[in_c3k] = SOURCE_C3K
 
+        # rows whose interpolation cell touches a C3K cell with no model (served
+        # by a blackbody, as MIST v2.5 did there) -- recorded, never silent
+        bbfill = np.zeros(n, dtype=bool)
+        if in_c3k.any() and self.c3k_bbfill.any():
+            def lo(ax, x):
+                return np.clip(np.searchsorted(ax, x) - 1, 0, ax.size - 2)
+            f0 = lo(self.feh_grid, fe_clip[in_c3k])
+            g0 = lo(self.c3k_logg, lg[in_c3k])
+            t0 = lo(self.c3k_logt, lt[in_c3k])
+            hit = np.zeros(in_c3k.sum(), dtype=bool)
+            for df in (0, 1):
+                for dg in (0, 1):
+                    for dt in (0, 1):
+                        hit |= self.c3k_bbfill[f0 + df, g0 + dg, t0 + dt]
+            bbfill[in_c3k] = hit
+
         in_wd = np.zeros(n, dtype=bool)
         if self.has_wd:
             in_wd = (~in_c3k
@@ -1018,7 +1093,9 @@ class KCorrectionGrid:
                 + at(rest.sum())))
             source[rest] = SOURCE_BB
 
+        bbfill &= source == SOURCE_C3K
         info = dict(source=source, fallback=(source == SOURCE_BB),
+                    c3k_bbfill=bbfill, n_c3k_bbfill=int(bbfill.sum()),
                     feh_clipped=feh_clipped,
                     n_c3k=int((source == SOURCE_C3K).sum()),
                     n_wd=int((source == SOURCE_WD).sum()),
