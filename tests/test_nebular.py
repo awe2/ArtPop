@@ -227,7 +227,7 @@ class TestIonizingPhotons(TestCase):
         lg = np.array([c[1] for c in cases])
         ll = np.array([c[2] for c in cases])
         q, src = ionizing_rate(lt, lg, ll, 0.0)
-        self.assertTrue((src == neb.SOURCE_C3K).all())
+        self.assertTrue(np.isin(src, (neb.SOURCE_C3K, neb.SOURCE_C3K_LOGG)).all())
         for (t, g, l, logq), qq in zip(cases, q):
             self.assertLess(abs(np.log10(qq) - logq), 0.15,
                             f'{t:.0f} K: log Q = {np.log10(qq):.3f} vs {logq}')
@@ -243,6 +243,29 @@ class TestIonizingPhotons(TestCase):
         self.assertTrue(np.all(np.diff(q[:-1]) > 0))
         self.assertEqual(src[-1], neb.SOURCE_BB)
         self.assertLess(abs(np.log10(q[-1] / q[-2])), 0.3)
+
+    def test_n2c_fsps_fill_cells_are_detected_and_never_used(self):
+        """N2c: FSPS's C3K file fills the unphysical corner of the (log g, Teff)
+        rectangle with copies. At [Fe/H] = 0, 399 cells hold a spectrum found
+        at another Teff, and those are the cells whose spectrum is also
+        byte-identical at [Fe/H] = -1 (no real model is metallicity-blind).
+        A row there is served by genuine models only."""
+        lib = C3KLibrary()
+        g, t, f0 = lib.grid(0.0)
+        fill0 = neb.c3k_fill_mask(f0)
+        f0 = np.array(f0)                       # the library caches one block
+        _, _, f1 = lib.grid(-1.0)
+        same_feh = np.array([[np.array_equal(f0[i, j], f1[i, j]) and np.any(f0[i, j] > 0)
+                              for j in range(t.size)] for i in range(g.size)])
+        self.assertEqual(int(fill0.sum()), 399)
+        self.assertTrue(np.array_equal(fill0, same_feh))
+        cool_low = (int(np.argmin(abs(g + 1.0))), int(np.argmin(abs(t - 4.0))))
+        ms_hot = (int(np.argmin(abs(g - 4.0))), int(np.argmin(abs(t - np.log10(3e4)))))
+        self.assertTrue(fill0[cool_low])       # log g -1 at 10 kK: past Eddington
+        self.assertFalse(fill0[ms_hot])        # a 30 kK dwarf: a real model
+        # a supergiant-like row whose cell touches fills: never the fill spectrum
+        _, src = row_spectra([np.log10(4.5e4)], [3.3], 0.0)
+        self.assertEqual(int(src[0]), neb.SOURCE_C3K_LOGG)
 
     @skipUnless(_HAVE_TABLE, 'MAPPINGS table not built')
     def test_n5_birth_cloud_dust_is_the_band_offset_differential(self):
@@ -334,17 +357,14 @@ class TestNebularMIST(TestCase):
                                        np.asarray(direct.mag_table[f]),
                                        rtol=0, atol=1e-10)
 
-    def test_n9_constant_sfr_ionizing_budget(self):
-        """N9 (external): a constant SFR sustained for 20 Myr emits
-        Q_H / SFR within 0.2 dex of 1.37e53 photons/s per Msun/yr
-        (Murphy et al. 2011 eq. 2, the Halpha calibration adopted by
-        Kennicutt & Evans 2012; Starburst99, Kroupa 0.1-100 Msun).
-        MIST's rotating (v/vcrit = 0.4) tracks are expected to sit above it."""
+    def _q_over_sfr(self, feh):
+        """Q_H / SFR (photons/s per Msun/yr) of a constant SFR held 20 Myr."""
         from artpop import MISTIsochrone
         log_ages = np.round(np.arange(5.0, 7.3001, 0.05), 2)
         q_per_msun = []
         for la in log_ages:
-            iso = MISTIsochrone(log_age=la, **self._kw)
+            iso = MISTIsochrone(log_age=la, feh=feh, phot_system='LSST',
+                                version='2.5')
             # rows cooler than ~8 kK emit no measurable Q_H; skipping them
             # keeps this test to seconds
             m = (np.asarray(iso.mini) <= 100.0) & (np.asarray(iso.log_Teff) >= 3.9)
@@ -356,8 +376,21 @@ class TestNebularMIST(TestCase):
             q_per_msun.append(float(np.sum(w[m] * q)))
         t_yr = 10 ** log_ages
         # Q(t) = SFR * INT_0^t q(t') dt'; the first node stands in for 0-0.1 Myr
-        total = np.sum(_trapz_weights(t_yr) * np.array(q_per_msun)) \
+        return np.sum(_trapz_weights(t_yr) * np.array(q_per_msun)) \
             + q_per_msun[0] * t_yr[0]
-        offset = np.log10(total / 1.37e53)
-        print(f'N9: log[Q/SFR / Murphy+11] = {offset:+.3f} dex')
+
+    def test_n9_constant_sfr_ionizing_budget(self):
+        """N9 (external): at SOLAR metallicity, a constant SFR held for 20 Myr
+        emits Q_H / SFR within 0.2 dex of 1.37e53 photons/s per Msun/yr
+        (Murphy et al. 2011 eq. 2, the Halpha calibration Kennicutt & Evans
+        2012 adopt; Starburst99, Kroupa 0.1-100 Msun, solar). Measured
+        2026-09-28: +0.08 dex. At [Fe/H] = -1 the budget must come out HIGHER
+        (hotter, longer-lived metal-poor rotating massive stars; +0.34 dex
+        measured) -- the calibration does not apply there, the direction does."""
+        solar = self._q_over_sfr(0.0)
+        offset = np.log10(solar / 1.37e53)
+        poor = self._q_over_sfr(-1.0)
+        print(f'N9: log[Q/SFR / Murphy+11] = {offset:+.3f} dex (solar), '
+              f'{np.log10(poor / 1.37e53):+.3f} dex ([Fe/H] = -1)')
         self.assertLess(abs(offset), 0.2)
+        self.assertGreater(poor, solar)

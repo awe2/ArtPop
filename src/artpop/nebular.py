@@ -264,24 +264,75 @@ class MappingsLineTable:
 # ---------------------------------------------------------------------------
 # per-row spectra and the ionizing photon rate
 # ---------------------------------------------------------------------------
-SOURCE_C3K, SOURCE_BB = 0, 2
+# 0: C3K models only; 1: C3K, with at least one corner a fill cell replaced by
+# the nearest genuine model in log g at the same Teff; 2: blackbody
+SOURCE_C3K, SOURCE_C3K_LOGG, SOURCE_BB = 0, 1, 2
 _BB_WAVE = np.geomspace(10.0, 1.0e6, 20000)      # Angstrom
 _SIGMA_SB = 5.670374419e-5                        # erg / s / cm^2 / K^4
 
 
+def c3k_fill_mask(flux):
+    """
+    Cells of an FSPS C3K block that hold a **fill**, not a model.
+
+    FSPS ships C3K on a full (log g, log Teff) rectangle, but ATLAS12 models
+    exist only inside the physical region. The rest is filled with copies:
+    along log g at the same Teff (FSPS's own nearest-log g extension, accepted
+    here), and -- past the Eddington limit and at log g 5.5 above ~15 kK -- with
+    one spectrum that is byte-identical at every [Fe/H] (399 of 1120 cells;
+    measured 2026-09-28). A cell whose spectrum is identical to a cell at a
+    **different Teff** is such a fill; that single-block test flags exactly the
+    same cells as the cross-[Fe/H] identity.
+    """
+    import hashlib
+    n_g, n_t = flux.shape[:2]
+    first_t = {}
+    keys = np.empty((n_g, n_t), dtype=object)
+    for i in range(n_g):
+        for j in range(n_t):
+            spec = np.ascontiguousarray(flux[i, j])
+            if not np.any(spec > 0):
+                continue
+            k = hashlib.sha1(spec.tobytes()).digest()
+            keys[i, j] = k
+            first_t.setdefault(k, set()).add(j)
+    fill = np.zeros((n_g, n_t), dtype=bool)
+    for i in range(n_g):
+        for j in range(n_t):
+            k = keys[i, j]
+            if k is not None and len(first_t[k]) > 1:
+                fill[i, j] = True
+    return fill
+
+
+_C3K_MAPS = {}
+
+
 def _c3k_block(lib, feh):
     """
-    C3K block at one [Fe/H] node, its f_nu -> f_lam factor and the bolometric
-    flux of every node (the spectra stay float32 f_nu; only the corners a row
-    uses are converted and normalised, in `row_spectra`).
+    C3K block at one [Fe/H] node: its f_nu -> f_lam factor, the bolometric
+    flux of every cell, and ``use[ig, it]``, the log g index of the genuine
+    model that serves that cell (itself, or the nearest genuine cell in log g
+    at the same Teff when it is a fill; -1 when the Teff column has none).
+    The spectra stay float32 f_nu; only the corners a row uses are converted
+    and normalised, in `row_spectra`.
     """
     logg, logt, flux = lib.grid(feh)
     lam = np.asarray(lib.wave, dtype=float)
     to_flam = C_AA / lam ** 2
     bol = np.asarray(flux.reshape(-1, lam.size) @ (to_flam * _trapz_weights(lam)),
                      dtype=float).reshape(flux.shape[:2])
-    valid = np.isfinite(bol) & (bol > 0)
-    return logg, logt, lam, flux, to_flam, bol, valid
+    key = (lib.resolution, lib.a_over_fe, float(feh))
+    if key not in _C3K_MAPS:
+        good = np.isfinite(bol) & (bol > 0) & ~c3k_fill_mask(flux)
+        use = np.full(good.shape, -1, dtype=int)
+        for it in range(good.shape[1]):
+            gi = np.flatnonzero(good[:, it])
+            if gi.size:
+                use[:, it] = gi[np.argmin(np.abs(logg[:, None] - logg[gi][None, :]), axis=1)]
+        _C3K_MAPS[key] = (good, use)
+    good, use = _C3K_MAPS[key]
+    return logg, logt, lam, flux, to_flam, bol, good, use
 
 
 def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
@@ -289,10 +340,12 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
     One spectrum per row, **normalised to unit bolometric flux**.
 
     C3K inside its hull, bilinear in (log g, log Teff) between the four
-    surrounding nodes of the nearest [Fe/H] node (corners with no model are
-    dropped and the weights renormalised); a blackbody at the row's Teff
-    outside the hull or when no corner is valid. The source is recorded per
-    row, never silent.
+    surrounding cells of the nearest [Fe/H] node. A corner that is an FSPS
+    **fill** (`c3k_fill_mask`) is served by the nearest genuine model in log g
+    at the same Teff, and the row is flagged `SOURCE_C3K_LOGG`; a corner with no
+    genuine model in its Teff column is dropped and the weights renormalised; a
+    blackbody at the row's Teff outside the hull or when no corner survives.
+    The source is recorded per row, never silent.
 
     Returns
     -------
@@ -300,7 +353,7 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
         Rows ``idx`` share the wavelength grid ``lam``; ``f_lam`` is
         ``(len(idx), len(lam))`` with ``INT f_lam dlam = 1``.
     source : `~numpy.ndarray`
-        0 = C3K, 2 = blackbody, per row.
+        0 = C3K, 1 = C3K with a log g-extended corner, 2 = blackbody.
     """
     lt = np.atleast_1d(np.asarray(log_teff, dtype=float))
     lg = np.atleast_1d(np.asarray(log_g, dtype=float))
@@ -314,7 +367,7 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
                & (lg >= C3K_HULL['logg'][0]) & (lg <= C3K_HULL['logg'][1]))
     if in_hull.any() and lib.available:
         feh_node = float(lib.feh_grid[np.argmin(np.abs(lib.feh_grid - float(feh)))])
-        g_ax, t_ax, lam, flux, to_flam, bol, valid = _c3k_block(lib, feh_node)
+        g_ax, t_ax, lam, flux, to_flam, bol, good, use = _c3k_block(lib, feh_node)
 
         def norm(ig, it):
             return np.asarray(flux[ig, it], dtype=float) * to_flam / bol[ig, it]
@@ -322,6 +375,7 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
         rows = np.flatnonzero(in_hull)
         out = np.zeros((rows.size, lam.size))
         ok = np.zeros(rows.size, dtype=bool)
+        extended = np.zeros(rows.size, dtype=bool)
         for j, r in enumerate(rows):
             ig = int(np.clip(np.searchsorted(g_ax, lg[r]) - 1, 0, g_ax.size - 2))
             it = int(np.clip(np.searchsorted(t_ax, lt[r]) - 1, 0, t_ax.size - 2))
@@ -332,15 +386,21 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
             for dg, wg in ((0, 1 - fg), (1, fg)):
                 for dt, wt in ((0, 1 - ft), (1, ft)):
                     w = wg * wt
-                    if w > 0 and valid[ig + dg, it + dt]:
-                        out[j] += w * norm(ig + dg, it + dt)
-                        wsum += w
+                    if w <= 0:
+                        continue
+                    src_g = use[ig + dg, it + dt]
+                    if src_g < 0:
+                        continue
+                    if src_g != ig + dg:
+                        extended[j] = True
+                    out[j] += w * norm(src_g, it + dt)
+                    wsum += w
             if wsum > 0:
                 out[j] /= wsum
                 ok[j] = True
         if ok.any():
             groups.append((rows[ok], lam, out[ok]))
-            source[rows[ok]] = SOURCE_C3K
+            source[rows[ok]] = np.where(extended[ok], SOURCE_C3K_LOGG, SOURCE_C3K)
 
     bb = np.flatnonzero(source == SOURCE_BB)
     if bb.size:
@@ -372,7 +432,7 @@ def ionizing_rate(log_teff, log_g, log_l, feh, resolution='c3k_hr',
     Hydrogen-ionizing photon rate ``Q_H`` (photons / s) of each row, before
     any capture by the nebula (no knob, no Teff threshold).
 
-    Returns ``(q_h, source)``; ``source`` is 0 (C3K) or 2 (blackbody) per row.
+    Returns ``(q_h, source)``; ``source`` per row as in `row_spectra`.
     """
     lt = np.atleast_1d(np.asarray(log_teff, dtype=float))
     ll = np.atleast_1d(np.asarray(log_l, dtype=float))

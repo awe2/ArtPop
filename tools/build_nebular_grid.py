@@ -59,6 +59,14 @@ def _source_dir(arg):
 
 
 def _nebulabayes_version(src):
+    # an unpacked wheel or site-packages keeps its dist-info beside the package
+    import glob
+    for meta in glob.glob(os.path.join(src, os.pardir, os.pardir,
+                                       'NebulaBayes-*.dist-info', 'METADATA')):
+        with open(meta) as fh:
+            for line in fh:
+                if line.startswith('Version:'):
+                    return line.split(':', 1)[1].strip()
     try:
         import NebulaBayes
         return getattr(NebulaBayes, '__version__', 'unknown')
@@ -87,8 +95,17 @@ def build(src, lam_min, lam_max):
     out = Table()
     for ax, name in _AXES.items():
         out[name] = np.asarray(grid[ax], dtype=np.float32)
+    # MAPPINGS prints a line only above 1e-5 of Hbeta (the smallest finite
+    # value anywhere in the grid is exactly 1.0e-5); below it the grid holds
+    # NaN -- e.g. [OIII]5007 at the highest O/H and lowest U, where it truly
+    # vanishes. NaN therefore means "< 1e-5 Hbeta" and is stored as 0.
+    n_nan = {}
     for c in lines:
-        out[c] = np.asarray(grid[c], dtype=np.float32)
+        v = np.asarray(grid[c], dtype=np.float32)
+        bad = ~np.isfinite(v)
+        if bad.any():
+            n_nan[c] = int(bad.sum())
+        out[c] = np.where(bad, np.float32(0.0), v)
     out.meta = {
         'description': 'MAPPINGS V HII-region line fluxes relative to Hbeta, '
                        'converted for artpop.nebular',
@@ -102,6 +119,9 @@ def build(src, lam_min, lam_max):
                  'log_p': 'log P/k [K cm^-3]'},
         'wavelengths': 'air, Angstrom (artpop converts to vacuum with air_to_vac)',
         'lambda_air_aa': {c: lam_air[c] for c in lines},
+        'below_print_threshold': 'NaN in the source (a line under MAPPINGS\' '
+                                 '1e-5 Hbeta print threshold) stored as 0',
+        'n_nan_set_to_zero': n_nan,
     }
     return out
 
