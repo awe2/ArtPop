@@ -23,6 +23,7 @@ if not __ARTPOP_SETUP__:
             os.mkdir(MIST_PATH)
     from .filters import *
     from .kcorrect import *
+    from .nebular import NebularConfig, MappingsLineTable
     from .stars import *
     from .image import *
     from .space import *

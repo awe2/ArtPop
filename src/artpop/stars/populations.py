@@ -14,6 +14,7 @@ from ..util import check_random_state, check_units
 from ..log import logger
 from .imf import sample_imf, build_galaxy, IMFIntegrator
 from .isochrones import MISTIsochrone
+from ..nebular import is_active as is_nebular_active
 
 
 __all__ = ['SSP', 'MISTSSP', 'constant_sb_stars_per_pix']
@@ -239,6 +240,7 @@ class StellarPopulation(metaclass=abc.ABCMeta):
         self.redshift = z
         for filt in self.filters:
             self.abs_mags[filt] = iso.interpolate(filt, self.initial_masses)
+        self._attach_nebular()
 
     def star_mags(self, bandpass, select=None):
         """
@@ -484,6 +486,9 @@ class SSP(StellarPopulation):
         self.mag_limit = mag_limit
         self.mag_limit_band = mag_limit_band
         self.sampling = sampling
+        # the nebular knob lives on the isochrone, like z and dust, so the
+        # population and its magnitudes cannot disagree about it
+        self.nebular = getattr(isochrone, 'nebular', None)
         self.rng = check_random_state(random_state)
         self.build_pop(num_stars, total_mass, mass_tolerance, add_remnants)
         self._r = {'M_star': f'{self.total_mass.value:.2e} M_sun'}
@@ -675,6 +680,7 @@ class SSP(StellarPopulation):
                 if getattr(iso, attr) is not None:
                     vals_interp = iso.interpolate(attr, self.initial_masses)
                     setattr(self, attr, vals_interp)
+        self._attach_nebular()
 
         # row-sampling bookkeeping (populated by the LF path; trivial here)
         n_rows = len(np.asarray(iso.mini))
@@ -682,6 +688,24 @@ class SSP(StellarPopulation):
                                  if self.mag_limit is None else None)
         self.row_counts = None
         self.n_total_expected = None
+
+    def _attach_nebular(self):
+        """
+        Per-star share of each band's light that goes into the nebular blob.
+
+        Interpolated from the isochrone rows in initial mass, exactly as the
+        magnitudes are, so the mass and LF samplers need no special case and a
+        star between an O/B row and a cooler one gets a continuous fraction.
+        Set only when the isochrone's nebular knob is active.
+        """
+        blob = getattr(self.isochrone, 'nebular_blob_frac', None)
+        if blob is None:
+            return
+        from scipy.interpolate import interp1d
+        mini = np.asarray(self.isochrone.mini)
+        self.nebular_blob_frac = {
+            filt: np.clip(interp1d(mini, frac)(self.initial_masses), 0.0, 1.0)
+            for filt, frac in blob.items()}
 
     def _lf_row_split(self):
         """
@@ -826,6 +850,7 @@ class SSP(StellarPopulation):
                 if getattr(iso, attr) is not None:
                     vals_interp = iso.interpolate(attr, self.initial_masses)
                     setattr(self, attr, vals_interp)
+        self._attach_nebular()
 
     def sample_fraction(self, mag_limit, mag_limit_band):
         """
@@ -949,6 +974,24 @@ class SSP(StellarPopulation):
                 new_attr = getattr(new, attr)
                 ssp_attr = getattr(ssp, attr)
                 setattr(new, attr, np.concatenate([new_attr, ssp_attr]))
+
+        # nebular: one knob per composite; a bin with no young stars (or no
+        # config) contributes zeros, so the per-star arrays stay aligned
+        a, b = getattr(new, 'nebular', None), getattr(ssp, 'nebular', None)
+        if is_nebular_active(a) and is_nebular_active(b):
+            assert a == b, 'SSPs must have the same nebular configuration'
+        new.nebular = a if is_nebular_active(a) else b
+        nb_new = getattr(new, 'nebular_blob_frac', None)
+        nb_ssp = getattr(ssp, 'nebular_blob_frac', None)
+        if nb_new is not None or nb_ssp is not None:
+            n_ssp = len(ssp.star_masses)
+            n_new = len(new.star_masses) - n_ssp
+            bands = list((nb_new or nb_ssp).keys())
+            new.nebular_blob_frac = {
+                f: np.concatenate([
+                    nb_new[f] if nb_new is not None else np.zeros(n_new),
+                    nb_ssp[f] if nb_ssp is not None else np.zeros(n_ssp)])
+                for f in bands}
 
         new_label = np.ones(len(ssp.star_masses), dtype=int)
         new_label *= len(new.isochrone)

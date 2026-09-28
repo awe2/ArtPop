@@ -62,6 +62,10 @@ class Source(object):
             self.xy = np.asarray(xy)
             mask = np.ones(len(self.xy), dtype=bool)
         self.labels = labels if labels is None else np.asarray(labels)[mask]
+        # which of the population's stars survived the frame mask, so
+        # per-star population arrays (e.g. the nebular blob fractions) can be
+        # subset the same way the magnitudes just were
+        self.star_mask = mask
         self.xy_dim = check_xy_dim(xy_dim)
         if pixel_scale is not None:
             self.pixel_scale = check_units(pixel_scale, u.arcsec / u.pixel)
@@ -692,7 +696,7 @@ class UniformSSP(Source):
             self.ssp_kw['version'] = isochrone.version
             self.ssp_kw['a_over_fe'] = isochrone.a_over_fe
             for attr in ('redshift', 'a_v_host', 'a_v_mw', 'r_v',
-                         'extinction_law'):
+                         'extinction_law', 'nebular'):
                 self.ssp_kw[attr] = getattr(isochrone, attr)
             self.sp = MISTSSP(**self.ssp_kw)
             labels = _check_label_type(self.sp, label_type)

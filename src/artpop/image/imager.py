@@ -13,6 +13,7 @@ from astropy.convolution import convolve_fft
 from fast_histogram import histogram2d
 
 # Project
+from ..nebular import is_active as _nebular_active, nebular_kernel
 from ..util import check_units, check_random_state
 from ..filters import FilterSystem, get_filter_names, get_filter_properties
 from ..source import Source
@@ -116,6 +117,30 @@ class ArtObservation(Observation):
         self.mag_error = mag_error
 
 
+def _nebular_star_fraction(source, bandpass):
+    """
+    Per-star blob fraction for the stars this source kept, or None when
+    there is no active nebular knob (the only case that changes nothing).
+    """
+    sp = getattr(source, 'sp', None)
+    if sp is None or not _nebular_active(getattr(sp, 'nebular', None)):
+        return None
+    fracs = getattr(sp, 'nebular_blob_frac', None)
+    if fracs is None or bandpass not in fracs:
+        return None
+    frac = np.asarray(fracs[bandpass], dtype=float)
+    keep = getattr(source, 'star_mask', None)
+    if keep is not None and len(keep) == len(frac):
+        frac = frac[keep]
+    if len(frac) != source.num_stars:
+        raise ValueError(
+            f'nebular blob fractions ({len(frac)}) do not match the '
+            f'source\'s {source.num_stars} stars')
+    if not np.any(frac > 0):
+        return None
+    return frac
+
+
 mAB_0 = 48.6
 def fnu_from_AB_mag(mag):
     """
@@ -172,6 +197,37 @@ class Imager(metaclass=abc.ABCMeta):
             _x, _y, _s = x, y, signal
         image = histogram2d(_x, _y, bins=bins, weights=_s, range=hist_range).T
         return image
+
+    def inject_source_stars(self, source, bandpass, signal, mask=None):
+        """
+        Inject a source's stars, spreading the nebular share of young O/B
+        stars' light into a blob first (`artpop.nebular`).
+
+        With no active nebular knob this is exactly
+        ``inject_stars(source.x, source.y, signal, source.xy_dim, mask)``.
+        Otherwise each star's signal is split: ``(1 - f_blob)`` stays a point
+        and ``f_blob`` is binned into a second image and convolved with a
+        unit-sum Gaussian of physical FWHM ``fwhm_pc`` at the source's D_A.
+        This happens **before** the smooth model and the PSF, so it applies
+        with or without a PSF (the LSST injection route passes none).
+        """
+        frac = _nebular_star_fraction(source, bandpass)
+        if frac is None:
+            return self.inject_stars(source.x, source.y, signal,
+                                     source.xy_dim, mask)
+        signal = np.asarray(signal, dtype=float)
+        image = self.inject_stars(source.x, source.y, signal * (1.0 - frac),
+                                  source.xy_dim, mask)
+        blob = self.inject_stars(source.x, source.y, signal * frac,
+                                 source.xy_dim, mask)
+        sp = source.sp
+        d_a = getattr(source, 'distance_angular', None)
+        if d_a is None:
+            d_a = sp.distance_angular()
+        kernel = nebular_kernel(sp.nebular.fwhm_pc, d_a, source.pixel_scale)
+        blob = convolve_fft(blob, kernel, boundary='fill',
+                            normalize_kernel=True)
+        return image + blob
 
     def apply_seeing(self, image, psf=None, boundary='wrap'):
         """
@@ -284,8 +340,7 @@ class IdealImager(Imager):
         """
         self._check_source(source)
         flux = 10**(0.4 * (zpt - source.mags[bandpass]))
-        image = self.inject_stars(source.x, source.y, flux,
-                                  source.xy_dim, mask)
+        image = self.inject_source_stars(source, bandpass, flux, mask)
         image = self.inject_smooth_model(image, source, bandpass, zpt)
         image = self.apply_seeing(image, psf, **kwargs)
         observation = IdealObservation(image=image, bandpass=bandpass, zpt=zpt)
@@ -586,8 +641,8 @@ class ArtImager(Imager):
         self._check_source(source)
         exptime = check_units(exptime, 's')
         counts = self.mag_to_counts(source.mags[bandpass], bandpass, exptime)
-        src_counts = self.inject_stars(source.x, source.y,
-                                       counts, source.xy_dim, mask)
+        src_counts = self.inject_source_stars(source, bandpass, counts,
+                                              mask)
         src_counts = self.inject_smooth_model(src_counts, source,
                                               bandpass, exptime, zpt)
         src_counts = self.apply_seeing(src_counts, psf, **kwargs)

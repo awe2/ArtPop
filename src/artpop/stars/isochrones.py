@@ -16,6 +16,8 @@ from ..log import logger
 from ..filters import phot_system_list, get_filter_names
 from ..filters import load_zero_point_converter, phot_system_lookup
 from ..kcorrect import KCorrectionGrid
+from ..nebular import NebularConfig, apply_to_rows as apply_nebular_to_rows
+from ..nebular import is_active as is_nebular_active
 from ..util import (check_units, fetch_mist_grid_if_needed,
                     mist_version_layout, DEFAULT_MIST_VERSION)
 
@@ -726,6 +728,10 @@ class MISTIsochrone(Isochrone):
         change the dust axes. A dust pair inside the axes (by default
         A_V_host <= 1, A_V_mw <= 0.5) is interpolated in a shared table;
         outside them it is computed exactly, with a warning.
+    nebular : `~artpop.nebular.NebularConfig` or dict, optional
+        The nebular emission knob: birth-cloud dust, MAPPINGS emission lines
+        and the blob fraction on the young O/B rows (`artpop.nebular`).
+        ``None`` (default) or ``knob = 0`` changes nothing, bit for bit.
 
     Attributes
     ----------
@@ -736,6 +742,15 @@ class MISTIsochrone(Isochrone):
         Per photometric system: which spectral-library backend served each row
         (C3K, Tremblay or the blackbody fallback) and how many rows had their
         [Fe/H] clipped to the library's range. Nothing is served silently.
+    nebular_delta_mag : dict
+        The nebular offset per row and filter (after K and dust); 0.0 when
+        inactive.
+    nebular_blob_frac : dict or None
+        Per row and filter, the share of the light spread into the blob; None
+        when inactive.
+    nebular_info : dict or None
+        Per row ``q_h`` (captured ionizing photons / s) and spectral source,
+        the gas state and the lines used.
     """
 
     # the age grid
@@ -757,7 +772,8 @@ class MISTIsochrone(Isochrone):
                  ab_or_vega='ab', v_over_vcrit=0.4,
                  version=DEFAULT_MIST_VERSION, a_over_fe=0.0,
                  redshift=0.0, a_v_host=0.0, a_v_mw=0.0, r_v=3.1,
-                 extinction_law='F99', kcorr_grid=None, kcorr_kw=None):
+                 extinction_law='F99', kcorr_grid=None, kcorr_kw=None,
+                 nebular=None):
 
         # verify age are metallicity are within model grids
         if log_age < self._log_age_min or log_age > self._log_age_max:
@@ -861,6 +877,13 @@ class MISTIsochrone(Isochrone):
         if self.redshift != 0.0 or self.a_v_host != 0.0 or self.a_v_mw != 0.0:
             self._apply_band_offsets(filters, kcorr_grid, kcorr_kw or {})
 
+        # nebular emission around young O/B stars, on top of K and dust. An
+        # inactive config (None or knob = 0) touches nothing (test N1).
+        self.nebular = NebularConfig.coerce(nebular)
+        self._reset_nebular(filters)
+        if is_nebular_active(self.nebular):
+            self._apply_nebular(filters)
+
         super(MISTIsochrone, self).__init__(
             mini = self._iso_full['initial_mass'],
             mact = self._iso_full['star_mass'],
@@ -954,6 +977,50 @@ class MISTIsochrone(Isochrone):
                 self._iso_full[filt] = self._iso_full[filt] + delta[filt]
         self.kcorr_info = info
 
+    def _reset_nebular(self, filters):
+        """The no-nebular state: nothing moved, no blob."""
+        self.nebular_delta_mag = {f: 0.0 for f in filters}
+        self.nebular_blob_frac = None
+        self.nebular_info = None
+
+    def _apply_nebular(self, filters):
+        """
+        Birth-cloud dust + nebular lines on the young O/B rows, per band.
+
+        Runs after `_apply_band_offsets`, on the K- and dust-corrected columns,
+        for the same reason that one lives here: every consumer of `mag_table`
+        -- the sampled stars, the smooth component's two moments, SBF and the
+        ``mag_limit`` row split -- then sees the nebular light consistently.
+        The per-row share of each band's light that is spread into the blob is
+        kept in `nebular_blob_frac` and carried to the stars by the population.
+        See `artpop.nebular` for the physics.
+        """
+        from ..filters import load_filter_system
+        if self._mags_rest is None:
+            self._mags_rest = Table(self._iso_full[filters].copy())
+
+        by_system = {}
+        lookup = phot_system_lookup()
+        for filt in filters:
+            by_system.setdefault(lookup[filt], []).append(filt)
+        curves = {}
+        for system, bands in by_system.items():
+            fs = load_filter_system(system, bands=bands)
+            curves.update({b: fs.get_trans(b) for b in bands})
+
+        mags = {f: np.asarray(self._iso_full[f], dtype=float) for f in filters}
+        new, blob, info = apply_nebular_to_rows(
+            self.nebular, mags, curves, self.log_age, self.feh,
+            self._iso_full['log_Teff'], self._iso_full['log_g'],
+            self._iso_full['log_L'], redshift=self.redshift,
+            a_v_host=self.a_v_host, a_v_mw=self.a_v_mw,
+            extinction_law=self.extinction_law, r_v=self.r_v)
+        for filt in filters:
+            self.nebular_delta_mag[filt] = new[filt] - mags[filt]
+            self._iso_full[filt] = new[filt]
+        self.nebular_blob_frac = blob
+        self.nebular_info = info
+
     @property
     def isochrone_full(self):
         """MIST entire isochrone in a structured `~numpy.ndarray`."""
@@ -991,6 +1058,10 @@ class MISTIsochrone(Isochrone):
         self._mags_rest = None
         if self.redshift != 0.0 or self.a_v_host != 0.0 or self.a_v_mw != 0.0:
             self._apply_band_offsets(filters, None, {})
+        # the lines land in different bands at a new z: recompute, never shift
+        self._reset_nebular(filters)
+        if is_nebular_active(self.nebular):
+            self._apply_nebular(filters)
         self.mag_table = Table(self._iso_full[filters])
         return self
 
