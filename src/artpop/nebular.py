@@ -264,49 +264,40 @@ class MappingsLineTable:
 # ---------------------------------------------------------------------------
 # per-row spectra and the ionizing photon rate
 # ---------------------------------------------------------------------------
-# 0: C3K models only; 1: C3K, with at least one corner a fill cell replaced by
-# the nearest genuine model in log g at the same Teff; 2: blackbody
+# 0: C3K models only; 1: C3K, with at least one corner an empty cell (no model)
+# replaced by the nearest model in log g at the same Teff -- a best guess; 2: blackbody
 SOURCE_C3K, SOURCE_C3K_LOGG, SOURCE_BB = 0, 1, 2
 _BB_WAVE = np.geomspace(10.0, 1.0e6, 20000)      # Angstrom
 _SIGMA_SB = 5.670374419e-5                        # erg / s / cm^2 / K^4
 
 
-def c3k_fill_mask(flux):
-    """
-    Cells of an FSPS C3K block that hold a **fill**, not a model.
+# FSPS's own threshold for "no model in this cell" (sps_vars.f90 `tiny30`;
+# getspec.f90: "the flux at 5000A should never be zero unless a spec is missing")
+C3K_MISSING_FLUX = 1e-30
 
-    FSPS ships C3K on a full (log g, log Teff) rectangle, but ATLAS12 models
-    exist only inside the physical region. Outside it (past the Eddington limit;
-    log g 5.5 above ~15 kK) all 399 of 1120 cells at [Fe/H] = 0 hold **one
-    placeholder spectrum**, byte-identical in every cell and at every [Fe/H]. It
-    is not a blackbody (best Planck fit 17 kK, 0.27 dex rms over 912 A - 2.5 um;
-    it has a 5 % deep Halpha absorption line) and it matches no genuine model
-    (0.30-0.45 dex from the 20-45 kK atmospheres); measured 2026-09-28. A cell
-    whose spectrum also appears at a **different Teff** is such a fill; that
-    single-block test flags exactly the cells the cross-[Fe/H] identity does.
-    (Cells repeated along log g at the same Teff -- FSPS's nearest-log g
-    extension -- are not flagged.) This is inside FSPS's files, not ArtPop's
-    blackbody or white-dwarf fallbacks, which serve only outside the rectangle.
+
+def c3k_missing_mask(flux, wave):
     """
-    import hashlib
-    n_g, n_t = flux.shape[:2]
-    first_t = {}
-    keys = np.empty((n_g, n_t), dtype=object)
-    for i in range(n_g):
-        for j in range(n_t):
-            spec = np.ascontiguousarray(flux[i, j])
-            if not np.any(spec > 0):
-                continue
-            k = hashlib.sha1(spec.tobytes()).digest()
-            keys[i, j] = k
-            first_t.setdefault(k, set()).add(j)
-    fill = np.zeros((n_g, n_t), dtype=bool)
-    for i in range(n_g):
-        for j in range(n_t):
-            k = keys[i, j]
-            if k is not None and len(first_t[k]) > 1:
-                fill[i, j] = True
-    return fill
+    Cells of an FSPS C3K block that hold **no model**, by FSPS's own test.
+
+    FSPS ships C3K on a full (log g, Teff) rectangle. Where ATLAS12 has no
+    model -- past the Eddington limit, and log g 5.5 above ~15 kK -- the cell
+    holds a constant f_nu = 1e-33 at every wavelength, below FSPS's `tiny30`
+    (1e-30), and FSPS's `getspec` treats it as missing: it warns "part of the
+    point is off the grid" and, in its words, "just pick[s] one of the spectra"
+    that exist. The criterion here is FSPS's: f_nu at 5000 A <= 1e-30.
+    Measured 2026-09-28: 399 of 1120 cells at [Fe/H] = 0 (407 at -1, 414 at
+    -2.5, 427 at +0.5); the genuine cells' f_nu(5000 A) starts at 1e-10.
+
+    Not flagged, because they carry real flux: ~250 cells per [Fe/H] that are
+    byte-identical to a neighbour along log g at the same Teff (e.g. 36 kK at
+    log g 3.5/4.0/4.5, 10 kK at 1.0/1.5/2.0), at the edges of the covered
+    region. That is a best-guess extension inside the distributed library;
+    it is undocumented as far as we found, and which cell of each group was
+    actually computed cannot be told from the file.
+    """
+    i5 = int(np.argmin(np.abs(np.asarray(wave, dtype=float) - 5000.0)))
+    return np.asarray(flux[:, :, i5], dtype=float) <= C3K_MISSING_FLUX
 
 
 _C3K_MAPS = {}
@@ -315,9 +306,12 @@ _C3K_MAPS = {}
 def _c3k_block(lib, feh):
     """
     C3K block at one [Fe/H] node: its f_nu -> f_lam factor, the bolometric
-    flux of every cell, and ``use[ig, it]``, the log g index of the genuine
-    model that serves that cell (itself, or the nearest genuine cell in log g
-    at the same Teff when it is a fill; -1 when the Teff column has none).
+    flux of every cell, and ``use[ig, it]``, the log g index of the model that
+    serves that cell: itself, or -- when the cell holds no model
+    (`c3k_missing_mask`) -- the nearest cell in log g at the same Teff that
+    does; -1 when the Teff column has none. **That substitution is our best
+    guess**, not a model: it assumes the spectrum at fixed Teff changes little
+    with log g, as FSPS's own "pick one of the spectra" fallback does.
     The spectra stay float32 f_nu; only the corners a row uses are converted
     and normalised, in `row_spectra`.
     """
@@ -328,7 +322,7 @@ def _c3k_block(lib, feh):
                      dtype=float).reshape(flux.shape[:2])
     key = (lib.resolution, lib.a_over_fe, float(feh))
     if key not in _C3K_MAPS:
-        good = np.isfinite(bol) & (bol > 0) & ~c3k_fill_mask(flux)
+        good = np.isfinite(bol) & (bol > 0) & ~c3k_missing_mask(flux, lam)
         use = np.full(good.shape, -1, dtype=int)
         for it in range(good.shape[1]):
             gi = np.flatnonzero(good[:, it])
@@ -344,9 +338,9 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
     One spectrum per row, **normalised to unit bolometric flux**.
 
     C3K inside its hull, bilinear in (log g, log Teff) between the four
-    surrounding cells of the nearest [Fe/H] node. A corner that is an FSPS
-    **fill** (`c3k_fill_mask`) is served by the nearest genuine model in log g
-    at the same Teff, and the row is flagged `SOURCE_C3K_LOGG`; a corner with no
+    surrounding cells of the nearest [Fe/H] node. A corner with **no model**
+    (`c3k_missing_mask`, FSPS's own test) is served by the nearest model in
+    log g at the same Teff -- a best guess, flagged per row `SOURCE_C3K_LOGG`; a corner with no
     genuine model in its Teff column is dropped and the weights renormalised; a
     blackbody at the row's Teff outside the hull or when no corner survives.
     The source is recorded per row, never silent.

@@ -244,27 +244,23 @@ class TestIonizingPhotons(TestCase):
         self.assertEqual(src[-1], neb.SOURCE_BB)
         self.assertLess(abs(np.log10(q[-1] / q[-2])), 0.3)
 
-    def test_n2c_fsps_fill_cells_are_detected_and_never_used(self):
-        """N2c: FSPS's C3K file fills the unphysical corner of the (log g, Teff)
-        rectangle with ONE placeholder spectrum (not a blackbody, not any
-        genuine model). At [Fe/H] = 0 it sits in 399 cells, exactly the cells
-        whose spectrum is also byte-identical at [Fe/H] = -1 (no real model is
-        metallicity-blind). A row there is served by genuine models only."""
+    def test_n2c_empty_c3k_cells_are_detected_and_never_used(self):
+        """N2c: FSPS's C3K file marks cells with no ATLAS12 model (past the
+        Eddington limit; log g 5.5 above ~15 kK) with a constant f_nu = 1e-33,
+        below FSPS's own `tiny30` = 1e-30. `c3k_missing_mask` applies FSPS's
+        test (f_nu at 5000 A <= 1e-30); a row whose cell touches one is served
+        from the nearest model in log g at the same Teff and flagged."""
         lib = C3KLibrary()
         g, t, f0 = lib.grid(0.0)
-        fill0 = neb.c3k_fill_mask(f0)
-        f0 = np.array(f0)                       # the library caches one block
-        _, _, f1 = lib.grid(-1.0)
-        same_feh = np.array([[np.array_equal(f0[i, j], f1[i, j]) and np.any(f0[i, j] > 0)
-                              for j in range(t.size)] for i in range(g.size)])
-        self.assertEqual(int(fill0.sum()), 399)
-        self.assertEqual(len({f0[i, j].tobytes() for i, j in np.argwhere(fill0)}), 1)
-        self.assertTrue(np.array_equal(fill0, same_feh))
+        miss = neb.c3k_missing_mask(f0, lib.wave)
+        self.assertEqual(int(miss.sum()), 399)
+        empty = np.asarray(f0, dtype=float)[miss]
+        self.assertTrue(np.all(empty == np.float32(1e-33)))      # a floor, not a spectrum
+        self.assertGreater(float(np.asarray(f0, dtype=float)[~miss][:, 5000 < np.asarray(lib.wave)].max()), 1e-12)
         cool_low = (int(np.argmin(abs(g + 1.0))), int(np.argmin(abs(t - 4.0))))
         ms_hot = (int(np.argmin(abs(g - 4.0))), int(np.argmin(abs(t - np.log10(3e4)))))
-        self.assertTrue(fill0[cool_low])       # log g -1 at 10 kK: past Eddington
-        self.assertFalse(fill0[ms_hot])        # a 30 kK dwarf: a real model
-        # a supergiant-like row whose cell touches fills: never the fill spectrum
+        self.assertTrue(miss[cool_low])        # log g -1 at 10 kK: past Eddington
+        self.assertFalse(miss[ms_hot])         # a 30 kK dwarf
         _, src = row_spectra([np.log10(4.5e4)], [3.3], 0.0)
         self.assertEqual(int(src[0]), neb.SOURCE_C3K_LOGG)
 
