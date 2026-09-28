@@ -246,10 +246,10 @@ class TestIonizingPhotons(TestCase):
 
     def test_n2c_fsps_fill_cells_are_detected_and_never_used(self):
         """N2c: FSPS's C3K file fills the unphysical corner of the (log g, Teff)
-        rectangle with copies. At [Fe/H] = 0, 399 cells hold a spectrum found
-        at another Teff, and those are the cells whose spectrum is also
-        byte-identical at [Fe/H] = -1 (no real model is metallicity-blind).
-        A row there is served by genuine models only."""
+        rectangle with ONE placeholder spectrum (not a blackbody, not any
+        genuine model). At [Fe/H] = 0 it sits in 399 cells, exactly the cells
+        whose spectrum is also byte-identical at [Fe/H] = -1 (no real model is
+        metallicity-blind). A row there is served by genuine models only."""
         lib = C3KLibrary()
         g, t, f0 = lib.grid(0.0)
         fill0 = neb.c3k_fill_mask(f0)
@@ -258,6 +258,7 @@ class TestIonizingPhotons(TestCase):
         same_feh = np.array([[np.array_equal(f0[i, j], f1[i, j]) and np.any(f0[i, j] > 0)
                               for j in range(t.size)] for i in range(g.size)])
         self.assertEqual(int(fill0.sum()), 399)
+        self.assertEqual(len({f0[i, j].tobytes() for i, j in np.argwhere(fill0)}), 1)
         self.assertTrue(np.array_equal(fill0, same_feh))
         cool_low = (int(np.argmin(abs(g + 1.0))), int(np.argmin(abs(t - 4.0))))
         ms_hot = (int(np.argmin(abs(g - 4.0))), int(np.argmin(abs(t - np.log10(3e4)))))

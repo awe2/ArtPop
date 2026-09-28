@@ -276,13 +276,17 @@ def c3k_fill_mask(flux):
     Cells of an FSPS C3K block that hold a **fill**, not a model.
 
     FSPS ships C3K on a full (log g, log Teff) rectangle, but ATLAS12 models
-    exist only inside the physical region. The rest is filled with copies:
-    along log g at the same Teff (FSPS's own nearest-log g extension, accepted
-    here), and -- past the Eddington limit and at log g 5.5 above ~15 kK -- with
-    one spectrum that is byte-identical at every [Fe/H] (399 of 1120 cells;
-    measured 2026-09-28). A cell whose spectrum is identical to a cell at a
-    **different Teff** is such a fill; that single-block test flags exactly the
-    same cells as the cross-[Fe/H] identity.
+    exist only inside the physical region. Outside it (past the Eddington limit;
+    log g 5.5 above ~15 kK) all 399 of 1120 cells at [Fe/H] = 0 hold **one
+    placeholder spectrum**, byte-identical in every cell and at every [Fe/H]. It
+    is not a blackbody (best Planck fit 17 kK, 0.27 dex rms over 912 A - 2.5 um;
+    it has a 5 % deep Halpha absorption line) and it matches no genuine model
+    (0.30-0.45 dex from the 20-45 kK atmospheres); measured 2026-09-28. A cell
+    whose spectrum also appears at a **different Teff** is such a fill; that
+    single-block test flags exactly the cells the cross-[Fe/H] identity does.
+    (Cells repeated along log g at the same Teff -- FSPS's nearest-log g
+    extension -- are not flagged.) This is inside FSPS's files, not ArtPop's
+    blackbody or white-dwarf fallbacks, which serve only outside the rectangle.
     """
     import hashlib
     n_g, n_t = flux.shape[:2]
