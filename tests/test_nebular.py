@@ -227,7 +227,7 @@ class TestIonizingPhotons(TestCase):
         lg = np.array([c[1] for c in cases])
         ll = np.array([c[2] for c in cases])
         q, src = ionizing_rate(lt, lg, ll, 0.0)
-        self.assertTrue(np.isin(src, (neb.SOURCE_C3K, neb.SOURCE_C3K_LOGG)).all())
+        self.assertTrue(np.isin(src, (neb.SOURCE_C3K, neb.SOURCE_C3K_BB)).all())
         for (t, g, l, logq), qq in zip(cases, q):
             self.assertLess(abs(np.log10(qq) - logq), 0.15,
                             f'{t:.0f} K: log Q = {np.log10(qq):.3f} vs {logq}')
@@ -244,25 +244,29 @@ class TestIonizingPhotons(TestCase):
         self.assertEqual(src[-1], neb.SOURCE_BB)
         self.assertLess(abs(np.log10(q[-1] / q[-2])), 0.3)
 
-    def test_n2c_empty_c3k_cells_are_detected_and_never_used(self):
+    def test_n2c_empty_c3k_cells_are_served_as_mist_does(self):
         """N2c: FSPS's C3K file marks cells with no ATLAS12 model (past the
         Eddington limit; log g 5.5 above ~15 kK) with a constant f_nu = 1e-33,
-        below FSPS's own `tiny30` = 1e-30. `c3k_missing_mask` applies FSPS's
-        test (f_nu at 5000 A <= 1e-30); a row whose cell touches one is served
-        from the nearest model in log g at the same Teff and flagged."""
+        below FSPS's own missing threshold. MIST v2.5's BC table -- and the K
+        table since v2 -- serve those cells with a blackbody at the cell's
+        Teff; the nebular spectra do the same, and flag the rows."""
+        from artpop.kcorrect import planck_lam, C_AA
         lib = C3KLibrary()
         g, t, f0 = lib.grid(0.0)
         miss = neb.c3k_missing_mask(f0, lib.wave)
         self.assertEqual(int(miss.sum()), 399)
-        empty = np.asarray(f0, dtype=float)[miss]
-        self.assertTrue(np.all(empty == np.float32(1e-33)))      # a floor, not a spectrum
-        self.assertGreater(float(np.asarray(f0, dtype=float)[~miss][:, 5000 < np.asarray(lib.wave)].max()), 1e-12)
-        cool_low = (int(np.argmin(abs(g + 1.0))), int(np.argmin(abs(t - 4.0))))
-        ms_hot = (int(np.argmin(abs(g - 4.0))), int(np.argmin(abs(t - np.log10(3e4)))))
-        self.assertTrue(miss[cool_low])        # log g -1 at 10 kK: past Eddington
-        self.assertFalse(miss[ms_hot])         # a 30 kK dwarf
-        _, src = row_spectra([np.log10(4.5e4)], [3.3], 0.0)
-        self.assertEqual(int(src[0]), neb.SOURCE_C3K_LOGG)
+        self.assertTrue(np.all(np.asarray(f0, dtype=float)[miss] == np.float32(1e-33)))
+        # a row sitting exactly on an empty node gets that node's blackbody
+        ig, it = map(int, np.argwhere(miss)[len(np.argwhere(miss)) // 2])
+        groups, src = row_spectra([t[it]], [g[ig]], 0.0)
+        idx, lam, spec = groups[0]
+        self.assertEqual(int(src[0]), neb.SOURCE_C3K_BB)
+        bb = planck_lam(lam, 10 ** t[it])                       # f_lam shape
+        bb = bb / (bb @ neb._trapz_weights(lam))
+        np.testing.assert_allclose(spec[0], bb, rtol=2e-6, atol=0)
+        # a row next to the Eddington limit is flagged; a 30 kK dwarf on a model is not
+        _, src = row_spectra([np.log10(4.5e4), np.log10(3.0e4)], [3.3, 4.0], 0.0)
+        self.assertEqual(src.tolist(), [neb.SOURCE_C3K_BB, neb.SOURCE_C3K])
 
     @skipUnless(_HAVE_TABLE, 'MAPPINGS table not built')
     def test_n5_birth_cloud_dust_is_the_band_offset_differential(self):

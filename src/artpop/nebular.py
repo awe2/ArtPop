@@ -53,9 +53,12 @@ from dataclasses import dataclass, asdict, fields
 import numpy as np
 
 from .log import logger
+from collections import OrderedDict
+
 from .kcorrect import (C_AA, C3KLibrary, C3K_HULL, _H, _trapz_weights,
                        air_to_vac, band_weights, extinction_curve,
-                       planck_lam)
+                       planck_lam, c3k_missing_mask, c3k_fill_blackbody,
+                       C3K_MISSING_FLUX)
 
 __all__ = ['NebularConfig', 'MappingsLineTable', 'row_spectra', 'ionizing_rate',
            'ionizing_photons_per_erg', 'line_band_abs_mags',
@@ -266,71 +269,43 @@ class MappingsLineTable:
 # ---------------------------------------------------------------------------
 # 0: C3K models only; 1: C3K, with at least one corner an empty cell (no model)
 # replaced by the nearest model in log g at the same Teff -- a best guess; 2: blackbody
-SOURCE_C3K, SOURCE_C3K_LOGG, SOURCE_BB = 0, 1, 2
+# 0: C3K models only; 1: C3K, with at least one corner a cell C3K has no model
+# for (FSPS's 1e-33 floor), served by a blackbody at that cell's Teff -- exactly
+# as MIST v2.5's BC table and the K table (table v2, ledger S-51) serve it; 2: a
+# blackbody at the row's own Teff (outside C3K's rectangle: > 50 kK, log g > 5.5)
+SOURCE_C3K, SOURCE_C3K_BB, SOURCE_BB = 0, 1, 2
 _BB_WAVE = np.geomspace(10.0, 1.0e6, 20000)      # Angstrom
 _SIGMA_SB = 5.670374419e-5                        # erg / s / cm^2 / K^4
 
-
-# FSPS's own threshold for "no model in this cell" (sps_vars.f90 `tiny30`;
-# getspec.f90: "the flux at 5000A should never be zero unless a spec is missing")
-C3K_MISSING_FLUX = 1e-30
-
-
-def c3k_missing_mask(flux, wave):
-    """
-    Cells of an FSPS C3K block that hold **no model**, by FSPS's own test.
-
-    FSPS ships C3K on a full (log g, Teff) rectangle. Where ATLAS12 has no
-    model -- past the Eddington limit, and log g 5.5 above ~15 kK -- the cell
-    holds a constant f_nu = 1e-33 at every wavelength, below FSPS's `tiny30`
-    (1e-30), and FSPS's `getspec` treats it as missing: it warns "part of the
-    point is off the grid" and, in its words, "just pick[s] one of the spectra"
-    that exist. The criterion here is FSPS's: f_nu at 5000 A <= 1e-30.
-    Measured 2026-09-28: 399 of 1120 cells at [Fe/H] = 0 (407 at -1, 414 at
-    -2.5, 427 at +0.5); the genuine cells' f_nu(5000 A) starts at 1e-10.
-
-    Not flagged, because they carry real flux: ~250 cells per [Fe/H] that are
-    byte-identical to a neighbour along log g at the same Teff (e.g. 36 kK at
-    log g 3.5/4.0/4.5, 10 kK at 1.0/1.5/2.0), at the edges of the covered
-    region. That is a best-guess extension inside the distributed library;
-    it is undocumented as far as we found, and which cell of each group was
-    actually computed cannot be told from the file.
-    """
-    i5 = int(np.argmin(np.abs(np.asarray(wave, dtype=float) - 5000.0)))
-    return np.asarray(flux[:, :, i5], dtype=float) <= C3K_MISSING_FLUX
-
-
-_C3K_MAPS = {}
+_C3K_BLOCKS = OrderedDict()
+_C3K_BLOCKS_MAX = 4
 
 
 def _c3k_block(lib, feh):
     """
-    C3K block at one [Fe/H] node: its f_nu -> f_lam factor, the bolometric
-    flux of every cell, and ``use[ig, it]``, the log g index of the model that
-    serves that cell: itself, or -- when the cell holds no model
-    (`c3k_missing_mask`) -- the nearest cell in log g at the same Teff that
-    does; -1 when the Teff column has none. **That substitution is our best
-    guess**, not a model: it assumes the spectrum at fixed Teff changes little
-    with log g, as FSPS's own "pick one of the spectra" fallback does.
-    The spectra stay float32 f_nu; only the corners a row uses are converted
-    and normalised, in `row_spectra`.
+    C3K block at one [Fe/H] node **as MIST v2.5 used it**: cells with no model
+    (`kcorrect.c3k_missing_mask`, FSPS's own test) replaced by a blackbody at the
+    cell's Teff (`kcorrect.c3k_fill_blackbody`) -- the same spectra the K table
+    is built from, so Q_H, the birth-cloud dust and Delta m all agree. Returns
+    the axes, wavelength, the filled f_nu block, the f_nu -> f_lam factor, the
+    bolometric flux of every cell and the mask of filled cells. The spectra
+    stay float32 f_nu; only the corners a row uses are converted and
+    normalised, in `row_spectra`. The last few blocks are kept in memory.
     """
-    logg, logt, flux = lib.grid(feh)
-    lam = np.asarray(lib.wave, dtype=float)
-    to_flam = C_AA / lam ** 2
-    bol = np.asarray(flux.reshape(-1, lam.size) @ (to_flam * _trapz_weights(lam)),
-                     dtype=float).reshape(flux.shape[:2])
-    key = (lib.resolution, lib.a_over_fe, float(feh))
-    if key not in _C3K_MAPS:
-        good = np.isfinite(bol) & (bol > 0) & ~c3k_missing_mask(flux, lam)
-        use = np.full(good.shape, -1, dtype=int)
-        for it in range(good.shape[1]):
-            gi = np.flatnonzero(good[:, it])
-            if gi.size:
-                use[:, it] = gi[np.argmin(np.abs(logg[:, None] - logg[gi][None, :]), axis=1)]
-        _C3K_MAPS[key] = (good, use)
-    good, use = _C3K_MAPS[key]
-    return logg, logt, lam, flux, to_flam, bol, good, use
+    key = (lib.resolution, lib.a_over_fe, float(feh), lib.root)
+    if key not in _C3K_BLOCKS:
+        logg, logt, raw = lib.grid(feh)
+        lam = np.asarray(lib.wave, dtype=float)
+        flux, filled = c3k_fill_blackbody(raw, lam, logt)
+        flux = np.array(flux, copy=True)             # never alias the library's cache
+        to_flam = C_AA / lam ** 2
+        bol = np.asarray(flux.reshape(-1, lam.size) @ (to_flam * _trapz_weights(lam)),
+                         dtype=float).reshape(flux.shape[:2])
+        _C3K_BLOCKS[key] = (logg, logt, lam, flux, to_flam, bol, filled)
+        while len(_C3K_BLOCKS) > _C3K_BLOCKS_MAX:
+            _C3K_BLOCKS.popitem(last=False)
+    _C3K_BLOCKS.move_to_end(key)
+    return _C3K_BLOCKS[key]
 
 
 def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
@@ -338,12 +313,11 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
     One spectrum per row, **normalised to unit bolometric flux**.
 
     C3K inside its hull, bilinear in (log g, log Teff) between the four
-    surrounding cells of the nearest [Fe/H] node. A corner with **no model**
-    (`c3k_missing_mask`, FSPS's own test) is served by the nearest model in
-    log g at the same Teff -- a best guess, flagged per row `SOURCE_C3K_LOGG`; a corner with no
-    genuine model in its Teff column is dropped and the weights renormalised; a
-    blackbody at the row's Teff outside the hull or when no corner survives.
-    The source is recorded per row, never silent.
+    surrounding cells of the nearest [Fe/H] node, with C3K read **as MIST v2.5
+    used it**: a cell with no model is a blackbody at that cell's Teff, and a
+    row touching one is flagged `SOURCE_C3K_BB`. Outside C3K's rectangle
+    (> 50 kK; log g > 5.5) a blackbody at the row's own Teff (`SOURCE_BB`), as
+    in MIST and the K table. The source is recorded per row, never silent.
 
     Returns
     -------
@@ -351,7 +325,7 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
         Rows ``idx`` share the wavelength grid ``lam``; ``f_lam`` is
         ``(len(idx), len(lam))`` with ``INT f_lam dlam = 1``.
     source : `~numpy.ndarray`
-        0 = C3K, 1 = C3K with a log g-extended corner, 2 = blackbody.
+        0 = C3K, 1 = C3K with a blackbody-filled corner, 2 = blackbody.
     """
     lt = np.atleast_1d(np.asarray(log_teff, dtype=float))
     lg = np.atleast_1d(np.asarray(log_g, dtype=float))
@@ -365,40 +339,28 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
                & (lg >= C3K_HULL['logg'][0]) & (lg <= C3K_HULL['logg'][1]))
     if in_hull.any() and lib.available:
         feh_node = float(lib.feh_grid[np.argmin(np.abs(lib.feh_grid - float(feh)))])
-        g_ax, t_ax, lam, flux, to_flam, bol, good, use = _c3k_block(lib, feh_node)
+        g_ax, t_ax, lam, flux, to_flam, bol, filled = _c3k_block(lib, feh_node)
 
         def norm(ig, it):
             return np.asarray(flux[ig, it], dtype=float) * to_flam / bol[ig, it]
 
         rows = np.flatnonzero(in_hull)
         out = np.zeros((rows.size, lam.size))
-        ok = np.zeros(rows.size, dtype=bool)
-        extended = np.zeros(rows.size, dtype=bool)
+        touched = np.zeros(rows.size, dtype=bool)
         for j, r in enumerate(rows):
             ig = int(np.clip(np.searchsorted(g_ax, lg[r]) - 1, 0, g_ax.size - 2))
             it = int(np.clip(np.searchsorted(t_ax, lt[r]) - 1, 0, t_ax.size - 2))
             fg = (lg[r] - g_ax[ig]) / (g_ax[ig + 1] - g_ax[ig])
             ft = (lt[r] - t_ax[it]) / (t_ax[it + 1] - t_ax[it])
             fg, ft = float(np.clip(fg, 0, 1)), float(np.clip(ft, 0, 1))
-            wsum = 0.0
             for dg, wg in ((0, 1 - fg), (1, fg)):
                 for dt, wt in ((0, 1 - ft), (1, ft)):
                     w = wg * wt
-                    if w <= 0:
-                        continue
-                    src_g = use[ig + dg, it + dt]
-                    if src_g < 0:
-                        continue
-                    if src_g != ig + dg:
-                        extended[j] = True
-                    out[j] += w * norm(src_g, it + dt)
-                    wsum += w
-            if wsum > 0:
-                out[j] /= wsum
-                ok[j] = True
-        if ok.any():
-            groups.append((rows[ok], lam, out[ok]))
-            source[rows[ok]] = np.where(extended[ok], SOURCE_C3K_LOGG, SOURCE_C3K)
+                    if w > 0:
+                        out[j] += w * norm(ig + dg, it + dt)
+                        touched[j] |= bool(filled[ig + dg, it + dt])
+        groups.append((rows, lam, out))
+        source[rows] = np.where(touched, SOURCE_C3K_BB, SOURCE_C3K)
 
     bb = np.flatnonzero(source == SOURCE_BB)
     if bb.size:
