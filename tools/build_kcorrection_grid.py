@@ -38,7 +38,8 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 
 from artpop.kcorrect import (KCorrectionGrid, C3KLibrary, TremblayWDLibrary,
-                             kcorr_cache_dir, spectra_path, DEFAULT_Z_GRID)
+                             kcorr_cache_dir, spectra_path, DEFAULT_Z_GRID,
+                             DEFAULT_AV_HOST_GRID, DEFAULT_AV_MW_GRID)
 
 DEFAULT_SYSTEMS = ['LSST', 'Roman']
 
@@ -47,9 +48,15 @@ def _grid_kw(args):
     z_grid = DEFAULT_Z_GRID
     if args.z_max is not None:
         z_grid = np.round(np.linspace(0.0, args.z_max, args.n_z), 6)
-    return dict(z_grid=z_grid, a_v_host=args.a_v_host, a_v_mw=args.a_v_mw,
-                extinction_law=args.law, r_v=args.r_v,
-                resolution=args.resolution, a_over_fe=args.a_over_fe)
+    kw = dict(z_grid=z_grid, extinction_law=args.law, r_v=args.r_v,
+              resolution=args.resolution, a_over_fe=args.a_over_fe)
+    if args.dust_axes:
+        if args.a_v_host or args.a_v_mw:
+            raise SystemExit('--dust-axes and fixed --a-v-host / --a-v-mw are exclusive')
+        kw.update(a_v_host_grid=DEFAULT_AV_HOST_GRID, a_v_mw_grid=DEFAULT_AV_MW_GRID)
+    else:
+        kw.update(a_v_host=args.a_v_host, a_v_mw=args.a_v_mw)
+    return kw
 
 
 def build(systems, cache_dir, check=False, **kw):
@@ -108,6 +115,10 @@ def main(argv=None):
                     help='rest-frame (host galaxy) V-band extinction')
     ap.add_argument('--a-v-mw', type=float, default=0.0,
                     help='observer-frame (Milky Way foreground) extinction')
+    ap.add_argument('--dust-axes', action='store_true',
+                    help='the table with A_V_host and A_V_mw as axes '
+                         '(kcorrect.DEFAULT_AV_HOST_GRID x DEFAULT_AV_MW_GRID), '
+                         'which serves any dust pair inside them')
     ap.add_argument('--law', default='F99', choices=('F99', 'CCM89', 'grey'))
     ap.add_argument('--r-v', type=float, default=3.1)
     ap.add_argument('--resolution', default='c3k_hr',

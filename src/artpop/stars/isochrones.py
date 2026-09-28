@@ -721,8 +721,11 @@ class MISTIsochrone(Isochrone):
         Use this prebuilt grid instead of building or loading one. Only valid
         for a single photometric system.
     kcorr_kw : dict, optional
-        Extra arguments for `~artpop.kcorrect.KCorrectionGrid.cached`, e.g.
-        ``z_grid`` or ``resolution``.
+        Extra arguments for `~artpop.kcorrect.KCorrectionGrid.for_dust`, e.g.
+        ``z_grid``, ``resolution``, or ``a_v_host_grid`` / ``a_v_mw_grid`` to
+        change the dust axes. A dust pair inside the axes (by default
+        A_V_host <= 1, A_V_mw <= 0.5) is interpolated in a shared table;
+        outside them it is computed exactly, with a warning.
 
     Attributes
     ----------
@@ -935,11 +938,16 @@ class MISTIsochrone(Isochrone):
         grid_kw.update(kcorr_kw)
         info = {}
         for system, bands in by_system.items():
-            grid = kcorr_grid
-            if grid is None:
-                grid = KCorrectionGrid.cached(system, bands=bands, **grid_kw)
+            if kcorr_grid is None:
+                # the dust-axis table for any pair inside its axes; an exact
+                # (baked, warned) table for a pair outside them
+                grid, dust_kw = KCorrectionGrid.for_dust(system, bands=bands, **grid_kw)
+            else:
+                grid = kcorr_grid
+                dust_kw = (dict(a_v_host=self.a_v_host, a_v_mw=self.a_v_mw)
+                           if grid.has_dust_axes else {})
             delta, inf = grid.offsets(log_teff, log_g, feh_star,
-                                      self.redshift, bands=bands)
+                                      self.redshift, bands=bands, **dust_kw)
             info[system] = inf
             for filt in bands:
                 self.delta_mag[filt] = delta[filt]

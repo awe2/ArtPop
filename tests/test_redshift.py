@@ -916,3 +916,161 @@ class TestRedshiftMIST(TestCase):
             np.testing.assert_allclose(np.asarray(iso.mag_table[filt]),
                                        np.asarray(stock.mag_table[filt]),
                                        rtol=0, atol=1e-12)
+
+
+@skipUnless(_HAVE_C3K, f'C3K not staged under {spectra_path()}')
+class TestDustAxes(TestCase):
+    """
+    Tier D: A_V_host and A_V_mw as axes of the K table (F3_dust.ipynb 4.6).
+
+    The axes were sized to keep the interpolation error in A_V under 1 mmag
+    over every library spectrum, band and redshift; these tests hold the
+    implementation to that and to the out-of-range rule (computed exactly,
+    with a warning, never extrapolated).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from artpop.kcorrect import DEFAULT_AV_HOST_GRID, DEFAULT_AV_MW_GRID
+        cls.tmp = tempfile.mkdtemp(prefix='kcorr_axes_')
+        cls.AH, cls.AM = DEFAULT_AV_HOST_GRID, DEFAULT_AV_MW_GRID
+        cls.kw = dict(bands=FILTERS, z_grid=np.array([0.0, 0.05, 0.10, 0.15, 0.20]))
+        cls.G = KCorrectionGrid.cached('LSST', cache_dir=cls.tmp, a_v_host_grid=cls.AH,
+                                       a_v_mw_grid=cls.AM, **cls.kw)
+        # stars across the CMD, off every stellar-parameter node, at a z node
+        cls.lt = np.log10(np.array([3800.0, 4200.0, 5000.0, 5800.0, 9000.0]))
+        cls.lg = np.array([4.8, 1.5, 2.6, 4.4, 4.0])
+        cls.fe, cls.z = -1.3, 0.15
+
+    def _baked(self, h, m):
+        return KCorrectionGrid.build('LSST', a_v_host=h, a_v_mw=m, **self.kw)
+
+    def _both(self, h, m):
+        a, _ = self.G.offsets(self.lt, self.lg, self.fe, self.z, a_v_host=h, a_v_mw=m)
+        b, _ = self._baked(h, m).offsets(self.lt, self.lg, self.fe, self.z)
+        return max(float(np.max(np.abs(a[k] - b[k]))) for k in FILTERS)
+
+    def test_d1_axis_nodes_equal_a_baked_table(self):
+        """D1: at a node of both dust axes the table IS the baked table."""
+        self.assertTrue(self.G.has_dust_axes)
+        self.assertEqual(self.G.c3k.shape[-3:-1], (self.AH.size, self.AM.size))
+        for h, m in ((0.5, 0.25), (1.0, 0.5), (0.25, 0.0)):
+            self.assertLess(self._both(h, m), 1e-9, (h, m))
+
+    def test_d2_cell_centres_within_one_mmag(self):
+        """D2: halfway between dust nodes -- worst case for linear -- < 1 mmag."""
+        for h, m in ((0.125, 0.125), (0.375, 0.375), (0.875, 0.375), (0.625, 0.125)):
+            self.assertLess(self._both(h, m), 1e-3, (h, m))
+
+    def test_d3_for_dust_routes_and_warns_once(self):
+        """D3: none -> dust-free table; inside -> axes; outside -> exact + one warning."""
+        kw = dict(cache_dir=self.tmp, **self.kw)
+        g0, d0 = KCorrectionGrid.for_dust('LSST', 0.0, 0.0, **kw)
+        self.assertFalse(g0.has_dust_axes); self.assertEqual(d0, {})
+        g1, d1 = KCorrectionGrid.for_dust('LSST', 0.3, 0.2, **kw)
+        self.assertTrue(g1.has_dust_axes); self.assertEqual(d1, dict(a_v_host=0.3, a_v_mw=0.2))
+        KCorrectionGrid._WARNED.discard(('LSST', 1.2, 0.2))
+        with self.assertLogs('ArtPop Logger', level='WARNING') as cm:
+            g2, d2 = KCorrectionGrid.for_dust('LSST', 1.2, 0.2, **kw)
+        self.assertTrue(any('outside the K table' in r for r in cm.output))
+        self.assertFalse(g2.has_dust_axes); self.assertEqual(d2, {})
+        self.assertEqual((g2.meta['a_v_host'], g2.meta['a_v_mw']), (1.2, 0.2))
+        a, _ = g2.offsets(self.lt, self.lg, self.fe, self.z)
+        b, _ = self._baked(1.2, 0.2).offsets(self.lt, self.lg, self.fe, self.z)
+        for k in FILTERS:
+            np.testing.assert_array_equal(a[k], b[k])
+        self.assertFalse(any('avh1.200' in f for f in os.listdir(self.tmp)),
+                         'an out-of-range pair must not leave a cache file per object')
+        import logging
+        seen = []
+        h = logging.Handler(); h.emit = lambda rec: seen.append(rec)
+        lg = logging.getLogger('ArtPop Logger'); lg.addHandler(h)
+        try:
+            KCorrectionGrid.for_dust('LSST', 1.2, 0.2, **kw)
+        finally:
+            lg.removeHandler(h)
+        self.assertEqual([r for r in seen if r.levelno >= logging.WARNING], [], 'warn once per pair')
+
+    def test_d4_lookups_refuse_what_the_table_cannot_serve(self):
+        """D4: out-of-axis dust on the axis table, or a different baked pair, raises."""
+        with self.assertRaises(ValueError):
+            self.G.offsets(self.lt, self.lg, self.fe, self.z, a_v_host=1.5, a_v_mw=0.1)
+        with self.assertRaises(ValueError):
+            self.G.offsets(self.lt, self.lg, self.fe, self.z, a_v_host=0.1, a_v_mw=-0.1)
+        with self.assertRaises(ValueError):
+            self._baked(0.2, 0.0).offsets(self.lt, self.lg, self.fe, self.z, a_v_host=0.3)
+
+    def test_d5_cache_key_and_round_trip(self):
+        """D5: the key names the axes; save/load keeps them; an old-format file loads baked."""
+        k_ax = KCorrectionGrid.cache_key('LSST', a_v_host_grid=self.AH, a_v_mw_grid=self.AM, **self.kw)
+        k_other = KCorrectionGrid.cache_key('LSST', a_v_host_grid=self.AH, a_v_mw_grid=[0.0, 0.5], **self.kw)
+        k_baked = KCorrectionGrid.cache_key('LSST', **self.kw)
+        self.assertEqual(len({k_ax, k_other, k_baked}), 3)
+        path = os.path.join(self.tmp, 'roundtrip.npz')
+        self.G.save(path)
+        L = KCorrectionGrid.load(path)
+        np.testing.assert_array_equal(L.av_host_grid, self.AH)
+        np.testing.assert_array_equal(L.c3k, self.G.c3k)
+        B = self._baked(0.0, 0.0)
+        d = {k: np.asarray(getattr(B, k)) for k in KCorrectionGrid._ARRAYS if not k.startswith('av_')}
+        import json
+        d['bands'] = np.array(B.bands); d['meta_json'] = np.array(json.dumps(B.meta))
+        old = os.path.join(self.tmp, 'old_format.npz')
+        np.savez(old, **d)
+        self.assertFalse(KCorrectionGrid.load(old).has_dust_axes)
+
+    def test_d7_out_of_range_warning_survives_muted_artpop_logger(self):
+        """D7: the pipeline mutes 'ArtPop Logger' (ERROR); the dust warning still shows."""
+        import logging
+        parent = logging.getLogger('ArtPop Logger')
+        old = parent.level
+        parent.setLevel(logging.ERROR)                  # what simulate_catalog does at import
+        KCorrectionGrid._WARNED.discard(('LSST', 1.1, 0.6))
+        try:
+            with self.assertLogs('ArtPop Logger', level='WARNING') as cm:
+                KCorrectionGrid.for_dust('LSST', 1.1, 0.6, cache_dir=self.tmp, **self.kw)
+        finally:
+            parent.setLevel(old)
+        self.assertTrue(any('outside the K table' in r for r in cm.output))
+
+    @skipUnless(os.path.isdir(os.path.join(MIST_PATH, 'MIST_v2.5_LSST')), 'MIST v2.5 LSST not staged')
+    def test_d6_isochrone_uses_the_axes_to_one_mmag(self):
+        """D6: MISTIsochrone(a_v_mw=...) at z > 0 goes through the axes, to < 1 mmag of exact."""
+        from artpop import MISTIsochrone
+        kw = dict(log_age=10.0, feh=-1.0, phot_system='LSST', version='2.5', redshift=0.05)
+        via_axes = MISTIsochrone(a_v_host=0.4, a_v_mw=0.3,
+                                 kcorr_kw=dict(cache_dir=self.tmp, z_grid=self.kw['z_grid']), **kw)
+        exact = MISTIsochrone(a_v_host=0.4, a_v_mw=0.3, kcorr_grid=self._baked(0.4, 0.3), **kw)
+        for f in FILTERS:
+            d = np.abs(np.asarray(via_axes.mag_table[f]) - np.asarray(exact.mag_table[f]))
+            self.assertLess(float(np.nanmax(d)), 1e-3, f)
+
+
+@skipUnless(os.path.isdir(os.path.join(MIST_PATH, 'MIST_v2.5_LSST'))
+            and _HAVE_C3K, 'MIST v2.5 LSST grid or C3K not staged')
+class TestRepeatedIsochroneNoLeak(TestCase):
+    """
+    C12: building the same redshifted, dusty isochrone twice in one process
+    gives the same magnitudes -- with the MIST binary cache bypassed, which is
+    the path an unwritable MIST directory takes. Before the fix the uncached
+    reader handed out its own array, the first isochrone's in-place K/dust
+    correction leaked into it, and the second came out corrected twice.
+    """
+
+    def test_c12_second_isochrone_is_not_corrected_twice(self):
+        from artpop import MISTIsochrone
+        old = os.environ.get('ARTPOP_MIST_CACHE')
+        os.environ['ARTPOP_MIST_CACHE'] = '0'
+        try:
+            kw = dict(log_age=10.0, feh=-1.0, phot_system='LSST', version='2.5',
+                      redshift=0.05, a_v_mw=0.3)
+            first, second = MISTIsochrone(**kw), MISTIsochrone(**kw)
+            stock = MISTIsochrone(log_age=10.0, feh=-1.0, phot_system='LSST', version='2.5')
+        finally:
+            if old is None:
+                os.environ.pop('ARTPOP_MIST_CACHE', None)
+            else:
+                os.environ['ARTPOP_MIST_CACHE'] = old
+        for f in FILTERS:
+            np.testing.assert_array_equal(np.asarray(first.mag_table[f]), np.asarray(second.mag_table[f]))
+            np.testing.assert_array_equal(np.asarray(first.mag_table_rest[f]), np.asarray(stock.mag_table[f]))

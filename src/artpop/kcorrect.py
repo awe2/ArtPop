@@ -1,7 +1,9 @@
 # Standard library
+import logging
 import os
 import tarfile
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 
 # Third-party
 import numpy as np
@@ -9,6 +11,14 @@ import numpy as np
 # Project
 from . import MIST_PATH
 from .log import logger
+
+# The out-of-range dust warning has its own channel with its own level, so
+# muting ArtPop's routine messages (simulate_catalog raises 'ArtPop Logger' to
+# ERROR) does not also mute this one: an A_V outside the table's dust axes costs
+# an exact per-pair build and should always be seen. Records propagate to the
+# ArtPop logger's handlers; silence it explicitly, by name, if you must.
+dust_logger = logging.getLogger(logger.name + '.dust')
+dust_logger.setLevel(logging.WARNING)
 from .filters import filter_curve_dir, load_filter_system
 
 
@@ -17,7 +27,8 @@ __all__ = ['SpectralLibrary', 'C3KLibrary', 'TremblayWDLibrary',
            'k_correction', 'band_weights', 'extinction_curve', 'air_to_vac',
            'planck_lam',
            'spectra_path', 'kcorr_cache_dir', 'C3K_HULL', 'WD_HULL',
-           'DEFAULT_Z_GRID', 'SOURCE_NAMES', 'SOURCE_C3K',
+           'DEFAULT_Z_GRID', 'DEFAULT_AV_HOST_GRID', 'DEFAULT_AV_MW_GRID',
+           'SOURCE_NAMES', 'SOURCE_C3K',
            'SOURCE_WD', 'SOURCE_BB']
 
 
@@ -66,6 +77,18 @@ _KB = 1.380649e-16              # erg / K
 # least reliable -- the flag says so.
 DEFAULT_Z_GRID = np.round(np.concatenate(
     [np.linspace(0.0, 0.10, 21), np.linspace(0.11, 0.25, 15)]), 6)
+
+# The two dust axes of the K table (F3_dust.ipynb section 4.6). Sized by
+# measurement, not guessed. Delta m is concave in A_V with a curvature that is
+# FLAT across the range (worst |f''| 0.042 /mag^2 for the MW screen and 0.049
+# for the host screen, both in Roman F062, the widest band), so uniform spacing
+# is optimal and the linear-interpolation error is h^2 |f''| / 8. Measured over
+# every spectrum of the three libraries, all 14 LSST + Roman bands and z = 0 to
+# 0.25: MW 0.32 mmag at 3 nodes, host 0.38 mmag at 5. The two add (same sign),
+# so <= ~0.7 mmag against a 1 mmag target. A dust pair outside these ranges is
+# computed exactly, with a warning (`KCorrectionGrid.for_dust`).
+DEFAULT_AV_HOST_GRID = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+DEFAULT_AV_MW_GRID = np.array([0.0, 0.25, 0.5])
 
 # Hulls of the two libraries MIST composited (MIST III, Bauer et al. 2025
 # s III.3). The gap at 5.5 < log g < 6.5 is real, and is why there is a
@@ -610,31 +633,74 @@ class KCorrectionGrid:
     """
 
     _ARRAYS = ('z_grid', 'feh_grid', 'c3k_logg', 'c3k_logt', 'c3k',
-               'wd_logg', 'wd_logt', 'wd', 'bb_logt', 'bb')
+               'wd_logg', 'wd_logt', 'wd', 'bb_logt', 'bb',
+               'av_host_grid', 'av_mw_grid')
+
+    # tables already loaded in this process, so an isochrone per SFH bin per
+    # object does not re-read a few hundred MB from disk each time
+    _MEMO = OrderedDict()
+    _MEMO_MAX = 6
+    # dust pairs already warned about by `for_dust`, so a fallback warns once
+    _WARNED = set()
 
     def __init__(self, bands, z_grid, feh_grid, c3k_logg, c3k_logt, c3k,
-                 wd_logg, wd_logt, wd, bb_logt, bb, meta=None):
+                 wd_logg, wd_logt, wd, bb_logt, bb, meta=None,
+                 av_host_grid=None, av_mw_grid=None):
         self.bands = list(bands)
         self.z_grid = np.asarray(z_grid, dtype=float)
         self.feh_grid = np.asarray(feh_grid, dtype=float)
         self.c3k_logg, self.c3k_logt, self.c3k = c3k_logg, c3k_logt, c3k
         self.wd_logg, self.wd_logt, self.wd = wd_logg, wd_logt, wd
         self.bb_logt, self.bb = bb_logt, bb
+        # empty = the dust pair is baked in (meta['a_v_host'], meta['a_v_mw']);
+        # otherwise the table carries (..., z, A_V_host, A_V_mw, band) axes
+        self.av_host_grid = np.asarray([] if av_host_grid is None else av_host_grid, dtype=float)
+        self.av_mw_grid = np.asarray([] if av_mw_grid is None else av_mw_grid, dtype=float)
         self.meta = dict(meta or {})
         self._interp = {}
+
+    @property
+    def has_dust_axes(self):
+        return self.av_host_grid.size > 0
+
+    @staticmethod
+    def _dust_axes(a_v_host_grid, a_v_mw_grid):
+        """Resolve the requested dust axes: None, or (host axis, MW axis)."""
+        if a_v_host_grid is None and a_v_mw_grid is None:
+            return None
+        axes = []
+        for ax, default, name in ((a_v_host_grid, DEFAULT_AV_HOST_GRID, 'a_v_host_grid'),
+                                  (a_v_mw_grid, DEFAULT_AV_MW_GRID, 'a_v_mw_grid')):
+            ax = np.asarray(default if ax is None else ax, dtype=float)
+            if ax.size < 2 or np.any(np.diff(ax) <= 0) or ax[0] != 0.0:
+                raise ValueError(f'{name} must be strictly increasing, start at '
+                                 f'exactly 0.0 (so zero dust is a node) and have '
+                                 f'at least two values; got {ax.tolist()}')
+            axes.append(ax)
+        return tuple(axes)
 
     # -- build ------------------------------------------------------------
     @classmethod
     def build(cls, phot_system, bands=None, z_grid=None, a_v_host=0.0,
               a_v_mw=0.0, extinction_law='F99', r_v=3.1, resolution='c3k_hr',
-              a_over_fe=0.0, spectra=None, curve_dir=None, verbose=False):
+              a_over_fe=0.0, spectra=None, curve_dir=None, verbose=False,
+              a_v_host_grid=None, a_v_mw_grid=None):
         """
-        Build the grid from the staged libraries. Seconds, not minutes.
+        Build the grid from the staged libraries.
 
-        The dust arguments are baked into the grid rather than carried as extra
-        axes: two A_V axes would cost ~430 MB, and a render has one dust pair.
-        The dust-free ``(0, 0)`` grid is the common case.
+        Dust comes in one of two forms. Either ``a_v_host`` / ``a_v_mw`` are
+        baked in as scalars (seconds to build, one dust pair per table), or
+        ``a_v_host_grid`` / ``a_v_mw_grid`` make the two extinctions axes of
+        the table, so any pair inside them is an interpolation (one build per
+        catalog: ~15x the scalar build and size at the default axes). Giving
+        one axis selects the default for the other (`DEFAULT_AV_HOST_GRID`,
+        `DEFAULT_AV_MW_GRID`). The dust-free ``(0, 0)`` table is the common case.
         """
+        axes = cls._dust_axes(a_v_host_grid, a_v_mw_grid)
+        if axes is not None and (a_v_host or a_v_mw):
+            raise ValueError('give either fixed a_v_host / a_v_mw or dust axes, not both')
+        pairs = ([(float(h), float(m)) for h in axes[0] for m in axes[1]]
+                 if axes is not None else [(a_v_host, a_v_mw)])
         z_grid = DEFAULT_Z_GRID if z_grid is None else np.asarray(z_grid, float)
         if z_grid[0] != 0.0:
             raise ValueError('z_grid must start at exactly 0.0 so that '
@@ -651,45 +717,57 @@ class KCorrectionGrid:
                 f'C3K is not staged under {c3k_lib.root}; set '
                 'ALVISS_SPECTRA_PATH (see data/spectral_libraries/PROVENANCE.md)')
 
+        def over_pairs(lib, feh):
+            # one pass per dust pair; with axes, stacked to (..., z, n_h, n_m, band)
+            outs = [_grid_offsets(lib, feh, curves, bands, z_grid, h, m, ext) for h, m in pairs]
+            lg_, lt_ = outs[0][0], outs[0][1]
+            if axes is None:
+                return lg_, lt_, outs[0][2]
+            arr = np.stack([o[2] for o in outs], axis=-2)
+            return lg_, lt_, arr.reshape(arr.shape[:-2] + (axes[0].size, axes[1].size, arr.shape[-1]))
+
         blocks, feh_grid = [], c3k_lib.feh_grid
         for feh in feh_grid:
-            logg, logt, arr = _grid_offsets(c3k_lib, feh, curves, bands,
-                                            z_grid, a_v_host, a_v_mw, ext)
+            logg, logt, arr = over_pairs(c3k_lib, feh)
             blocks.append(arr)
             if verbose:
                 logger.info(f'K grid: C3K [Fe/H] = {feh:+.2f} done')
-        c3k = np.stack(blocks)                       # (n_feh, n_g, n_t, n_z, n_b)
+        c3k = np.stack(blocks)                       # (n_feh, n_g, n_t, n_z, [n_h, n_m,] n_b)
         c3k_logg, c3k_logt = logg, logt
 
         wd_lib = TremblayWDLibrary(path=spectra)
         if wd_lib.available:
-            wd_logg, wd_logt, wd = _grid_offsets(
-                wd_lib, None, curves, bands, z_grid, a_v_host, a_v_mw, ext)
+            wd_logg, wd_logt, wd = over_pairs(wd_lib, None)
         else:
             logger.warning(f'Tremblay WD library not staged under '
                            f'{wd_lib.root}; the log g >= 6.5 branch will fall '
                            'back to the blackbody backend')
             wd_logg = np.zeros(0)
             wd_logt = np.zeros(0)
-            wd = np.zeros((0, 0, len(z_grid), len(bands)), dtype=np.float32)
+            dust_shape = () if axes is None else (axes[0].size, axes[1].size)
+            wd = np.zeros((0, 0, len(z_grid)) + dust_shape + (len(bands),), dtype=np.float32)
 
         bb_lib = BlackbodyLibrary()
-        _, bb_logt, bb = _grid_offsets(bb_lib, None, curves, bands, z_grid,
-                                       a_v_host, a_v_mw, ext)
-        bb = bb[0]                                   # (n_t, n_z, n_b)
+        _, bb_logt, bb = over_pairs(bb_lib, None)
+        bb = bb[0]                                   # (n_t, n_z, [n_h, n_m,] n_b)
 
         meta = dict(phot_system=phot_system, resolution=resolution,
-                    a_over_fe=float(a_over_fe), a_v_host=float(a_v_host),
-                    a_v_mw=float(a_v_mw), extinction_law=str(extinction_law),
+                    a_over_fe=float(a_over_fe),
+                    a_v_host=None if axes is not None else float(a_v_host),
+                    a_v_mw=None if axes is not None else float(a_v_mw),
+                    extinction_law=str(extinction_law),
                     r_v=float(r_v), has_wd=bool(wd_lib.available))
         return cls(bands, z_grid, feh_grid, c3k_logg, c3k_logt, c3k,
-                   wd_logg, wd_logt, wd, bb_logt, bb, meta)
+                   wd_logg, wd_logt, wd, bb_logt, bb, meta,
+                   av_host_grid=None if axes is None else axes[0],
+                   av_mw_grid=None if axes is None else axes[1])
 
     # -- persistence ------------------------------------------------------
     @staticmethod
     def cache_key(phot_system, bands=None, z_grid=None, a_v_host=0.0,
                   a_v_mw=0.0, extinction_law='F99', r_v=3.1,
-                  resolution='c3k_hr', a_over_fe=0.0, curve_dir=None):
+                  resolution='c3k_hr', a_over_fe=0.0, curve_dir=None,
+                  a_v_host_grid=None, a_v_mw_grid=None):
         """
         A key that names the grid's *contents*, not the arguments it was asked
         for. ``bands`` is resolved to the actual filter list first, so
@@ -705,9 +783,16 @@ class KCorrectionGrid:
         h = hashlib.sha1()
         h.update(np.ascontiguousarray(z_grid, dtype='<f8').tobytes())
         h.update(','.join(resolved).encode())
+        axes = KCorrectionGrid._dust_axes(a_v_host_grid, a_v_mw_grid)
+        if axes is None:
+            dust = f'_avh{a_v_host:.3f}_avmw{a_v_mw:.3f}'
+        else:
+            for ax in axes:
+                h.update(np.ascontiguousarray(ax, dtype='<f8').tobytes())
+            dust = (f'_avhax{axes[0].size}x{axes[0][-1]:.2f}'
+                    f'_avmwax{axes[1].size}x{axes[1][-1]:.2f}')
         return (f'kcorr_{phot_system}_{resolution}_afe{a_over_fe:+.1f}'
-                f'_avh{a_v_host:.3f}_avmw{a_v_mw:.3f}'
-                f'_{str(extinction_law).lower()}_rv{r_v:.2f}'
+                f'{dust}_{str(extinction_law).lower()}_rv{r_v:.2f}'
                 f'_z{len(z_grid)}-{h.hexdigest()[:8]}.npz')
 
     def save(self, path):
@@ -738,28 +823,86 @@ class KCorrectionGrid:
     def load(cls, path):
         import json
         with np.load(path, allow_pickle=False) as z:
-            arrays = {k: z[k] for k in cls._ARRAYS}
+            arrays = {k: z[k] for k in cls._ARRAYS if k in z.files}
             bands = [str(b) for b in z['bands']]
             meta = json.loads(str(z['meta_json']))
         return cls(bands=bands, meta=meta, **arrays)
 
     @classmethod
-    def cached(cls, phot_system, cache_dir=None, rebuild=False, **kwargs):
-        """Load the grid for these arguments, building and caching it if absent."""
+    def cached(cls, phot_system, cache_dir=None, rebuild=False, persist=True,
+               **kwargs):
+        """
+        Load the grid for these arguments, building and caching it if absent.
+
+        A table is also kept in memory (the last `_MEMO_MAX` of them), so every
+        isochrone of a render does not re-read it. ``persist=False`` builds
+        without writing to disk: `for_dust` uses it for one-off out-of-range
+        dust pairs, which would otherwise leave a ~30 MB file per object.
+        """
         key = cls.cache_key(phot_system, **kwargs)
         path = os.path.join(cache_dir or kcorr_cache_dir(), key)
-        if os.path.isfile(path) and not rebuild:
+        mtime = os.path.getmtime(path) if os.path.isfile(path) else None
+        hit = cls._MEMO.get(path)
+        if hit is not None and not rebuild and hit[0] == mtime:
+            cls._MEMO.move_to_end(path)
+            return hit[1]
+        grid = None
+        if mtime is not None and not rebuild:
             try:
-                return cls.load(path)
+                grid = cls.load(path)
             except Exception as exc:                    # noqa: BLE001
                 logger.warning(f'could not read cached K grid {path} ({exc}); '
                                'rebuilding')
-        grid = cls.build(phot_system, **kwargs)
-        try:
-            grid.save(path)
-        except OSError as exc:
-            logger.warning(f'could not cache K grid to {path}: {exc}')
+        if grid is None:
+            grid = cls.build(phot_system, **kwargs)
+            if persist:
+                try:
+                    grid.save(path)
+                    mtime = os.path.getmtime(path)
+                except OSError as exc:
+                    logger.warning(f'could not cache K grid to {path}: {exc}')
+        cls._MEMO[path] = (mtime, grid)
+        cls._MEMO.move_to_end(path)
+        while len(cls._MEMO) > cls._MEMO_MAX:
+            cls._MEMO.popitem(last=False)
         return grid
+
+    @classmethod
+    def for_dust(cls, phot_system, a_v_host=0.0, a_v_mw=0.0,
+                 a_v_host_grid=None, a_v_mw_grid=None, **kwargs):
+        """
+        The table that serves one dust pair, and the dust arguments to look it
+        up with: ``grid, dust_kw = for_dust(...)``, then
+        ``grid.offsets(..., **dust_kw)``.
+
+        * No dust: the dust-free table (small; exactly what it always was).
+        * Inside the dust axes (default `DEFAULT_AV_HOST_GRID` x
+          `DEFAULT_AV_MW_GRID`): the dust-axis table, interpolated in A_V to
+          <= ~0.7 mmag (F3_dust.ipynb section 4.6). One build per catalog.
+        * Outside them: **computed exactly** -- a table with this pair baked in,
+          built in memory (~10 s) and not written to disk -- with a warning,
+          because the axes were sized for the range they cover and an
+          extrapolation along them is not validated.
+        """
+        a_h, a_m = float(a_v_host), float(a_v_mw)
+        if a_h == 0.0 and a_m == 0.0:
+            return cls.cached(phot_system, **kwargs), {}
+        ax_h, ax_m = cls._dust_axes(
+            DEFAULT_AV_HOST_GRID if a_v_host_grid is None else a_v_host_grid,
+            DEFAULT_AV_MW_GRID if a_v_mw_grid is None else a_v_mw_grid)
+        tol = 1e-12
+        if (ax_h[0] - tol <= a_h <= ax_h[-1] + tol) and (ax_m[0] - tol <= a_m <= ax_m[-1] + tol):
+            grid = cls.cached(phot_system, a_v_host_grid=ax_h, a_v_mw_grid=ax_m, **kwargs)
+            return grid, dict(a_v_host=a_h, a_v_mw=a_m)
+        key = (phot_system, round(a_h, 6), round(a_m, 6))
+        if key not in cls._WARNED:
+            cls._WARNED.add(key)
+            dust_logger.warning(
+                f'{phot_system}: dust (A_V_host, A_V_mw) = ({a_h:g}, {a_m:g}) is outside the K '
+                f'table\'s dust axes (A_V_host in [{ax_h[0]:g}, {ax_h[-1]:g}], A_V_mw in '
+                f'[{ax_m[0]:g}, {ax_m[-1]:g}]); computing this pair exactly instead of '
+                'extrapolating (one ~10 s build, not cached to disk)')
+        return cls.cached(phot_system, a_v_host=a_h, a_v_mw=a_m, persist=False, **kwargs), {}
 
     # -- interpolation ----------------------------------------------------
     def _rgi(self, which):
@@ -774,18 +917,27 @@ class KCorrectionGrid:
             else:
                 pts = (self.bb_logt, self.z_grid)
                 val = self.bb
+            if self.has_dust_axes:
+                pts = pts + (self.av_host_grid, self.av_mw_grid)
+            # the stored float32 values, not a float64 copy: scipy upcasts each
+            # corner exactly, so results are bit-identical at half the memory
             self._interp[which] = RegularGridInterpolator(
-                pts, np.asarray(val, dtype=float),
-                bounds_error=False, fill_value=np.nan)
+                pts, np.asarray(val), bounds_error=False, fill_value=np.nan)
         return self._interp[which]
 
     @property
     def has_wd(self):
         return self.wd_logg.size > 0
 
-    def interpolate(self, log_teff, log_g, feh, redshift):
+    def interpolate(self, log_teff, log_g, feh, redshift, a_v_host=None,
+                    a_v_mw=None):
         """
         Per-star magnitude offsets, plus which backend served each star.
+
+        ``a_v_host`` / ``a_v_mw`` select the dust on a table with dust axes
+        (default 0.0; outside the axes raises -- `for_dust` is what computes an
+        out-of-range pair exactly). On a table with the dust baked in they may
+        be omitted, and if given must equal the baked values.
 
         Returns
         -------
@@ -807,6 +959,28 @@ class KCorrectionGrid:
                 'extrapolating a K-correction')
         z = float(np.clip(z, self.z_grid[0], self.z_grid[-1]))
 
+        dust = []
+        if self.has_dust_axes:
+            for v, ax, name in ((a_v_host, self.av_host_grid, 'a_v_host'),
+                                (a_v_mw, self.av_mw_grid, 'a_v_mw')):
+                v = 0.0 if v is None else float(v)
+                if v < ax[0] - 1e-12 or v > ax[-1] + 1e-12:
+                    raise ValueError(
+                        f'{name} = {v} is outside this table\'s dust axis '
+                        f'[{ax[0]}, {ax[-1]}]; KCorrectionGrid.for_dust computes an '
+                        'out-of-range pair exactly')
+                dust.append(float(np.clip(v, ax[0], ax[-1])))
+        else:
+            for v, name in ((a_v_host, 'a_v_host'), (a_v_mw, 'a_v_mw')):
+                baked = float(self.meta.get(name) or 0.0)
+                if v is not None and abs(float(v) - baked) > 1e-9:
+                    raise ValueError(f'this table has {name} = {baked} baked in and '
+                                     f'cannot serve {name} = {v}')
+
+        def at(n):
+            # the redshift and dust columns shared by every row of one backend
+            return [np.full(n, z)] + [np.full(n, d) for d in dust]
+
         fe = np.broadcast_to(np.atleast_1d(np.asarray(feh, dtype=float)),
                              lt.shape).astype(float)
         # [Fe/H] below -2.50 exists in MIST's BC tables and not in C3K as FSPS
@@ -822,8 +996,8 @@ class KCorrectionGrid:
                   & (lg >= self.c3k_logg[0]) & (lg <= self.c3k_logg[-1]))
         if in_c3k.any():
             out[in_c3k] = self._rgi('c3k')(
-                np.column_stack([fe_clip[in_c3k], lg[in_c3k], lt[in_c3k],
-                                 np.full(in_c3k.sum(), z)]))
+                np.column_stack([fe_clip[in_c3k], lg[in_c3k], lt[in_c3k]]
+                                + at(in_c3k.sum())))
             source[in_c3k] = SOURCE_C3K
 
         in_wd = np.zeros(n, dtype=bool)
@@ -833,16 +1007,15 @@ class KCorrectionGrid:
                      & (lg >= self.wd_logg[0]) & (lg <= self.wd_logg[-1]))
             if in_wd.any():
                 out[in_wd] = self._rgi('wd')(
-                    np.column_stack([lg[in_wd], lt[in_wd],
-                                     np.full(in_wd.sum(), z)]))
+                    np.column_stack([lg[in_wd], lt[in_wd]] + at(in_wd.sum())))
                 source[in_wd] = SOURCE_WD
 
         # anything left, plus anything a backend returned NaN for
         rest = ~(in_c3k | in_wd) | ~np.isfinite(out).all(axis=1)
         if rest.any():
             out[rest] = self._rgi('bb')(np.column_stack(
-                [np.clip(lt[rest], self.bb_logt[0], self.bb_logt[-1]),
-                 np.full(rest.sum(), z)]))
+                [np.clip(lt[rest], self.bb_logt[0], self.bb_logt[-1])]
+                + at(rest.sum())))
             source[rest] = SOURCE_BB
 
         info = dict(source=source, fallback=(source == SOURCE_BB),
@@ -851,12 +1024,16 @@ class KCorrectionGrid:
                     n_wd=int((source == SOURCE_WD).sum()),
                     n_fallback=int((source == SOURCE_BB).sum()),
                     n_feh_clipped=int(feh_clipped.sum()),
-                    redshift=z, bands=list(self.bands))
+                    redshift=z, bands=list(self.bands),
+                    a_v_host=dust[0] if dust else self.meta.get('a_v_host'),
+                    a_v_mw=dust[1] if dust else self.meta.get('a_v_mw'))
         return out, info
 
-    def offsets(self, log_teff, log_g, feh, redshift, bands=None):
+    def offsets(self, log_teff, log_g, feh, redshift, bands=None,
+                a_v_host=None, a_v_mw=None):
         """`interpolate` as a ``{band: array}`` dict, for the bands asked for."""
-        out, info = self.interpolate(log_teff, log_g, feh, redshift)
+        out, info = self.interpolate(log_teff, log_g, feh, redshift,
+                                     a_v_host=a_v_host, a_v_mw=a_v_mw)
         want = self.bands if bands is None else list(bands)
         idx = {b: self.bands.index(b) for b in want}
         return {b: out[:, idx[b]] for b in want}, info

@@ -417,7 +417,15 @@ def read_isocmd(filename, mist_path=None):
 
 
 def isocmd_block(reader, i):
-    """Age block `i` from either reader type as a structured ndarray."""
+    """
+    Age block `i` from either reader type as a structured ndarray -- always a
+    fresh COPY. The reader is shared through `_read_isocmd_keyed`'s lru_cache,
+    and `MISTIsochrone` adds the K/dust offsets to its columns in place; handing
+    out the reader's own array (the uncached `IsoCmdReader` path, taken when
+    the binary cache is unwritable) made a second isochrone of the same grid
+    point start from already-corrected magnitudes. `CachedIsoCmd.block`
+    already copies; this makes both paths agree.
+    """
     if hasattr(reader, 'block'):
         return reader.block(i)
-    return reader.isocmds[i]
+    return np.array(reader.isocmds[i])
