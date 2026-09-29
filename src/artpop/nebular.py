@@ -120,7 +120,8 @@ class NebularConfig:
         FWHM of the blob, physical pc, when ``size_mode = 'fixed'``. Default 100.
     size_mode : str
         ``'fixed'`` (default): one Gaussian of FWHM ``fwhm_pc`` for every star.
-        ``'stromgren'`` (2026-09-29, user): each star's nebula is a uniformly
+        ``'stromgren'`` (2026-09-29, user): each star's nebula -- its line
+        light only; the star's continuum stays a point -- is a uniformly
         emitting Stromgren sphere, projected, of diameter
         ``D_S = 2 (3 k Q_H / (4 pi n_e^2 alpha_B))^(1/3)`` from the photons it
         captures, at gas density ``n_e_cm3``; stars are grouped into
@@ -565,7 +566,12 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
             f_line = np.where(np.isfinite(m_line), 10 ** (-0.4 * m_line), 0.0)
             tot = f_star + f_line
             new[band][r] = -2.5 * np.log10(tot)
-            blob[band][r] = (k * f_star + f_line) / tot
+            # what the nebula spreads: in 'fixed' mode the lines and the k share of
+            # the continuum (dusty blurring); in 'stromgren' mode only the lines --
+            # the Stromgren sphere is the size of the glowing gas, and a star's
+            # photosphere stays a point (dimmed by the birth-cloud dust) (user, 2026-09-29)
+            cont_share = k if cfg.size_mode == 'fixed' else 0.0
+            blob[band][r] = (cont_share * f_star + f_line) / tot
     return new, blob, info
 
 

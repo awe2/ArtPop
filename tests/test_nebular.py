@@ -472,3 +472,27 @@ class TestStromgrenMIST(TestCase):
         comp = old + young
         self.assertEqual(comp.nebular_q_h.size, comp.num_stars)
         self.assertTrue(np.all(comp.nebular_q_h[:old.num_stars] == 0))
+
+
+@skipUnless(_HAVE_C3K and _HAVE_TABLE, 'needs C3K and the MAPPINGS table')
+class TestStromgrenContinuum(TestCase):
+
+    def test_s6_stromgren_spreads_lines_only(self):
+        """S6: in 'stromgren' mode the blob share is the line share only (the
+        star stays a point); in 'fixed' mode it is k x continuum + lines."""
+        curves = _lsst_curves()
+        lt, lg = np.log10([35e3, 12e3]), np.array([4.0, 4.0])
+        mags = {b: np.zeros(2) for b in FILTERS}
+        out = {}
+        for mode in ('fixed', 'stromgren'):
+            cfg = NebularConfig(knob=0.9, size_mode=mode)
+            new, blob, info = apply_to_rows(cfg, mags, curves, 6.5, -1.0, lt, lg, np.array([5.3, 2.5]))
+            out[mode] = (new, blob)
+        for b in FILTERS:
+            np.testing.assert_allclose(out['fixed'][0][b], out['stromgren'][0][b], rtol=0, atol=0)   # same light
+            line_share = (out['fixed'][1][b] - 0.9) / (1 - 0.9)     # fixed: 0.9 + 0.1 x line share
+            np.testing.assert_allclose(out['stromgren'][1][b], line_share, rtol=1e-9, atol=1e-12)
+        # a 12 kK star (almost no ionizing photons): a point in 'stromgren' mode,
+        # 0.9 of its light spread in 'fixed' mode
+        self.assertLess(out['stromgren'][1]['LSST_r'][1], 1e-6)
+        self.assertGreater(out['fixed'][1]['LSST_r'][1], 0.9 - 1e-9)
