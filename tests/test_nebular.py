@@ -395,3 +395,80 @@ class TestNebularMIST(TestCase):
               f'{np.log10(poor / 1.37e53):+.3f} dex ([Fe/H] = -1)')
         self.assertLess(abs(offset), 0.2)
         self.assertGreater(poor, solar)
+
+
+# ---------------------------------------------------------------------------
+# Stromgren-sized nebulae (size_mode = 'stromgren', 2026-09-29, user)
+# ---------------------------------------------------------------------------
+class TestStromgren(TestCase):
+
+    def test_s1_diameter_formula_and_scalings(self):
+        """S1: D_S = 2 (3 Q / 4 pi n^2 alpha_B)^(1/3): 136 pc for 1e49/s at
+        n = 1; D ~ Q^(1/3) and ~ n^(-2/3); zero photons, zero size."""
+        d = neb.stromgren_diameter_pc
+        self.assertAlmostEqual(float(d(1e49, 1.0)), 135.9, delta=0.5)
+        self.assertAlmostEqual(float(d(8e49, 1.0) / d(1e49, 1.0)), 2.0, places=10)
+        self.assertAlmostEqual(float(d(1e49, 8.0) / d(1e49, 1.0)), 0.25, places=10)
+        self.assertEqual(float(d(0.0)), 0.0)
+
+    def test_s2_sphere_kernel(self):
+        """S2: unit sum, symmetric, half maximum at sqrt(3)/2 R (a projected
+        uniform sphere), a delta below half a pixel."""
+        k = neb.sphere_kernel(30.0)
+        self.assertAlmostEqual(k.sum(), 1.0, places=14)
+        self.assertTrue(np.allclose(k, k[::-1, ::-1]) and np.allclose(k, k.T))
+        prof = k[k.shape[0] // 2]
+        self.assertLess(abs(np.sum(prof >= prof.max() / 2) / 2 / 30.0 - np.sqrt(3) / 2), 0.03)
+        self.assertEqual(neb.sphere_kernel(0.3).shape, (1, 1))
+
+    def test_s3_config(self):
+        self.assertEqual(NebularConfig().size_mode, 'fixed')       # the validated default is unchanged
+        for bad in ({'size_mode': 'huge'}, {'n_e_cm3': 0.0}, {'n_size_classes': 0}):
+            with self.assertRaises(ValueError, msg=bad):
+                NebularConfig.coerce(bad)
+
+    def _source(self, q, cfg, frac=0.8, dim=241):
+        xy = np.array([[80.0, 120.0], [160.0, 120.0], [120.0, 60.0]])
+        src = Source(xy, {'LSST_r': np.array([24.0, 24.0, 24.0])}, dim, pixel_scale=0.2)
+        src.sp = SimpleNamespace(nebular=cfg, nebular_blob_frac={'LSST_r': np.full(3, frac)},
+                                 nebular_q_h=np.asarray(q, float))
+        src.distance_angular = 5 * u.Mpc
+        return src
+
+    def test_s4_imager_flux_and_size_order(self):
+        """S4: Stromgren blobs conserve flux; a star with 30x the photons gets
+        a visibly wider nebula (r ~ Q^(1/3)); a star with none stays a point."""
+        cfg = NebularConfig(knob=1.0, size_mode='stromgren', n_e_cm3=1.0)
+        src = self._source([1e48, 3e49, 0.0], cfg)
+        ref = IdealImager().observe(self._source([1e48, 3e49, 0.0], None), 'LSST_r', psf=None).image
+        img = IdealImager().observe(src, 'LSST_r', psf=None).image
+        self.assertAlmostEqual(img.sum() / ref.sum(), 1.0, places=12)
+
+        def rms(cx, cy, h=45):
+            cut = img[cy - h:cy + h + 1, cx - h:cx + h + 1]
+            yy, xx = np.mgrid[-h:h + 1, -h:h + 1]
+            return np.sqrt(np.sum(cut * (xx ** 2 + yy ** 2)) / cut.sum())
+        self.assertGreater(rms(160, 120), 1.5 * rms(80, 120))
+        # the Q = 0 star: its whole flux sits in its own pixel
+        self.assertAlmostEqual(img[60, 120] / ref[60, 120], 1.0, places=10)
+
+
+@skipUnless(_HAVE_MIST25 and _HAVE_C3K and _HAVE_TABLE,
+            'needs MIST v2.5 LSST, C3K and the MAPPINGS table')
+class TestStromgrenMIST(TestCase):
+
+    def test_s5_population_carries_captured_q(self):
+        """S5: a young population carries each star's captured Q_H, aligned
+        with its stars, through the SFH sum; k scales it."""
+        from artpop.stars import MISTSSP
+        kw = dict(feh=-1.0, phot_system='LSST', version='2.5', total_mass=2e4,
+                  distance=5 * u.Mpc, random_state=3)
+        young = MISTSSP(log_age=6.5, nebular={'knob': 1.0, 'size_mode': 'stromgren'}, **kw)
+        half = MISTSSP(log_age=6.5, nebular={'knob': 0.5, 'size_mode': 'stromgren'}, **kw)
+        self.assertEqual(young.nebular_q_h.size, young.num_stars)
+        self.assertGreater(float(young.nebular_q_h.max()), 1e48)
+        np.testing.assert_allclose(half.nebular_q_h, 0.5 * young.nebular_q_h, rtol=1e-10)
+        old = MISTSSP(log_age=9.0, nebular={'knob': 1.0, 'size_mode': 'stromgren'}, **kw)
+        comp = old + young
+        self.assertEqual(comp.nebular_q_h.size, comp.num_stars)
+        self.assertTrue(np.all(comp.nebular_q_h[:old.num_stars] == 0))

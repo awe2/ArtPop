@@ -706,6 +706,10 @@ class SSP(StellarPopulation):
         self.nebular_blob_frac = {
             filt: np.clip(interp1d(mini, frac)(self.initial_masses), 0.0, 1.0)
             for filt, frac in blob.items()}
+        # each star's captured ionizing photons (k Q_H): sets its Stromgren size
+        info = getattr(self.isochrone, 'nebular_info', None) or {}
+        q_row = np.asarray(info.get('q_h', np.zeros(mini.size)), dtype=float)
+        self.nebular_q_h = np.clip(interp1d(mini, q_row)(self.initial_masses), 0.0, None)
 
     def _lf_row_split(self):
         """
@@ -992,6 +996,11 @@ class SSP(StellarPopulation):
                     nb_new[f] if nb_new is not None else np.zeros(n_new),
                     nb_ssp[f] if nb_ssp is not None else np.zeros(n_ssp)])
                 for f in bands}
+            q_new = getattr(new, 'nebular_q_h', None)
+            q_ssp = getattr(ssp, 'nebular_q_h', None)
+            new.nebular_q_h = np.concatenate([
+                q_new if q_new is not None else np.zeros(n_new),
+                q_ssp if q_ssp is not None else np.zeros(n_ssp)])
 
         new_label = np.ones(len(ssp.star_masses), dtype=int)
         new_label *= len(new.isochrone)

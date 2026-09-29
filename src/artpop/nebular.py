@@ -63,7 +63,8 @@ from .kcorrect import (C_AA, C3KLibrary, C3K_HULL, _H, _trapz_weights,
 __all__ = ['NebularConfig', 'MappingsLineTable', 'row_spectra', 'ionizing_rate',
            'ionizing_photons_per_erg', 'line_band_abs_mags',
            'apply_to_rows', 'nebular_kernel', 'default_line_table_path',
-           'L_SUN', 'HBETA_ERG_PER_ION', 'LYMAN_EDGE_AA']
+           'L_SUN', 'HBETA_ERG_PER_ION', 'LYMAN_EDGE_AA',
+           'stromgren_diameter_pc', 'sphere_kernel', 'stromgren_classes']
 
 # its own channel, like `ArtPop Logger.dust`, so pipeline log muting of the
 # parent logger does not hide an O/H clip
@@ -116,7 +117,20 @@ class NebularConfig:
         log P/k of the MAPPINGS model (grid: 4.2 to 8.6). Default 6.2, a
         typical local HII region.
     fwhm_pc : float
-        FWHM of the blob, physical pc. Default 100.
+        FWHM of the blob, physical pc, when ``size_mode = 'fixed'``. Default 100.
+    size_mode : str
+        ``'fixed'`` (default): one Gaussian of FWHM ``fwhm_pc`` for every star.
+        ``'stromgren'`` (2026-09-29, user): each star's nebula is a uniformly
+        emitting Stromgren sphere, projected, of diameter
+        ``D_S = 2 (3 k Q_H / (4 pi n_e^2 alpha_B))^(1/3)`` from the photons it
+        captures, at gas density ``n_e_cm3``; stars are grouped into
+        ``n_size_classes`` log-spaced size classes (one convolution each).
+    n_e_cm3 : float
+        Gas density for ``'stromgren'`` (cm^-3). Default 1 (diffuse dwarf-
+        irregular gas: ~60 pc for 1e48 photons/s, ~140 pc for one O star,
+        ~290 pc for 1e50).
+    n_size_classes : int
+        Size classes for ``'stromgren'``. Default 6.
     oh_solar : float
         12 + log O/H at [Fe/H] = 0, on the grid's own scale.
     lambda_min_aa, lambda_max_aa : float
@@ -132,6 +146,9 @@ class NebularConfig:
     log_u: float = -3.0
     log_p: float = 6.2
     fwhm_pc: float = 100.0
+    size_mode: str = 'fixed'
+    n_e_cm3: float = 1.0
+    n_size_classes: int = 6
     oh_solar: float = OH_SOLAR_MAPPINGS
     lambda_min_aa: float = 2000.0
     lambda_max_aa: float = 25000.0
@@ -147,6 +164,12 @@ class NebularConfig:
             raise ValueError(f'fwhm_pc must be > 0, got {self.fwhm_pc}')
         if self.t_bc_myr <= 0:
             raise ValueError(f't_bc_myr must be > 0, got {self.t_bc_myr}')
+        if self.size_mode not in ('fixed', 'stromgren'):
+            raise ValueError(f"size_mode must be 'fixed' or 'stromgren', got {self.size_mode!r}")
+        if self.n_e_cm3 <= 0:
+            raise ValueError(f'n_e_cm3 must be > 0, got {self.n_e_cm3}')
+        if int(self.n_size_classes) < 1:
+            raise ValueError(f'n_size_classes must be >= 1, got {self.n_size_classes}')
 
     @property
     def active(self):
@@ -571,3 +594,69 @@ def nebular_kernel(fwhm_pc, distance_angular, pixel_scale):
     p = np.diff(cdf)
     kern = np.outer(p, p)
     return kern / kern.sum()
+
+
+# case B recombination coefficient at 10^4 K (Osterbrock & Ferland 2006, Table 2.1)
+ALPHA_B = 2.59e-13                  # cm^3 / s
+
+
+def stromgren_diameter_pc(q_h, n_e_cm3=1.0):
+    """
+    Stromgren diameter (pc) of an ionization-bounded nebula around a source
+    of ``q_h`` absorbed ionizing photons per second in gas of density
+    ``n_e_cm3``: ``2 (3 q_h / (4 pi n^2 alpha_B))^(1/3)`` (pure hydrogen, case B,
+    10^4 K, no filling factor). 0 for ``q_h <= 0``.
+    """
+    q = np.clip(np.asarray(q_h, dtype=float), 0.0, None)
+    r_cm = (3.0 * q / (4.0 * np.pi * float(n_e_cm3) ** 2 * ALPHA_B)) ** (1.0 / 3.0)
+    return 2.0 * r_cm / PC_CM
+
+
+def _pixels_per_pc(distance_angular, pixel_scale):
+    from astropy import units as u
+    d_pc = (distance_angular.to(u.pc).value if hasattr(distance_angular, 'unit')
+            else float(distance_angular) * 1e6)
+    ps = (u.Quantity(pixel_scale).to(u.arcsec / u.pixel).value
+          if hasattr(pixel_scale, 'unit') else float(pixel_scale))
+    return np.degrees(1.0 / d_pc) * 3600.0 / ps
+
+
+def sphere_kernel(radius_px, oversample=5):
+    """
+    Unit-sum stamp of a uniformly emitting sphere of radius ``radius_px``
+    seen in projection: surface brightness ``~ sqrt(R^2 - r^2)``, integrated
+    over each pixel by ``oversample`` x ``oversample`` sub-pixels. A radius
+    below half a pixel returns the 1 x 1 delta function.
+    """
+    R = float(radius_px)
+    if R < 0.5:
+        return np.ones((1, 1))
+    half = int(np.ceil(R))
+    n = 2 * half + 1
+    sub = (np.arange(n * oversample) + 0.5) / oversample - (half + 0.5)
+    yy, xx = np.meshgrid(sub, sub, indexing='ij')
+    prof = np.sqrt(np.clip(R ** 2 - (xx ** 2 + yy ** 2), 0.0, None))
+    kern = prof.reshape(n, oversample, n, oversample).sum(axis=(1, 3))
+    return kern / kern.sum()
+
+
+def stromgren_classes(q_h, cfg, distance_angular, pixel_scale):
+    """
+    Group stars into ``cfg.n_size_classes`` log-spaced classes of Stromgren
+    radius (in pixels). Returns ``(class_index, radii_px)``: ``class_index``
+    is -1 for stars with no nebula (``q_h <= 0``); ``radii_px[c]`` is the
+    radius used for class c (the geometric mean of its members).
+    """
+    q = np.asarray(q_h, dtype=float)
+    r_px = 0.5 * stromgren_diameter_pc(q, cfg.n_e_cm3) * _pixels_per_pc(distance_angular, pixel_scale)
+    idx = np.full(q.size, -1, dtype=int)
+    has = r_px > 0
+    if not has.any():
+        return idx, np.zeros(0)
+    lo, hi = np.log(r_px[has].min()), np.log(r_px[has].max())
+    n_c = int(cfg.n_size_classes)
+    edges = np.linspace(lo, hi, n_c + 1) if hi > lo else np.array([lo, lo + 1e-9])
+    idx[has] = np.clip(np.searchsorted(edges, np.log(r_px[has]), side='right') - 1, 0, len(edges) - 2)
+    radii = np.array([np.exp(np.mean(np.log(r_px[idx == c]))) if np.any(idx == c) else 0.0
+                      for c in range(len(edges) - 1)])
+    return idx, radii

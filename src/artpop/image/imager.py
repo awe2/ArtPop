@@ -14,6 +14,7 @@ from fast_histogram import histogram2d
 
 # Project
 from ..nebular import is_active as _nebular_active, nebular_kernel
+from ..nebular import sphere_kernel, stromgren_classes
 from ..util import check_units, check_random_state
 from ..filters import FilterSystem, get_filter_names, get_filter_properties
 from ..source import Source
@@ -141,6 +142,17 @@ def _nebular_star_fraction(source, bandpass):
     return frac
 
 
+def _nebular_star_q(source):
+    """Per-star captured ionizing photons (k Q_H) for the stars this source kept."""
+    q = np.asarray(getattr(source.sp, 'nebular_q_h', np.zeros(source.num_stars)), dtype=float)
+    keep = getattr(source, 'star_mask', None)
+    if keep is not None and len(keep) == len(q):
+        q = q[keep]
+    if len(q) != source.num_stars:
+        raise ValueError(f'nebular Q_H ({len(q)}) does not match the source\'s {source.num_stars} stars')
+    return q
+
+
 mAB_0 = 48.6
 def fnu_from_AB_mag(mag):
     """
@@ -224,10 +236,34 @@ class Imager(metaclass=abc.ABCMeta):
         d_a = getattr(source, 'distance_angular', None)
         if d_a is None:
             d_a = sp.distance_angular()
+        if getattr(sp.nebular, 'size_mode', 'fixed') == 'stromgren':
+            return image + self._stromgren_blobs(source, signal * frac, d_a, mask)
         kernel = nebular_kernel(sp.nebular.fwhm_pc, d_a, source.pixel_scale)
         blob = convolve_fft(blob, kernel, boundary='fill',
                             normalize_kernel=True)
         return image + blob
+
+    def _stromgren_blobs(self, source, blob_signal, d_a, mask=None):
+        """
+        The blob share of each star spread over its own projected Stromgren
+        sphere (`artpop.nebular.stromgren_classes`): one image and one
+        convolution per size class; a class under half a pixel, and stars
+        with no captured photons, stay points. Flux-conserving.
+        """
+        q = _nebular_star_q(source)
+        idx, radii = stromgren_classes(q, source.sp.nebular, d_a, source.pixel_scale)
+        out = np.zeros(tuple(np.asarray(source.xy_dim).astype(int))[::-1])
+        for c in range(-1, len(radii)):
+            sel = idx == c
+            if not sel.any():
+                continue
+            part = self.inject_stars(source.x, source.y, blob_signal * sel,
+                                     source.xy_dim, mask)
+            kern = sphere_kernel(radii[c]) if c >= 0 else np.ones((1, 1))
+            if kern.shape != (1, 1):
+                part = convolve_fft(part, kern, boundary='fill', normalize_kernel=True)
+            out = out + part
+        return out
 
     def apply_seeing(self, image, psf=None, boundary='wrap'):
         """
