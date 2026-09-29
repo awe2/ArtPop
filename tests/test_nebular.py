@@ -496,3 +496,86 @@ class TestStromgrenContinuum(TestCase):
         # 0.9 of its light spread in 'fixed' mode
         self.assertLess(out['stromgren'][1]['LSST_r'][1], 1e-6)
         self.assertGreater(out['fixed'][1]['LSST_r'][1], 0.9 - 1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Birth-cloud dust decoupled from the lines (birth_cloud_a_v, 2026-09-29, user)
+# ---------------------------------------------------------------------------
+class TestDecoupledDustConfig(TestCase):
+
+    def test_bc1_config(self):
+        """BC1: birth_cloud_a_v sets the screen whatever k; dust alone activates."""
+        c = NebularConfig(knob=0.0, birth_cloud_a_v=0.7)
+        self.assertTrue(c.active and c.decoupled)
+        self.assertEqual(c.a_v_bc, 0.7)
+        self.assertEqual(NebularConfig(knob=0.3, birth_cloud_a_v=0.7).a_v_bc, 0.7)
+        self.assertAlmostEqual(NebularConfig(knob=0.3).a_v_bc, 0.45)        # coupled default unchanged
+        self.assertFalse(NebularConfig(knob=0.0, birth_cloud_a_v=0.0).active)
+        with self.assertRaises(ValueError):
+            NebularConfig(birth_cloud_a_v=-0.1)
+
+
+@skipUnless(_HAVE_C3K and _HAVE_TABLE, 'needs C3K and the MAPPINGS table')
+class TestDecoupledDust(TestCase):
+
+    def _rows(self, knob, bc=0.7, a_h=0.4):
+        cfg = NebularConfig(knob=knob, birth_cloud_a_v=bc, size_mode='stromgren')
+        lt = np.log10([35e3, 12e3, 4.0e3])          # an O star, a late-B star, a cool giant
+        lg = np.array([4.0, 4.0, 1.0])
+        mags = {b: np.zeros(3) for b in FILTERS}
+        return cfg, lt, lg, apply_to_rows(cfg, mags, _lsst_curves(), 6.7, -1.0, lt, lg,
+                                          np.array([5.0, 2.5, 3.0]), a_v_host=a_h)
+
+    def test_bc2_every_young_star_dimmed_exactly(self):
+        """BC2: with k = 0, every row of the young SSP -- the cool giant too --
+        moves by exactly band_offset(A_ISM + A_bc) - band_offset(A_ISM) of its
+        own spectrum, and there are no lines and no blob."""
+        cfg, lt, lg, (new, blob, info) = self._rows(0.0)
+        self.assertEqual(info['n_rows'], 3)
+        self.assertTrue(np.all(info['q_h'] == 0))
+        ext = extinction_curve('F99', 3.1)
+        groups, _ = row_spectra(lt, lg, -1.0)
+        spec = {}
+        for idx, lam, f in groups:
+            for i, row in zip(idx, f):
+                spec[int(i)] = (lam, row)
+        for b in FILTERS:
+            tw, tt = _lsst_curves()[b]
+            for i in range(3):
+                lam, f = spec[i]
+                want = band_offset(lam, f, tw, tt, 0.0, 0.4 + 0.7, 0.0, ext) - band_offset(lam, f, tw, tt, 0.0, 0.4, 0.0, ext)
+                self.assertAlmostEqual(new[b][i], want, places=9, msg=(b, i))
+            self.assertTrue(np.all(blob[b] == 0))
+        self.assertGreater(new['LSST_g'][0], 0.5)       # ~0.7 x A_g/A_V on a hot star
+
+    def test_bc3_knob_scales_lines_not_dust(self):
+        """BC3: at fixed birth-cloud dust the knob adds only line light: the cool
+        giant (no lines) is identical at k = 0 and k = 1; Q_H scales with k."""
+        _, _, _, (n0, _, i0) = self._rows(0.0)
+        _, _, _, (n5, _, i5) = self._rows(0.5)
+        _, _, _, (n1, _, i1) = self._rows(1.0)
+        for b in FILTERS:
+            self.assertEqual(n0[b][2], n1[b][2])
+            self.assertLessEqual(n1[b][0], n0[b][0])      # lines only ever add light
+        np.testing.assert_allclose(i5['q_h'], 0.5 * i1['q_h'], rtol=1e-12)
+        self.assertEqual(i1['q_h'][2], 0.0)
+
+
+@skipUnless(_HAVE_MIST25 and _HAVE_C3K and _HAVE_TABLE,
+            'needs MIST v2.5 LSST, C3K and the MAPPINGS table')
+class TestDecoupledDustMIST(TestCase):
+
+    def test_bc4_young_isochrone_all_rows_old_untouched(self):
+        """BC4: a 5 Myr isochrone with k = 0 and A_bc = 0.7 dims every row;
+        a 20 Myr isochrone (older than t_bc) is untouched."""
+        from artpop import MISTIsochrone
+        kw = dict(feh=-1.0, phot_system='LSST', version='2.5')
+        nb = {'knob': 0.0, 'birth_cloud_a_v': 0.7}
+        young, stock = MISTIsochrone(log_age=6.7, nebular=nb, **kw), MISTIsochrone(log_age=6.7, **kw)
+        dg = np.asarray(young.mag_table['LSST_g']) - np.asarray(stock.mag_table['LSST_g'])
+        self.assertEqual(young.nebular_info['n_rows'], len(dg))
+        self.assertTrue(np.all(dg > 0.3))
+        self.assertTrue(all(np.all(v == 0) for v in young.nebular_blob_frac.values()))   # k = 0: no line light, no blob
+        old, stock_old = MISTIsochrone(log_age=7.3, nebular=nb, **kw), MISTIsochrone(log_age=7.3, **kw)
+        for f in FILTERS:
+            self.assertTrue(np.array_equal(np.asarray(old.mag_table[f]), np.asarray(stock_old.mag_table[f])))

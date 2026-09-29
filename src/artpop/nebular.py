@@ -106,7 +106,15 @@ class NebularConfig:
         Scales the line flux, the birth-cloud dust (``k * a_v_max``) and the
         continuum's share of the blob. **0 is an exact no-op.**
     a_v_max : float
-        Birth-cloud V-band extinction at k = 1 (mag). Default 1.5.
+        Birth-cloud V-band extinction at k = 1 (mag) when the dust is COUPLED to
+        the knob (``birth_cloud_a_v`` unset): ``A_V,bc = k * a_v_max`` on the O/B
+        rows. Default 1.5.
+    birth_cloud_a_v : float or None
+        DECOUPLED birth-cloud dust (2026-09-29, user): when set, every star of an
+        SSP no older than ``t_bc_myr`` -- not only the O/B rows -- sits behind
+        this host-frame A_V on top of the ISM screen (``a_v_host``), whatever the
+        knob; the knob then scales only the lines (and the captured Q_H). The
+        lines sit behind the same screen. None (default): the coupled form above.
     t_bc_myr : float
         Oldest SSP that still sits in its birth cloud (Myr). Default 10.
     log_teff_min : float
@@ -142,6 +150,7 @@ class NebularConfig:
     """
     knob: float = 0.0
     a_v_max: float = 1.5
+    birth_cloud_a_v: float = None
     t_bc_myr: float = 10.0
     log_teff_min: float = 4.0
     log_u: float = -3.0
@@ -161,6 +170,8 @@ class NebularConfig:
             raise ValueError(f'nebular knob must be in [0, 1], got {k}')
         if self.a_v_max < 0:
             raise ValueError(f'a_v_max must be >= 0, got {self.a_v_max}')
+        if self.birth_cloud_a_v is not None and float(self.birth_cloud_a_v) < 0:
+            raise ValueError(f'birth_cloud_a_v must be >= 0, got {self.birth_cloud_a_v}')
         if self.fwhm_pc <= 0:
             raise ValueError(f'fwhm_pc must be > 0, got {self.fwhm_pc}')
         if self.t_bc_myr <= 0:
@@ -173,13 +184,21 @@ class NebularConfig:
             raise ValueError(f'n_size_classes must be >= 1, got {self.n_size_classes}')
 
     @property
+    def decoupled(self):
+        """Birth-cloud dust set on its own (``birth_cloud_a_v``), not by the knob."""
+        return self.birth_cloud_a_v is not None
+
+    @property
     def active(self):
-        """True when the knob is above zero; nothing is computed otherwise."""
-        return float(self.knob) > 0.0
+        """True when there are lines (knob > 0) or decoupled birth-cloud dust;
+        nothing is computed otherwise."""
+        return float(self.knob) > 0.0 or (self.decoupled and float(self.birth_cloud_a_v) > 0.0)
 
     @property
     def a_v_bc(self):
-        """The birth-cloud screen at this knob setting."""
+        """The birth-cloud screen: ``birth_cloud_a_v`` if set, else ``k * a_v_max``."""
+        if self.decoupled:
+            return float(self.birth_cloud_a_v)
         return float(self.knob) * float(self.a_v_max)
 
     def as_dict(self):
@@ -487,10 +506,13 @@ def line_band_abs_mags(line_lum, lambda_vac, trans_wave, trans, redshift=0.0,
 # the isochrone-row operation
 # ---------------------------------------------------------------------------
 def young_row_mask(log_age, log_teff, cfg):
-    """Rows that get the nebular treatment (all False for an old SSP)."""
+    """Rows that get the nebular treatment (all False for an old SSP): the O/B
+    rows, or -- with decoupled birth-cloud dust -- every row of the young SSP."""
     lt = np.asarray(log_teff, dtype=float)
     if not is_active(cfg) or 10 ** float(log_age) > cfg.t_bc_myr * 1e6 * (1 + 1e-9):
         return np.zeros(lt.shape, dtype=bool)
+    if cfg.decoupled and cfg.a_v_bc > 0:
+        return np.ones(lt.shape, dtype=bool)
     return lt >= float(cfg.log_teff_min)
 
 
@@ -525,6 +547,9 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
 
     k = float(cfg.knob)
     a_young = float(a_v_host) + cfg.a_v_bc
+    # lines only from the O/B rows (with decoupled dust the dust rows are all rows)
+    ob = np.asarray(log_teff, dtype=float) >= float(cfg.log_teff_min)
+    info['n_line_rows'] = int((rows & ob).sum()) if k > 0 else 0
     ext = extinction_curve(extinction_law, r_v)
     idx_all = np.flatnonzero(rows)
     groups, source = row_spectra(np.asarray(log_teff)[rows],
@@ -546,7 +571,7 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
     for sub, lam, f in groups:
         r = idx_all[sub]
         q = ionizing_photons_per_erg(lam, f)                     # photons / erg
-        q_h = k * q * (10 ** np.asarray(log_l, dtype=float)[r]) * L_SUN
+        q_h = k * q * (10 ** np.asarray(log_l, dtype=float)[r]) * L_SUN * ob[r]
         info['q_h'][r] = q_h
         line_lum = (HBETA_ERG_PER_ION * q_h)[:, None] * ratio[None, :]
         qw = _trapz_weights(lam)
@@ -570,7 +595,7 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
             # the continuum (dusty blurring); in 'stromgren' mode only the lines --
             # the Stromgren sphere is the size of the glowing gas, and a star's
             # photosphere stays a point (dimmed by the birth-cloud dust) (user, 2026-09-29)
-            cont_share = k if cfg.size_mode == 'fixed' else 0.0
+            cont_share = (k * ob[r]) if cfg.size_mode == 'fixed' else 0.0
             blob[band][r] = (cont_share * f_star + f_line) / tot
     return new, blob, info
 
