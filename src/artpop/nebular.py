@@ -67,7 +67,7 @@ __all__ = ['NebularConfig', 'MappingsLineTable', 'row_spectra', 'ionizing_rate',
            'stromgren_diameter_pc', 'sphere_kernel', 'stromgren_classes']
 
 # its own channel, like `ArtPop Logger.dust`, so pipeline log muting of the
-# parent logger does not hide an O/H clip
+# parent logger does not hide an O/H extrapolation or clip
 nebular_logger = logging.getLogger(logger.name + '.nebular')
 nebular_logger.setLevel(logging.WARNING)
 
@@ -235,13 +235,26 @@ class MappingsLineTable:
     ApJ 856, 89; MAPPINGS: Sutherland & Dopita 2017), converted by
     ``tools/build_nebular_grid.py``: axes 12 + log O/H (12 nodes, 7.06-9.30),
     log U (9, -4 to -2) and log P/k (12, 4.2-8.6). Interpolated linearly in all
-    three. log U and log P outside the grid **raise**; O/H below or above it is
-    **clipped to the edge with a warning** (a very metal-poor dwarf is common,
-    and its Balmer lines, which dominate the broadband effect, barely depend
-    on O/H), and never extrapolated.
+    three. log U and log P outside the grid **raise**.
+
+    **Below the grid's lowest O/H node (7.06)** each line is extrapolated
+    **log-linearly** in O/H from the two lowest nodes (7.06, 7.66) at the
+    requested (U, P): ``r(oh) = r0 * 10**(s * (oh - 7.06))``, with ``s`` that
+    line's own ``d log r / d(O/H)`` there (user, 2026-09-30). This is the
+    low-metallicity limit the grid itself shows: the metal (forbidden) lines
+    scale as O/H^0.9-1.2 (a coolant's line strength is proportional to its
+    abundance once metals no longer set the gas temperature), and the H and He
+    lines are flat (|s| <= 0.02). A line that is 0 at either node stays 0.
+    Tested leave-one-out (extrapolating 7.66 and 8.06 to 7.06, 0.60 dex, every
+    U and P): <= 0.1 dex for [OII], [SII], [SIII], 0.12-0.22 for [NII], ~0.3
+    for [OIII] and [NeIII], against 0.5-0.7 dex for holding the edge value.
+    It stops at ``OH_EXTRAPOLATION_FLOOR`` (6.5, below any star-forming galaxy
+    known and the prior's lowest young O/H, 6.60) and **raises** below it.
+    Above the top node (9.30) the edge value is used, with a warning.
     """
 
     _AXES = ('oh', 'log_u', 'log_p')
+    OH_EXTRAPOLATION_FLOOR = 6.5
 
     def __init__(self, path=None):
         from astropy.table import Table
@@ -283,19 +296,35 @@ class MappingsLineTable:
                 raise ValueError(f'{name} = {v} is outside the MAPPINGS grid '
                                  f'[{ax[0]}, {ax[-1]}]')
         oh = float(oh)
-        oh_c = float(np.clip(oh, oh_ax[0], oh_ax[-1]))
-        if oh_c != oh:
-            key = round(oh, 3)
+        if oh < self.OH_EXTRAPOLATION_FLOOR - 1e-9:
+            raise ValueError(
+                f'12 + log O/H = {oh:.3f} is below the extrapolation floor '
+                f'{self.OH_EXTRAPOLATION_FLOOR} (the MAPPINGS grid starts at '
+                f'{oh_ax[0]:.3f}); refusing to extrapolate further')
+        if self._rgi is None:
+            self._rgi = RegularGridInterpolator(self.axes, self.cube)
+        at = lambda o: self._rgi([[float(o), float(log_u), float(log_p)]])[0]
+        key = round(oh, 3)
+        if oh < oh_ax[0]:
+            r0, r1 = at(oh_ax[0]), at(oh_ax[1])
+            with np.errstate(divide='ignore', invalid='ignore'):
+                slope = np.where((r0 > 0) & (r1 > 0),
+                                 np.log10(r1 / r0) / (oh_ax[1] - oh_ax[0]), 0.0)
+            r = r0 * 10.0 ** (slope * (oh - oh_ax[0]))
             if key not in self._warned:
                 self._warned.add(key)
                 nebular_logger.warning(
-                    f'12 + log O/H = {oh:.3f} is outside the MAPPINGS grid '
-                    f'[{oh_ax[0]:.3f}, {oh_ax[-1]:.3f}]; using the edge value '
-                    f'{oh_c:.3f} (clipped, not extrapolated)')
-        if self._rgi is None:
-            self._rgi = RegularGridInterpolator(self.axes, self.cube)
-        r = self._rgi([[oh_c, float(log_u), float(log_p)]])[0]
-        return list(self.names), self.lambda_vac.copy(), r
+                    f'12 + log O/H = {oh:.3f} is below the MAPPINGS grid '
+                    f'({oh_ax[0]:.3f}); line ratios extrapolated log-linearly '
+                    f'from its two lowest nodes')
+            return list(self.names), self.lambda_vac.copy(), r
+        oh_c = float(min(oh, oh_ax[-1]))
+        if oh_c != oh and key not in self._warned:
+            self._warned.add(key)
+            nebular_logger.warning(
+                f'12 + log O/H = {oh:.3f} is above the MAPPINGS grid '
+                f'({oh_ax[-1]:.3f}); using the edge value (not extrapolated)')
+        return list(self.names), self.lambda_vac.copy(), at(oh_c)
 
     _CACHE = {}
 
@@ -564,7 +593,8 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
     keep = (lam_vac >= cfg.lambda_min_aa) & (lam_vac <= cfg.lambda_max_aa)
     names = [nm for nm, kp in zip(names, keep) if kp]
     lam_vac, ratio = lam_vac[keep], ratio[keep]
-    info.update(oh=oh, oh_used=float(np.clip(oh, table.axes[0][0], table.axes[0][-1])),
+    info.update(oh=oh, oh_used=float(min(oh, table.axes[0][-1])),
+                oh_extrapolated=bool(oh < table.axes[0][0]),
                 log_u=cfg.log_u, log_p=cfg.log_p, lines=names)
 
     z = float(redshift)

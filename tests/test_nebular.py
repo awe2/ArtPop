@@ -201,13 +201,40 @@ class TestMappingsTable(TestCase):
         self.assertAlmostEqual(lam[names.index('Halpha')], 6564.6, delta=0.2)
 
     def test_n3b_out_of_grid(self):
+        """N3b: U/P outside raise; above the top O/H node the edge is used;
+        below the floor it raises."""
         t = MappingsLineTable()
         with self.assertRaises(ValueError):
             t.ratios(8.5, -1.0, 6.2)
         with self.assertLogs(neb.nebular_logger, 'WARNING'):
-            names, _, lo = t.ratios(6.0, -3.0, 6.2)
-        _, _, edge = t.ratios(t.axes[0][0], -3.0, 6.2)
-        np.testing.assert_array_equal(lo, edge)
+            _, _, hi = t.ratios(9.6, -3.0, 6.2)
+        _, _, top = t.ratios(t.axes[0][-1], -3.0, 6.2)
+        np.testing.assert_array_equal(hi, top)
+        with self.assertRaises(ValueError):
+            t.ratios(t.OH_EXTRAPOLATION_FLOOR - 0.01, -3.0, 6.2)
+
+    def test_n3c_log_linear_extrapolation_below_the_grid(self):
+        """N3c: below 7.06 each line follows its own log-linear slope from
+        the two lowest nodes; continuous at the edge; H/He flat, metals ~ O/H."""
+        t = MappingsLineTable()
+        o0, o1 = t.axes[0][0], t.axes[0][1]
+        names, _, r0 = t.ratios(o0, -3.0, 6.2)
+        _, _, r1 = t.ratios(o1, -3.0, 6.2)
+        _, _, just = t.ratios(o0 - 1e-6, -3.0, 6.2)
+        np.testing.assert_allclose(just, r0, rtol=1e-5)            # continuous at the edge
+        oh = 6.6
+        with self.assertLogs(neb.nebular_logger, 'WARNING'):
+            _, _, lo = t.ratios(oh, -3.0, 6.2)
+        pos = (r0 > 0) & (r1 > 0)
+        slope = np.log10(r1[pos] / r0[pos]) / (o1 - o0)
+        np.testing.assert_allclose(np.log10(lo[pos] / r0[pos]), slope * (oh - o0), atol=1e-10)
+        self.assertTrue(np.all(lo[~pos] == 0.0))
+        i = names.index
+        self.assertEqual(lo[i('Hbeta')], 1.0)
+        self.assertLess(abs(np.log10(lo[i('Halpha')] / r0[i('Halpha')])), 0.01)
+        for line in ('OII3726', 'OIII5007', 'NII6583', 'SII6716'):
+            d = np.log10(lo[i(line)] / r0[i(line)]) / (oh - o0)       # dex per dex
+            self.assertTrue(0.8 < d < 1.3, (line, d))
 
 
 # ---------------------------------------------------------------------------
