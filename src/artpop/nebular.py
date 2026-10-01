@@ -234,13 +234,27 @@ class MappingsLineTable:
     The grid is the one NebulaBayes distributes (Thomas et al. 2018,
     ApJ 856, 89; MAPPINGS: Sutherland & Dopita 2017), converted by
     ``tools/build_nebular_grid.py``: axes 12 + log O/H (12 nodes, 7.06-9.30),
-    log U (9, -4 to -2) and log P/k (12, 4.2-8.6). Interpolated linearly in all
-    three. log U and log P outside the grid **raise**.
+    log U (9, -4 to -2) and log P/k (12, 4.2-8.6). log U and log P outside the
+    grid **raise**. Interpolation is **linear in log U and log P** and, along
+    O/H, a **monotone cubic (PCHIP) in log10(ratio)** through all 12 nodes (user,
+    2026-10-01: interpolate the logarithm along O/H). Linear interpolation of
+    the ratio itself bowed above the metal lines (which scale roughly as a power
+    of O/H): leave-one-out at the 7.66 node, 0.15-0.34 dex off for [OII], [NII],
+    [SII], [SIII]. Straight lines in log fixed those but missed the saturating
+    [OIII] and [NeIII] by 0.10 dex. PCHIP in log is the most robust of the
+    three (over all interior nodes it has the smallest median error for most
+    lines and the smallest 95th percentile for [OIII], [NII] and [SII]),
+    reproduces every node, never overshoots between them, and has a continuous
+    slope. A line with a 0 at any node at this (U, P) (under MAPPINGS' 1e-5
+    print threshold) falls back to log-linear between positive pairs and linear
+    otherwise.
 
-    **Below the grid's lowest O/H node (7.06)** each line is extrapolated
-    **log-linearly** in O/H from the two lowest nodes (7.06, 7.66) at the
-    requested (U, P): ``r(oh) = r0 * 10**(s * (oh - 7.06))``, with ``s`` that
-    line's own ``d log r / d(O/H)`` there (user, 2026-09-30). This is the
+    **Below the grid's lowest O/H node (7.06)** each line continues
+    **log-linearly** with the PCHIP slope at 7.06 at the requested (U, P),
+    ``r(oh) = r0 * 10**(s * (oh - 7.06))``, so the slope is continuous at the edge
+    (user, 2026-09-30/10-01); the metal lines' slopes there are 1.0-1.2 dex per
+    dex, the low-metallicity limit (line strength proportional to abundance),
+    and H/He are flat. This is the
     low-metallicity limit the grid itself shows: the metal (forbidden) lines
     scale as O/H^0.9-1.2 (a coolant's line strength is proportional to its
     abundance once metals no longer set the gas temperature), and the H and He
@@ -284,12 +298,31 @@ class MappingsLineTable:
         if not np.isfinite(cube).all():
             raise ValueError(f'{self.path}: grid has holes')
         self.cube = cube
-        self._rgi = None
+        self._slabs = {}
         self._warned = set()
+
+    def _slab(self, log_u, log_p):
+        """The ratios at every O/H node, bilinear in (log U, log P)."""
+        key = (round(float(log_u), 9), round(float(log_p), 9))
+        if key not in self._slabs:
+            _, u_ax, p_ax = self.axes
+            def bracket(ax, v):
+                i = int(np.clip(np.searchsorted(ax, v, side='right') - 1, 0, ax.size - 2))
+                return i, (v - ax[i]) / (ax[i + 1] - ax[i])
+            iu, wu = bracket(u_ax, float(log_u))
+            ip, wp = bracket(p_ax, float(log_p))
+            c = self.cube
+            slab = ((1 - wu) * (1 - wp) * c[:, iu, ip] + wu * (1 - wp) * c[:, iu + 1, ip]
+                    + (1 - wu) * wp * c[:, iu, ip + 1] + wu * wp * c[:, iu + 1, ip + 1])
+            # PCHIP in log10(ratio) along O/H for the lines positive at every node
+            from scipy.interpolate import PchipInterpolator
+            smooth = (slab > 0).all(axis=0)
+            f = PchipInterpolator(self.axes[0], np.log10(np.where(smooth, slab, 1.0)), axis=0)
+            self._slabs[key] = (slab, smooth, f, f.derivative()(self.axes[0][0]))
+        return self._slabs[key]
 
     def ratios(self, oh, log_u, log_p):
         """``(names, lambda_vac, ratio_to_Hbeta)`` at one gas state."""
-        from scipy.interpolate import RegularGridInterpolator
         oh_ax, u_ax, p_ax = self.axes
         for v, ax, name in ((log_u, u_ax, 'log_u'), (log_p, p_ax, 'log_p')):
             if not ax[0] - 1e-9 <= float(v) <= ax[-1] + 1e-9:
@@ -301,30 +334,41 @@ class MappingsLineTable:
                 f'12 + log O/H = {oh:.3f} is below the extrapolation floor '
                 f'{self.OH_EXTRAPOLATION_FLOOR} (the MAPPINGS grid starts at '
                 f'{oh_ax[0]:.3f}); refusing to extrapolate further')
-        if self._rgi is None:
-            self._rgi = RegularGridInterpolator(self.axes, self.cube)
-        at = lambda o: self._rgi([[float(o), float(log_u), float(log_p)]])[0]
+        slab, smooth, f, slope0 = self._slab(log_u, log_p)   # (n_oh, n_line) ...
         key = round(oh, 3)
-        if oh < oh_ax[0]:
-            r0, r1 = at(oh_ax[0]), at(oh_ax[1])
-            with np.errstate(divide='ignore', invalid='ignore'):
-                slope = np.where((r0 > 0) & (r1 > 0),
-                                 np.log10(r1 / r0) / (oh_ax[1] - oh_ax[0]), 0.0)
-            r = r0 * 10.0 ** (slope * (oh - oh_ax[0]))
+        if oh > oh_ax[-1]:
             if key not in self._warned:
                 self._warned.add(key)
                 nebular_logger.warning(
-                    f'12 + log O/H = {oh:.3f} is below the MAPPINGS grid '
-                    f'({oh_ax[0]:.3f}); line ratios extrapolated log-linearly '
-                    f'from its two lowest nodes')
-            return list(self.names), self.lambda_vac.copy(), r
-        oh_c = float(min(oh, oh_ax[-1]))
-        if oh_c != oh and key not in self._warned:
+                    f'12 + log O/H = {oh:.3f} is above the MAPPINGS grid '
+                    f'({oh_ax[-1]:.3f}); using the edge value (not extrapolated)')
+            return list(self.names), self.lambda_vac.copy(), slab[-1].copy()
+        on_node = np.flatnonzero(np.abs(oh_ax - oh) < 1e-9)
+        if on_node.size:                                    # a node is reproduced exactly
+            return list(self.names), self.lambda_vac.copy(), slab[on_node[0]].copy()
+        below = oh < oh_ax[0]
+        if below and key not in self._warned:
             self._warned.add(key)
             nebular_logger.warning(
-                f'12 + log O/H = {oh:.3f} is above the MAPPINGS grid '
-                f'({oh_ax[-1]:.3f}); using the edge value (not extrapolated)')
-        return list(self.names), self.lambda_vac.copy(), at(oh_c)
+                f'12 + log O/H = {oh:.3f} is below the MAPPINGS grid '
+                f'({oh_ax[0]:.3f}); line ratios extrapolated log-linearly '
+                f'from its two lowest nodes')
+        j = int(np.clip(np.searchsorted(oh_ax, oh, side='right') - 1, 0, oh_ax.size - 2))
+        w = (oh - oh_ax[j]) / (oh_ax[j + 1] - oh_ax[j])    # < 0 below the grid
+        ra, rb = slab[j], slab[j + 1]
+        pos = (ra > 0) & (rb > 0)
+        # fallback (a 0 somewhere along O/H): log-linear for a positive pair;
+        # otherwise linear inside the grid and held at the edge value below it
+        with np.errstate(divide='ignore', invalid='ignore'):
+            r = np.where(pos, ra * (rb / ra) ** w, 0.0)
+        r = np.where(pos, r, ra + (rb - ra) * w if not below else ra)
+        # the smooth lines: PCHIP in log inside, its end slope continued below
+        if below:
+            r_s = slab[0] * 10.0 ** (slope0 * (oh - oh_ax[0]))
+        else:
+            r_s = 10.0 ** f(oh)
+        r = np.where(smooth, r_s, r)
+        return list(self.names), self.lambda_vac.copy(), r
 
     _CACHE = {}
 

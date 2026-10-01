@@ -214,21 +214,23 @@ class TestMappingsTable(TestCase):
             t.ratios(t.OH_EXTRAPOLATION_FLOOR - 0.01, -3.0, 6.2)
 
     def test_n3c_log_linear_extrapolation_below_the_grid(self):
-        """N3c: below 7.06 each line follows its own log-linear slope from
-        the two lowest nodes; continuous at the edge; H/He flat, metals ~ O/H."""
+        """N3c: below 7.06 each line continues log-linearly with the slope of
+        the in-grid curve at 7.06; continuous at the edge; H/He flat, metals
+        ~ proportional to O/H."""
         t = MappingsLineTable()
-        o0, o1 = t.axes[0][0], t.axes[0][1]
+        o0 = t.axes[0][0]
         names, _, r0 = t.ratios(o0, -3.0, 6.2)
-        _, _, r1 = t.ratios(o1, -3.0, 6.2)
-        _, _, just = t.ratios(o0 - 1e-6, -3.0, 6.2)
-        np.testing.assert_allclose(just, r0, rtol=1e-5)            # continuous at the edge
+        eps = 1e-5
+        _, _, up = t.ratios(o0 + eps, -3.0, 6.2)
         oh = 6.6
         with self.assertLogs(neb.nebular_logger, 'WARNING'):
             _, _, lo = t.ratios(oh, -3.0, 6.2)
-        pos = (r0 > 0) & (r1 > 0)
-        slope = np.log10(r1[pos] / r0[pos]) / (o1 - o0)
-        np.testing.assert_allclose(np.log10(lo[pos] / r0[pos]), slope * (oh - o0), atol=1e-10)
-        self.assertTrue(np.all(lo[~pos] == 0.0))
+        _, _, just = t.ratios(o0 - 1e-6, -3.0, 6.2)
+        np.testing.assert_allclose(just, r0, rtol=1e-5)            # continuous at the edge
+        pos = (r0 > 0) & (up > 0) & (lo > 0)
+        s_in = np.log10(up[pos] / r0[pos]) / eps                    # slope just inside
+        s_out = np.log10(r0[pos] / lo[pos]) / (o0 - oh)             # slope used below
+        np.testing.assert_allclose(s_out, s_in, atol=1e-3)
         i = names.index
         self.assertEqual(lo[i('Hbeta')], 1.0)
         self.assertLess(abs(np.log10(lo[i('Halpha')] / r0[i('Halpha')])), 0.01)
@@ -236,6 +238,34 @@ class TestMappingsTable(TestCase):
             d = np.log10(lo[i(line)] / r0[i(line)]) / (oh - o0)       # dex per dex
             self.assertTrue(0.8 < d < 1.3, (line, d))
 
+    def test_n3d_smooth_in_log_along_oh_inside_the_grid(self):
+        """N3d: along O/H the log ratio is a monotone cubic through the nodes:
+        nodes exact, no overshoot between neighbours, slope continuous across
+        every node; a line with a zero at some node falls back to piecewise."""
+        t = MappingsLineTable()
+        oh = t.axes[0]
+        rows = np.array([t.ratios(o, -3.0, 6.2)[2] for o in oh])
+        np.testing.assert_array_equal(rows, t._slab(-3.0, 6.2)[0])   # nodes exact
+        smooth = (rows > 0).all(axis=0)
+        names = list(t.names)
+        for line in ('Halpha', 'Hbeta', 'OII3726', 'OII3729', 'NeIII3869', 'OIII5007', 'NII6583',
+                     'SII6716', 'SII6731', 'SIII9069', 'SIII9531', 'HeI5876', 'Paalpha', 'Brgamma'):
+            self.assertTrue(smooth[names.index(line)], line)       # every strong line is on the cubic
+        for j in range(oh.size - 1):
+            mid = t.ratios(0.5 * (oh[j] + oh[j + 1]), -3.0, 6.2)[2][smooth]
+            lo_ = np.minimum(rows[j], rows[j + 1])[smooth]
+            hi_ = np.maximum(rows[j], rows[j + 1])[smooth]
+            self.assertTrue(np.all((mid >= lo_ * (1 - 1e-9)) & (mid <= hi_ * (1 + 1e-9))))
+        eps = 1e-7                                     # one-sided differences; curvature error ~ f'' eps
+        for j in range(1, oh.size - 1):
+            l = np.log10(t.ratios(oh[j] - eps, -3.0, 6.2)[2][smooth])
+            c = np.log10(rows[j][smooth])
+            r = np.log10(t.ratios(oh[j] + eps, -3.0, 6.2)[2][smooth])
+            np.testing.assert_allclose((c - l) / eps, (r - c) / eps, atol=2e-3)
+        # the 7.06 -> 7.66 gap: metal lines now sit below the old straight line in the ratio
+        k = names.index('SII6716')
+        mid = t.ratios(0.5 * (oh[0] + oh[1]), -3.0, 6.2)[2][k]
+        self.assertLess(mid, 0.5 * (rows[0, k] + rows[1, k]))
 
 # ---------------------------------------------------------------------------
 # Tier S -- spectra, Q_H and the birth-cloud dust
