@@ -38,10 +38,13 @@ from artpop import nebular as neb
 from artpop.nebular import (NebularConfig, MappingsLineTable, nebular_kernel,
                             line_band_abs_mags, apply_to_rows, young_row_mask,
                             row_spectra, ionizing_photons_per_erg,
-                            ionizing_rate, L_SUN, HBETA_ERG_PER_ION)
+                            ionizing_rate, L_SUN, HBETA_ERG_PER_ION,
+                            NebularContinuumTable, continuum_band_abs_mags,
+                            default_continuum_table_path)
 
 FILTERS = ['LSST_u', 'LSST_g', 'LSST_r', 'LSST_i', 'LSST_z', 'LSST_y']
 _HAVE_TABLE = os.path.isfile(neb.default_line_table_path())
+_HAVE_CONT = os.path.isfile(default_continuum_table_path())
 _HAVE_C3K = C3KLibrary().available
 _HAVE_MIST25 = os.path.isdir(os.path.join(MIST_PATH, 'MIST_v2.5_LSST'))
 _PC10_CM2 = 4.0 * np.pi * (10.0 * neb.PC_CM) ** 2
@@ -636,3 +639,162 @@ class TestDecoupledDustMIST(TestCase):
         old, stock_old = MISTIsochrone(log_age=7.3, nebular=nb, **kw), MISTIsochrone(log_age=7.3, **kw)
         for f in FILTERS:
             self.assertTrue(np.array_equal(np.asarray(old.mag_table[f]), np.asarray(stock_old.mag_table[f])))
+
+
+# ---------------------------------------------------------------------------
+# Nebular continuum (2026-10-05): free-bound, two-photon, free-free per Hbeta
+# ---------------------------------------------------------------------------
+class TestContinuumConfig(TestCase):
+
+    def test_nc0_defaults_and_validation(self):
+        """NC0: the continuum is on by default at 10^4 K and He+/H+ = 0.08;
+        bad values raise; a YAML block can switch it off."""
+        cfg = NebularConfig(knob=0.5)
+        self.assertTrue(cfg.continuum)
+        self.assertEqual((cfg.t_e_k, cfg.he1_h), (1.0e4, 0.08))
+        self.assertFalse(NebularConfig.coerce({'knob': 0.5, 'continuum': False}).continuum)
+        with self.assertRaises(ValueError):
+            NebularConfig(t_e_k=0.0)
+        with self.assertRaises(ValueError):
+            NebularConfig(he1_h=-0.1)
+
+
+@skipUnless(_HAVE_CONT, 'nebular continuum table not built')
+class TestContinuumTable(TestCase):
+
+    def test_nc1_nodes_jumps_and_temperature(self):
+        """NC1: the table returns its own nodes; the Balmer and Paschen jumps
+        sit at the vacuum series limits; the jump and the continuum per Hbeta
+        shrink as T_e rises; outside 5000-25000 K it raises."""
+        t = NebularContinuumTable.cached()
+        lam, c = t.spectrum(1.0e4, 0.08)
+        j = list(t.t_nodes).index(1.0e4)
+        np.testing.assert_allclose(c, t.h[j] + 0.08 * t.he1[j], rtol=1e-12)
+        np.testing.assert_allclose(t.spectrum(1.0e4, 0.0)[1], t.h[j], rtol=1e-12)
+        for limit, lo in ((3647.0175, 3.0), (8205.8265, 1.5)):
+            below = np.interp(limit - 0.01, lam, c)
+            above = np.interp(limit + 0.01, lam, c)
+            self.assertGreater(below / above, lo, limit)
+        def bj(T):
+            l, cc = t.spectrum(T)
+            return np.interp(3640.0, l, cc) / np.interp(3660.0, l, cc)
+        def ew_hb(T):
+            l, cc = t.spectrum(T)
+            return 1.0 / np.interp(4862.7, l, cc)
+        self.assertGreater(bj(6000.0), bj(1.2e4))
+        self.assertGreater(bj(1.2e4), bj(2.0e4))
+        self.assertGreater(ew_hb(1.2e4), ew_hb(2.0e4))
+        # regression of the PyNeb 1.1.32 build (not an independent check):
+        # Hbeta's equivalent width against the pure nebular continuum
+        self.assertAlmostEqual(ew_hb(1.0e4), 1374.0, delta=5.0)
+        for bad in (4000.0, 3.0e4):
+            with self.assertRaises(ValueError):
+                t.spectrum(bad)
+
+    def test_nc2_temperature_interpolation_between_nodes(self):
+        """NC2: between two nodes the continuum lies between them (log-log
+        interpolation, no overshoot)."""
+        t = NebularContinuumTable.cached()
+        a, b = t.spectrum(1.0e4)[1], t.spectrum(1.25e4)[1]
+        m = t.spectrum(1.12e4)[1]
+        self.assertTrue(np.all(m <= np.maximum(a, b) * (1 + 1e-12)))
+        self.assertTrue(np.all(m >= np.minimum(a, b) * (1 - 1e-12)))
+
+
+class TestContinuumIntoBand(TestCase):
+
+    def test_nc3_flat_continuum_matches_the_formula(self):
+        """NC3: a flat c in a top-hat band against the photon-counting formula
+        by hand, with the continuum's (1+z) bandwidth factor."""
+        tw, tt = _top_hat()
+        lam = np.linspace(4000.0, 9000.0, 50001)
+        c0, L = 1e-3, 1e38
+        den = C_AA * np.sum(_trapz_weights(tw) * tt / tw)
+        for z in (0.0, 0.05):
+            got = continuum_band_abs_mags([L], lam, np.full(lam.size, c0), tw, tt, z)[0]
+            integral = (7000.0 ** 2 - 6000.0 ** 2) / (2 * (1 + z) ** 2)
+            want = -2.5 * np.log10((1 + z) * L * c0 * integral / den / _PC10_CM2) - 48.6
+            # 1e-4 mag: the top-hat's edges sampled on two different grids
+            self.assertAlmostEqual(got, want, delta=2e-4)
+
+    def test_nc4_narrow_continuum_is_a_line(self):
+        """NC4: a continuum box of unit area around lambda_0 gives the same
+        magnitude as a line of the same luminosity there, at any z and with
+        dust -- the two conventions agree, and the (1+z) is right."""
+        tw, tt = _top_hat(5000, 8000)
+        ext = extinction_curve('F99', 3.1)
+        lam0, L = 6564.6, 1e38
+        lam = np.linspace(lam0 - 1.0, lam0 + 1.0, 4001)
+        box = np.where(np.abs(lam - lam0) <= 0.5, 1.0, 0.0)
+        box /= np.dot(box, _trapz_weights(lam))
+        for z, ah, amw in ((0.0, 0, 0), (0.07, 0.3, 0.2)):
+            got = continuum_band_abs_mags([L], lam, box, tw, tt, z, ah, amw, ext)[0]
+            want = line_band_abs_mags([[L]], [lam0], tw, tt, z, ah, amw, ext)[0]
+            self.assertAlmostEqual(got, want, places=4)
+
+
+@skipUnless(_HAVE_C3K and _HAVE_TABLE and _HAVE_CONT,
+            'needs C3K, the MAPPINGS table and the continuum table')
+class TestContinuumRows(TestCase):
+
+    def _run(self, **kw):
+        kw.setdefault('size_mode', 'stromgren')
+        lt = np.log10([45e3, 35e3])
+        lg = np.array([4.0, 4.0])
+        mags = {b: np.zeros(2) for b in FILTERS}
+        cfg = NebularConfig(**dict(dict(knob=1.0, a_v_max=0.0), **kw))
+        return apply_to_rows(cfg, mags, _lsst_curves(), 6.5, -1.0, lt, lg,
+                             np.array([5.3, 4.5]), redshift=0.02,
+                             a_v_host=0.2, a_v_mw=0.1)
+
+    def test_nc5_rows_gain_exactly_the_continuum(self):
+        """NC5: switching the continuum on adds, per row and band, exactly
+        L(Hbeta) x the continuum's band flux per unit Hbeta, behind the same
+        dust as the lines; it is linear in k and goes into the blob."""
+        curves = _lsst_curves()
+        on, b_on, info = self._run()
+        off, b_off, _ = self._run(continuum=False)
+        half, _, info_h = self._run(knob=0.5)
+        half_off, _, _ = self._run(knob=0.5, continuum=False)
+        t = NebularContinuumTable.cached()
+        lam, c = t.spectrum(1.0e4, 0.08)
+        ext = extinction_curve('F99', 3.1)
+        self.assertTrue(info['continuum'])
+        for band in FILTERS:
+            m1 = continuum_band_abs_mags([1.0], lam, c, *curves[band], 0.02, 0.2, 0.1, ext)[0]
+            want = HBETA_ERG_PER_ION * info['q_h'] * 10 ** (-0.4 * m1)
+            got = 10 ** (-0.4 * on[band]) - 10 ** (-0.4 * off[band])
+            np.testing.assert_allclose(got, want, rtol=1e-9, err_msg=band)
+            got_h = 10 ** (-0.4 * half[band]) - 10 ** (-0.4 * half_off[band])
+            np.testing.assert_allclose(got_h, 0.5 * got, rtol=1e-9, err_msg=band)
+            # stromgren mode: the blob holds lines + continuum, the star stays a point
+            self.assertTrue(np.all(b_on[band] > b_off[band]), band)
+
+    def test_nc6_knob_zero_still_a_no_op(self):
+        """NC6: with the continuum on, k = 0 still touches nothing."""
+        new, blob, info = self._run(knob=0.0)
+        for b in FILTERS:
+            self.assertTrue(np.array_equal(new[b], np.zeros(2)))
+            self.assertTrue(np.all(blob[b] == 0))
+
+
+@skipUnless(_HAVE_MIST25 and _HAVE_C3K and _HAVE_TABLE and _HAVE_CONT,
+            'needs MIST v2.5 LSST, C3K, the MAPPINGS table and the continuum table')
+class TestContinuumMIST(TestCase):
+
+    def test_nc7_young_isochrone_brightens_in_every_band(self):
+        """NC7: on a 3 Myr isochrone at k = 1 the continuum brightens the hot
+        rows in every band, including i at z = 0, which lines barely reach;
+        rows without lines are untouched."""
+        from artpop import MISTIsochrone
+        kw = dict(feh=-1.0, phot_system='LSST', version='2.5')
+        on = MISTIsochrone(log_age=6.5, nebular={'knob': 1.0, 'a_v_max': 0.0}, **kw)
+        off = MISTIsochrone(log_age=6.5, nebular={'knob': 1.0, 'a_v_max': 0.0,
+                                                   'continuum': False}, **kw)
+        q = on.nebular_info['q_h']
+        hot = q > 0
+        self.assertGreater(hot.sum(), 10)
+        for f in FILTERS:
+            d = np.asarray(on.mag_table[f]) - np.asarray(off.mag_table[f])
+            self.assertTrue(np.all(d[hot] < 0), f)
+            self.assertTrue(np.all(d[~hot] == 0), f)

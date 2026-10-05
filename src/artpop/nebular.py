@@ -22,6 +22,11 @@ fraction of the star's ionizing photons the nebula captures (1 - f_esc):
    (12 + log O/H, log U, log P/k). Each line is placed at ``(1+z) lambda`` and
    weighted by the filter curve there **exactly** -- lines are delta
    functions, so there is no z grid to interpolate across a filter edge.
+   The same gas emits a **nebular continuum** (free-bound, two-photon,
+   free-free; 2026-10-05): ``L_lambda = L(Hbeta) * c(lambda; T_e)`` from a
+   table of atomic coefficients per Hbeta (`NebularContinuumTable`), so it
+   scales with the same ``k Q_H``, sits behind the same dust and goes where
+   the line light goes (``NebularConfig.continuum``, on by default).
 3. **Spatial blob.** In each band the fraction
    ``f_blob = (k F_star + F_lines) / (F_star + F_lines)`` of the star's light
    is spread by a unit-sum Gaussian of physical FWHM ``fwhm_pc`` (converted to
@@ -42,9 +47,11 @@ Approximations (each one also a systematics-ledger row in ALVISS):
 one screen for stars and lines (Calzetti's ~2x extra nebular dust ignored);
 gas O/H = MAPPINGS' solar + [Fe/H]; line *ratios* from a MAPPINGS model whose
 ionizing spectrum is a cluster's, with the absolute scale from each star's
-``Q_H``; LTE C3K atmospheres for ``Q_H``; ionization-bounded case B; no
-nebular continuum (free-free, free-bound, two-photon) yet; one log U and P per
-galaxy; smooth-component OB light gets the magnitudes but no blob.
+``Q_H``; LTE C3K atmospheres for ``Q_H``; ionization-bounded case B; one
+electron temperature (``t_e_k``) and He+/H+ (``he1_h``) for the continuum, no
+He++, and Hbeta per recombination held at its 10^4 K value (it changes by
+<= 3 % over 5-20 kK); one log U and P per galaxy; smooth-component OB light
+gets the magnitudes but no blob.
 """
 import logging
 import os
@@ -64,7 +71,9 @@ __all__ = ['NebularConfig', 'MappingsLineTable', 'row_spectra', 'ionizing_rate',
            'ionizing_photons_per_erg', 'line_band_abs_mags',
            'apply_to_rows', 'nebular_kernel', 'default_line_table_path',
            'L_SUN', 'HBETA_ERG_PER_ION', 'LYMAN_EDGE_AA',
-           'stromgren_diameter_pc', 'sphere_kernel', 'stromgren_classes']
+           'stromgren_diameter_pc', 'sphere_kernel', 'stromgren_classes',
+           'NebularContinuumTable', 'continuum_band_abs_mags',
+           'default_continuum_table_path']
 
 # its own channel, like `ArtPop Logger.dust`, so pipeline log muting of the
 # parent logger does not hide an O/H extrapolation or clip
@@ -89,6 +98,13 @@ def default_line_table_path():
     """The converted MAPPINGS grid shipped in ``artpop/data/nebular/``."""
     return os.path.join(os.path.dirname(__file__), 'data', 'nebular',
                         'mappings51_hii_lines.ecsv')
+
+
+def default_continuum_table_path():
+    """The nebular continuum table (PyNeb coefficients per Hbeta) shipped in
+    ``artpop/data/nebular/``; built by ``tools/build_nebular_continuum.py``."""
+    return os.path.join(os.path.dirname(__file__), 'data', 'nebular',
+                        'nebular_continuum.ecsv')
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +144,9 @@ class NebularConfig:
         FWHM of the blob, physical pc, when ``size_mode = 'fixed'``. Default 100.
     size_mode : str
         ``'fixed'`` (default): one Gaussian of FWHM ``fwhm_pc`` for every star.
-        ``'stromgren'`` (2026-09-29, user): each star's nebula -- its line
-        light only; the star's continuum stays a point -- is a uniformly
+        ``'stromgren'`` (2026-09-29, user): each star's nebula -- its gas
+        light (lines and, since 2026-10-05, the nebular continuum); the star's
+        own continuum stays a point -- is a uniformly
         emitting Stromgren sphere, projected, of diameter
         ``D_S = 2 (3 k Q_H / (4 pi n_e^2 alpha_B))^(1/3)`` from the photons it
         captures, at gas density ``n_e_cm3``; stars are grouped into
@@ -147,6 +164,23 @@ class NebularConfig:
         dust destroys, is excluded by the lower bound).
     line_table : str or None
         Override path of the converted MAPPINGS table.
+    continuum : bool
+        Add the nebular continuum (free-bound, two-photon, free-free) of the
+        same gas (2026-10-05, user). Default True. It needs no knob of its own:
+        per captured photon it is fixed atomic physics, ``L(Hbeta) * c(lambda)``,
+        so it follows k exactly as the lines do. False reproduces the
+        lines-only model.
+    t_e_k : float
+        Electron temperature of the gas for the continuum (K; table 5000-25000).
+        Default 1e4, the temperature ``HBETA_ERG_PER_ION`` is quoted at.
+        Metal-poor HII regions run hotter (1.2-1.6e4 K), which flattens the
+        Balmer jump and lowers the continuum per Hbeta.
+    he1_h : float
+        He+/H+ by number in the ionized gas. Default 0.08 (Y ~ 0.25, helium
+        singly ionized through the H+ zone, as around the hot stars that carry
+        most of Q_H).
+    continuum_table : str or None
+        Override path of the continuum table.
     """
     knob: float = 0.0
     a_v_max: float = 1.5
@@ -163,6 +197,10 @@ class NebularConfig:
     lambda_min_aa: float = 2000.0
     lambda_max_aa: float = 25000.0
     line_table: str = None
+    continuum: bool = True
+    t_e_k: float = 1.0e4
+    he1_h: float = 0.08
+    continuum_table: str = None
 
     def __post_init__(self):
         k = float(self.knob)
@@ -182,6 +220,10 @@ class NebularConfig:
             raise ValueError(f'n_e_cm3 must be > 0, got {self.n_e_cm3}')
         if int(self.n_size_classes) < 1:
             raise ValueError(f'n_size_classes must be >= 1, got {self.n_size_classes}')
+        if self.t_e_k <= 0:
+            raise ValueError(f't_e_k must be > 0, got {self.t_e_k}')
+        if self.he1_h < 0:
+            raise ValueError(f'he1_h must be >= 0, got {self.he1_h}')
 
     @property
     def decoupled(self):
@@ -576,6 +618,118 @@ def line_band_abs_mags(line_lum, lambda_vac, trans_wave, trans, redshift=0.0,
 
 
 # ---------------------------------------------------------------------------
+# the nebular continuum
+# ---------------------------------------------------------------------------
+class NebularContinuumTable:
+    """
+    The nebular continuum per Angstrom relative to Hbeta, ``c(lambda; T_e)``.
+
+    Free-bound (H I, He I), two-photon (H 2s -> 1s) and free-free emission of
+    an ionization-bounded, case-B HII region, from PyNeb's atomic data
+    (``tools/build_nebular_continuum.py``; references in the table header).
+    Per recombination these are fixed numbers, so with ``L(Hbeta)`` from the
+    star's captured photons the continuum is ``L_lambda = L(Hbeta) * c`` --
+    the same scaling as every line, and no new free parameter.
+
+    The table stores ``h_<T>`` (from H+) and ``he1_<T>`` (per unit He+/H+) on
+    vacuum wavelengths at temperature nodes 5000-25000 K; ``spectrum``
+    interpolates ``log c`` linearly in ``log T`` (leave-one-out <= 1.6 % at
+    6250 K, <= 0.4 % above 10 kK) and **raises** outside the nodes.
+    """
+
+    def __init__(self, path=None):
+        from astropy.table import Table
+        self.path = path or default_continuum_table_path()
+        if not os.path.isfile(self.path):
+            raise FileNotFoundError(
+                f'nebular continuum table not found at {self.path}; build it '
+                'with tools/build_nebular_continuum.py')
+        t = Table.read(self.path, format='ascii.ecsv')
+        self.meta = dict(t.meta)
+        self.lambda_vac = np.asarray(t['lambda_vac'], dtype=float)
+        self.t_nodes = np.asarray(self.meta['t_nodes_k'], dtype=float)
+        self.h = np.stack([np.asarray(t[f'h_{int(x)}'], dtype=float)
+                           for x in self.t_nodes])
+        self.he1 = np.stack([np.asarray(t[f'he1_{int(x)}'], dtype=float)
+                             for x in self.t_nodes])
+        self._quad = _trapz_weights(self.lambda_vac)
+
+    _cache = OrderedDict()
+
+    @classmethod
+    def cached(cls, path=None):
+        key = path or default_continuum_table_path()
+        if key not in cls._cache:
+            cls._cache[key] = cls(key)
+        return cls._cache[key]
+
+    def spectrum(self, t_e_k=1.0e4, he1_h=0.08):
+        """``(lambda_vac, c)``: continuum per A relative to F(Hbeta), shape (n_lam,)."""
+        t = float(t_e_k)
+        lo, hi = self.t_nodes[0], self.t_nodes[-1]
+        if not lo <= t <= hi:
+            raise ValueError(f't_e_k = {t:g} K is outside the continuum table '
+                             f'({lo:g}-{hi:g} K)')
+        lt = np.log(self.t_nodes)
+        j = int(np.clip(np.searchsorted(lt, np.log(t)) - 1, 0, lt.size - 2))
+        w = (np.log(t) - lt[j]) / (lt[j + 1] - lt[j])
+
+        def interp(a):
+            with np.errstate(divide='ignore'):
+                la, lb = np.log(a[j]), np.log(a[j + 1])
+            out = np.exp((1.0 - w) * la + w * lb)
+            # a component that is exactly 0 at a node stays linear (never log 0)
+            bad = ~(np.isfinite(la) & np.isfinite(lb))
+            out[bad] = (1.0 - w) * a[j][bad] + w * a[j + 1][bad]
+            return out
+
+        return self.lambda_vac, interp(self.h) + float(he1_h) * interp(self.he1)
+
+
+def continuum_band_abs_mags(hbeta_lum, lambda_vac, c_per_aa, trans_wave, trans,
+                            redshift=0.0, a_v_host=0.0, a_v_mw=0.0, ext=None,
+                            quad_weights=None):
+    """
+    "Absolute" AB magnitude of the nebular continuum in one band, in the
+    convention of the stellar columns and of `line_band_abs_mags`
+    (``m = M + 5 log10(D_L / 10 pc)``). For a rest-frame continuum
+    ``L_lambda = L(Hbeta) c(lambda)``, photon-counting AB,
+
+        f_nu = (1+z) [L(Hbeta) / (4 pi D_L^2)] INT c(l) T((1+z) l) l dl
+               / (c INT T(l) / l dl)
+
+    -- unlike a line, a continuum keeps the bandwidth factor ``(1+z)``
+    (the same one `~artpop.kcorrect.band_offset` carries); a narrow box of
+    continuum reduces to the line formula (test NC4). Dust: host (+ birth
+    cloud) at the rest wavelength, Milky Way at the observed one.
+
+    Parameters
+    ----------
+    hbeta_lum : `~numpy.ndarray`, shape ``(n_row,)``
+        Hbeta luminosity of each row's nebula, erg/s.
+    lambda_vac, c_per_aa : `~numpy.ndarray`
+        `NebularContinuumTable.spectrum` output.
+
+    Returns
+    -------
+    mags : `~numpy.ndarray`, shape ``(n_row,)``; ``inf`` where nothing
+    transmits or ``hbeta_lum`` is 0.
+    """
+    lam = np.asarray(lambda_vac, dtype=float)
+    tw = np.asarray(trans_wave, dtype=float)
+    tt = np.asarray(trans, dtype=float)
+    if (a_v_host or a_v_mw) and ext is None:
+        ext = extinction_curve()
+    w = band_weights(lam, tw, tt, redshift, a_v_host, a_v_mw, ext, 'f_lam',
+                     quad_weights)
+    per_hbeta = (1.0 + float(redshift)) * float(np.dot(c_per_aa, w))
+    norm = C_AA * np.sum(_trapz_weights(tw) * tt / tw)
+    f_nu = np.asarray(hbeta_lum, dtype=float) * per_hbeta / norm / _FOUR_PI_10PC2
+    with np.errstate(divide='ignore'):
+        return -2.5 * np.log10(f_nu) - _MAG_AB0
+
+
+# ---------------------------------------------------------------------------
 # the isochrone-row operation
 # ---------------------------------------------------------------------------
 def young_row_mask(log_age, log_teff, cfg):
@@ -642,6 +796,19 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
                 log_u=cfg.log_u, log_p=cfg.log_p, lines=names)
 
     z = float(redshift)
+    # nebular continuum: L_lambda = L(Hbeta) c(lambda), so per band one number
+    # (magnitude of a nebula with L(Hbeta) = 1 erg/s), behind the same dust
+    cont_m1 = {}
+    if cfg.continuum and k > 0:
+        ctab = NebularContinuumTable.cached(cfg.continuum_table)
+        c_lam, c_val = ctab.spectrum(cfg.t_e_k, cfg.he1_h)
+        for band, (tw, tt) in curves.items():
+            cont_m1[band] = float(continuum_band_abs_mags(
+                np.ones(1), c_lam, c_val, tw, tt, z, a_young, a_v_mw, ext,
+                ctab._quad)[0])
+        info.update(continuum=True, t_e_k=float(cfg.t_e_k), he1_h=float(cfg.he1_h))
+    else:
+        info.update(continuum=False)
     for sub, lam, f in groups:
         r = idx_all[sub]
         q = ionizing_photons_per_erg(lam, f)                     # photons / erg
@@ -663,12 +830,16 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
                                         a_young, a_v_mw, ext)
             f_star = 10 ** (-0.4 * m_star)
             f_line = np.where(np.isfinite(m_line), 10 ** (-0.4 * m_line), 0.0)
+            if band in cont_m1 and np.isfinite(cont_m1[band]):
+                # the continuum is gas light, so it travels with the lines
+                f_line = f_line + HBETA_ERG_PER_ION * q_h * 10 ** (-0.4 * cont_m1[band])
             tot = f_star + f_line
             new[band][r] = -2.5 * np.log10(tot)
-            # what the nebula spreads: in 'fixed' mode the lines and the k share of
-            # the continuum (dusty blurring); in 'stromgren' mode only the lines --
-            # the Stromgren sphere is the size of the glowing gas, and a star's
-            # photosphere stays a point (dimmed by the birth-cloud dust) (user, 2026-09-29)
+            # what the nebula spreads: in 'fixed' mode the gas light (lines + nebular
+            # continuum) and the k share of the stellar continuum (dusty blurring); in
+            # 'stromgren' mode only the gas light -- the Stromgren sphere is the size
+            # of the glowing gas, and a star's photosphere stays a point (dimmed by
+            # the birth-cloud dust) (user, 2026-09-29; nebular continuum 2026-10-05)
             cont_share = (k * ob[r]) if cfg.size_mode == 'fixed' else 0.0
             blob[band][r] = (cont_share * f_star + f_line) / tot
     return new, blob, info
