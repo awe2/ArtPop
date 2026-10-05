@@ -85,11 +85,26 @@ DEFAULT_Z_GRID = np.round(np.concatenate(
 # for the host screen, both in Roman F062, the widest band), so uniform spacing
 # is optimal and the linear-interpolation error is h^2 |f''| / 8. Measured over
 # every spectrum of the three libraries, all 14 LSST + Roman bands and z = 0 to
-# 0.25: MW 0.32 mmag at 3 nodes, host 0.38 mmag at 5. The two add (same sign),
-# so <= ~0.7 mmag against a 1 mmag target. A dust pair outside these ranges is
-# computed exactly, with a warning (`KCorrectionGrid.for_dust`).
+# 0.25 (2026-09-25): MW 0.32 mmag at h = 0.25, host 0.38 mmag at 5 nodes. The
+# two add (same sign), so <= ~0.7 mmag against a 1 mmag target.
+# A_V_mw extended from 0-0.5 to 0-2.0, same h = 0.25 (2026-10-05, user): the
+# completeness injections take A_V_mw per object from SFD, 60 % of crowded
+# (|b| 10-20 deg) patches exceed 0.5, and those are capped at 2.0. Re-measured
+# the same way over 0-2.0 (finesst_feasibility notebooks/dust_axis/
+# size_mw_axis.py): the MW curvature stays flat and falls slowly (worst |f''|
+# 0.041 /mag^2 near 0 on a 1/120 mag grid, falling to 0.037 at 2.0), so every
+# MW cell stays <= 0.32 mmag;
+# the joint bilinear error over a 1/16 mag lattice of (host, MW) pairs is
+# 0.70 mmag (worst cell (0-0.25, 0-0.25); 0.59 in the top MW cell), against
+# the 1 mmag target. Coarser MW spacing, measured jointly the same way:
+# h = 1/3 (7 nodes) 0.95 mmag, a 5 % margin; h = 0.4 (6 nodes) 1.19, fails.
+# The built 5 x 9 tables against exact builds at 19 off-node pairs, every
+# node, all 36 z, every band: max 0.703 mmag (Roman F062), 0.330 in LSST
+# (notebooks/dust_axis/verify_mw_axis_table.py).
+# A dust pair outside these ranges is computed exactly, with a warning
+# (`KCorrectionGrid.for_dust`).
 DEFAULT_AV_HOST_GRID = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
-DEFAULT_AV_MW_GRID = np.array([0.0, 0.25, 0.5])
+DEFAULT_AV_MW_GRID = np.array([0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0])
 
 # Hulls of the two libraries MIST composited (MIST III, Bauer et al. 2025
 # s III.3). The gap at 5.5 < log g < 6.5 is real, and is why there is a
@@ -746,7 +761,7 @@ class KCorrectionGrid:
         baked in as scalars (seconds to build, one dust pair per table), or
         ``a_v_host_grid`` / ``a_v_mw_grid`` make the two extinctions axes of
         the table, so any pair inside them is an interpolation (one build per
-        catalog: ~15x the scalar build and size at the default axes). Giving
+        catalog: ~45x the scalar build and size at the default 5 x 9 axes). Giving
         one axis selects the default for the other (`DEFAULT_AV_HOST_GRID`,
         `DEFAULT_AV_MW_GRID`). The dust-free ``(0, 0)`` table is the common case.
         """
@@ -935,7 +950,8 @@ class KCorrectionGrid:
         * No dust: the dust-free table (small; exactly what it always was).
         * Inside the dust axes (default `DEFAULT_AV_HOST_GRID` x
           `DEFAULT_AV_MW_GRID`): the dust-axis table, interpolated in A_V to
-          <= ~0.7 mmag (F3_dust.ipynb section 4.6). One build per catalog.
+          <= 0.7 mmag (F3_dust.ipynb section 4.6; MW axis re-measured to 2.0
+          on 2026-10-05). One build per catalog.
         * Outside them: **computed exactly** -- a table with this pair baked in,
           built in memory (~10 s) and not written to disk -- with a warning,
           because the axes were sized for the range they cover and an

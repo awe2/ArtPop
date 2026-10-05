@@ -1016,12 +1016,14 @@ class TestDustAxes(TestCase):
         """D1: at a node of both dust axes the table IS the baked table."""
         self.assertTrue(self.G.has_dust_axes)
         self.assertEqual(self.G.c3k.shape[-3:-1], (self.AH.size, self.AM.size))
-        for h, m in ((0.5, 0.25), (1.0, 0.5), (0.25, 0.0)):
+        self.assertEqual(float(self.AM[-1]), 2.0)        # crowded-patch cap (2026-10-05)
+        for h, m in ((0.5, 0.25), (1.0, 0.5), (0.25, 0.0), (0.75, 1.25), (1.0, 2.0)):
             self.assertLess(self._both(h, m), 1e-9, (h, m))
 
     def test_d2_cell_centres_within_one_mmag(self):
         """D2: halfway between dust nodes -- worst case for linear -- < 1 mmag."""
-        for h, m in ((0.125, 0.125), (0.375, 0.375), (0.875, 0.375), (0.625, 0.125)):
+        for h, m in ((0.125, 0.125), (0.375, 0.375), (0.875, 0.375), (0.625, 0.125),
+                     (0.375, 0.875), (0.625, 1.375), (0.875, 1.875)):
             self.assertLess(self._both(h, m), 1e-3, (h, m))
 
     def test_d3_for_dust_routes_and_warns_once(self):
@@ -1059,6 +1061,8 @@ class TestDustAxes(TestCase):
             self.G.offsets(self.lt, self.lg, self.fe, self.z, a_v_host=1.5, a_v_mw=0.1)
         with self.assertRaises(ValueError):
             self.G.offsets(self.lt, self.lg, self.fe, self.z, a_v_host=0.1, a_v_mw=-0.1)
+        with self.assertRaises(ValueError):
+            self.G.offsets(self.lt, self.lg, self.fe, self.z, a_v_host=0.1, a_v_mw=2.1)
         with self.assertRaises(ValueError):
             self._baked(0.2, 0.0).offsets(self.lt, self.lg, self.fe, self.z, a_v_host=0.3)
 
