@@ -1172,7 +1172,8 @@ class MISTIsochrone(Isochrone):
         return iso
 
     def _interp_on_feh(self, phot_system):
-        """Interpolate isochrones between two [Fe/H] grid points."""
+        """Interpolate isochrones between two [Fe/H] grid points, matched on
+        EEP (`blend_isochrones_on_eep`), linear in [Fe/H]."""
         i_feh = self._feh_grid.searchsorted(self.feh)
         feh_lo, feh_hi = self._feh_grid[i_feh - 1: i_feh + 1]
 
@@ -1188,24 +1189,100 @@ class MISTIsochrone(Isochrone):
         mist_1 = fetch_mist_iso_cmd(self.log_age, feh_hi, phot_system,
                                     **self._iso_kw())
 
-        y0, y1 = np.array(mist_0.tolist()), np.array(mist_1.tolist())
+        weight = (self.feh - feh_lo) / (feh_hi - feh_lo)
+        return blend_isochrones_on_eep(mist_0, mist_1, weight)
 
-        x = self.feh
-        x0, x1 = feh_lo, feh_hi
-        weight = (x - x0) / (x1 - x0)
 
-        len_0, len_1 = len(y0), len(y1)
+def _on_eeps(y, eep, eep_ref, y_ref, eeps, categorical):
+    """
+    Columns ``y`` (n, k) of one isochrone at every EEP in ``eeps``.
 
-        # if necessary, extrapolate using trend of the longer array
-        if (len_0 < len_1):
-            delta = y1[len_0:] - y1[len_0 - 1]
-            y0 = np.append(y0, y0[-1] + delta, axis=0)
-        elif (len_0 > len_1):
-            delta = y0[len_1:] - y0[len_1 - 1]
-            y1 = np.append(y1, y1[-1] + delta, axis=0)
+    An EEP inside the isochrone's range that it does not tabulate is
+    interpolated linearly in EEP (nearest neighbour for a categorical column).
+    One beyond either end is taken from the reference isochrone's shape,
+    anchored at this isochrone's own end point, ``y(end) + y_ref(e) -
+    y_ref(end)``, with ``y_ref`` interpolated in EEP at ``end``: the upstream
+    padding, aligned on EEP instead of row. A categorical column takes the
+    reference's value there.
+    """
+    out = np.empty((eeps.size, y.shape[1]))
+    i = np.clip(np.searchsorted(eep, eeps), 1, eep.size - 1)
+    near = np.where(eeps - eep[i - 1] <= eep[i] - eeps, i - 1, i)
+    for j in range(y.shape[1]):
+        out[:, j] = y[near, j] if categorical[j] else np.interp(eeps, eep, y[:, j])
+    for beyond, end in ((eeps < eep[0], 0), (eeps > eep[-1], -1)):
+        if not beyond.any():
+            continue
+        ref_at_end = np.array([np.interp(eep[end], eep_ref, y_ref[:, j])
+                               for j in range(y.shape[1])])
+        ref_at = np.array([np.interp(eeps[beyond], eep_ref, y_ref[:, j])
+                           for j in range(y.shape[1])]).T
+        out[beyond] = np.where(categorical, ref_at, y[end] + ref_at - ref_at_end)
+    return out
 
-        y = y0 * (1 - weight) + y1 * weight
-        # np.core.records was removed in NumPy 2
-        iso = np.rec.fromarrays(y.transpose(), dtype=mist_0.dtype)
 
-        return iso
+def blend_isochrones_on_eep(iso_0, iso_1, weight):
+    """
+    Blend two MIST isochrones of one age, ``(1 - weight) iso_0 + weight
+    iso_1``, point by point in **EEP**.
+
+    MIST tabulates an isochrone by equivalent evolutionary point, and two
+    metallicities at one age neither start at the same EEP nor tabulate the
+    same ones (v1.2 and v2.5 alike: 190 and 208 of 216 neighbouring-[Fe/H]
+    LSST pairs differ). Upstream ArtPop blended by row index, so a row was
+    averaged with a star a few EEPs -- sometimes a phase -- away, and v2.5's
+    [Fe/H] = +0.5 grid, which starts near 0.5 M_sun, was averaged 0.1 M_sun
+    against 0.5 M_sun.
+
+    The result is on the union of the two EEP sets, so neither isochrone's
+    coverage is lost: v2.5's [Fe/H] = -3.0 grid at log age >= 10.2 stops at
+    EEP 808, before the TP-AGB (as does -2.5 at 10.3, past this class's age
+    grid), and an intersection would
+    drop the TP-AGB, post-AGB and white dwarfs (~900 rows) from every blend
+    with it. Where one isochrone lacks an EEP it is filled by `_on_eeps`.
+    ``EEP`` is exact. ``phase`` is a label and is never averaged: it is the
+    nearer isochrone's by ``weight`` (a tie goes to ``iso_0``); the two
+    disagree at a matched EEP mostly where MIST assigns WR (9) by surface
+    composition.
+    """
+    names = iso_0.dtype.names
+    if iso_1.dtype.names != names:
+        raise ValueError('the two isochrones have different columns')
+    e0 = np.asarray(iso_0['EEP'], dtype=float)
+    e1 = np.asarray(iso_1['EEP'], dtype=float)
+    for e in (e0, e1):
+        if np.any(np.diff(e) <= 0):
+            raise ValueError('EEP must increase strictly along an isochrone')
+    if e0[-1] < e1[0] or e1[-1] < e0[0]:
+        raise ValueError('the two isochrones share no EEP range to blend over')
+    y0 = np.array(iso_0.tolist(), dtype=float)
+    y1 = np.array(iso_1.tolist(), dtype=float)
+    categorical = np.array([n in ('EEP', 'phase') for n in names])
+    eeps = np.union1d(e0, e1)
+    a0 = _on_eeps(y0, e0, e1, y1, eeps, categorical)
+    a1 = _on_eeps(y1, e1, e0, y0, eeps, categorical)
+    y = a0 * (1 - weight) + a1 * weight
+    pick = a1 if weight > 0.5 else a0
+    y[:, categorical] = pick[:, categorical]
+    y[:, names.index('EEP')] = eeps
+    if 'initial_mass' in names:
+        # initial mass never decreases along EEP at one age, so neither does a
+        # blend of two isochrones; this removes the rounding-level drops
+        # (~1e-17) that a filled EEP can leave next to a real one
+        im = names.index('initial_mass')
+        y[:, im] = np.maximum.accumulate(y[:, im])
+        # The low-mass end is a MASS limit, not an EEP: every MIST isochrone
+        # starts at its grid's lowest track (0.1 M_sun), at an EEP that depends
+        # on [Fe/H]. Extending one isochrone below its first EEP reaches masses
+        # neither grid has, and `imf_weights` normalises over [min, max] mass,
+        # so those points would dim the population per unit mass (a grey
+        # +12-38 mmag at 10 Gyr in a held-out test). Keep the lower of the two
+        # parents' minimum masses as the floor; that still keeps the [Fe/H] =
+        # +0.5 blends' low-mass end, which only +0.25 has.
+        floor = min(float(np.min(iso_0['initial_mass'])),
+                    float(np.min(iso_1['initial_mass'])))
+        # relative tolerance: 0.7 * 0.1 + 0.3 * 0.1 is 0.09999999999999999,
+        # and the points to drop sit ~1e-3 M_sun below the floor
+        y = y[y[:, im] >= floor * (1 - 1e-9)]
+    # np.core.records was removed in NumPy 2
+    return np.rec.fromarrays(y.transpose(), dtype=iso_0.dtype)

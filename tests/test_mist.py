@@ -240,3 +240,106 @@ class TestMISTBinaryCache(TestCase):
         cached = fetch_mist_iso_cmd(9.0, -1.5, 'LSST')
         self.assertEqual(text.dtype, cached.dtype)
         self.assertTrue(np.array_equal(text, cached))
+
+
+class TestFehInterpolationOnEEP(TestCase):
+    """
+    Off-grid [Fe/H] blends two MIST isochrones point by point in EEP, not by
+    row index (`blend_isochrones_on_eep`). Two metallicities at one age start
+    at different EEPs and skip different ones, in v1.2 and v2.5 alike.
+    """
+
+    DTYPE = [('EEP', float), ('initial_mass', float), ('log_Teff', float),
+             ('phase', float)]
+
+    @classmethod
+    def _iso(cls, eep, slope, offset, phase):
+        eep = np.asarray(eep, dtype=float)
+        return np.rec.fromarrays(
+            [eep, 0.1 + 0.01 * eep, offset + slope * eep, phase(eep)],
+            dtype=cls.DTYPE)
+
+    def test_E1_matches_on_eep_not_row(self):
+        """Columns linear in EEP with one slope: the blend is exact at every
+        EEP of the union, shared, filled inside a gap or beyond an end; the
+        row-index blend is not."""
+        from artpop.stars.isochrones import blend_isochrones_on_eep
+        ph = lambda e: np.where(e < 30, 0.0, 2.0)
+        e0 = np.r_[10:30, 33:50]                      # starts later, has a gap
+        e1 = np.r_[5:60]
+        a = self._iso(e0, 0.002, 3.6, ph)
+        b = self._iso(e1, 0.002, 3.5, ph)
+        w = 0.3
+        r = blend_isochrones_on_eep(a, b, w)
+        self.assertTrue(np.array_equal(r['EEP'], np.union1d(e0, e1)))
+        want = (1 - w) * (3.6 + 0.002 * r['EEP']) + w * (3.5 + 0.002 * r['EEP'])
+        np.testing.assert_allclose(r['log_Teff'], want, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(r['initial_mass'], 0.1 + 0.01 * r['EEP'],
+                                   rtol=0, atol=1e-12)
+        # what the row-index blend gives at the first shared EEP (10): it
+        # pairs EEP 10 of iso_0 with EEP 5 of iso_1
+        row = (1 - w) * a['log_Teff'][0] + w * b['log_Teff'][0]
+        i = int(np.flatnonzero(r['EEP'] == 10)[0])
+        self.assertGreater(abs(row - r['log_Teff'][i]), 1e-3)
+
+    def test_E2_labels_are_not_averaged(self):
+        """EEP is exact and phase is the nearer isochrone's label."""
+        from artpop.stars.isochrones import blend_isochrones_on_eep
+        a = self._iso(np.r_[0:20], 0.0, 3.6, lambda e: np.full(e.size, 3.0))
+        b = self._iso(np.r_[0:20], 0.0, 3.6, lambda e: np.full(e.size, 9.0))
+        for w, want in ((0.3, 3.0), (0.5, 3.0), (0.7, 9.0)):
+            r = blend_isochrones_on_eep(a, b, w)
+            self.assertTrue(np.all(r['phase'] == want))
+            self.assertTrue(np.array_equal(r['EEP'], a['EEP']))
+        # 3.0 blended with itself is not always exactly 3.0 in floating point
+        r = blend_isochrones_on_eep(a, a, 0.29)
+        self.assertTrue(np.all(r['phase'] == 3.0))
+
+    def test_E3_aligned_isochrones_unchanged(self):
+        """Identical EEP sets: bit-identical to the old row blend."""
+        from artpop.stars.isochrones import blend_isochrones_on_eep
+        rng = np.random.RandomState(7)
+        eep = np.r_[200:260]
+        a = self._iso(eep, 0.0, 3.6, lambda e: np.zeros(e.size))
+        b = self._iso(eep, 0.0, 3.6, lambda e: np.zeros(e.size))
+        a['log_Teff'] = 3.6 + rng.normal(0, 0.1, eep.size)
+        b['log_Teff'] = 3.7 + rng.normal(0, 0.1, eep.size)
+        b['initial_mass'] = a['initial_mass'] * 1.01
+        w = 0.37
+        r = blend_isochrones_on_eep(a, b, w)
+        for n in ('initial_mass', 'log_Teff'):
+            self.assertTrue(np.array_equal(r[n], a[n] * (1 - w) + b[n] * w))
+
+    def test_E4_real_grids(self):
+        """On MIST v2.5: shared EEPs lie between the two parents, initial mass
+        never decreases, and the truncated grids keep their coverage."""
+        from artpop.stars.isochrones import (blend_isochrones_on_eep,
+                                             fetch_mist_iso_cmd)
+        kw = dict(version='2.5', a_over_fe=0.0)
+        a = fetch_mist_iso_cmd(10.0, -1.25, 'LSST', **kw)
+        b = fetch_mist_iso_cmd(10.0, -1.0, 'LSST', **kw)
+        self.assertFalse(np.array_equal(a['EEP'][:5], b['EEP'][:5]))
+        r = blend_isochrones_on_eep(a, b, 0.4)
+        _, ia, ib = np.intersect1d(a['EEP'], b['EEP'], return_indices=True)
+        ir = np.searchsorted(r['EEP'], a['EEP'][ia])
+        for n in ('initial_mass', 'log_Teff', 'log_L', 'log_g'):
+            lo = np.minimum(a[n][ia], b[n][ib])
+            hi = np.maximum(a[n][ia], b[n][ib])
+            self.assertTrue(np.all((r[n][ir] >= lo - 1e-12) & (r[n][ir] <= hi + 1e-12)), n)
+        self.assertTrue(np.all(np.diff(r['initial_mass']) >= 0))
+        self.assertTrue(set(np.unique(r['phase'])) <= set(np.unique(a['phase'])) | set(np.unique(b['phase'])))
+
+        # [Fe/H] = +0.5 starts near 0.5 M_sun; the row blend paired 0.1 M_sun
+        # with it. The EEP blend keeps +0.25's low-mass end.
+        iso = MISTIsochrone(10.0, 0.4, 'LSST', photometry='mist', **kw)
+        self.assertGreater(fetch_mist_iso_cmd(10.0, 0.5, 'LSST', **kw)['initial_mass'][0], 0.45)
+        self.assertLess(iso.mini.min(), 0.12)
+        self.assertTrue(np.all(np.diff(iso.mini) >= 0))
+
+        # [Fe/H] = -3.0 at log age 10.2 stops at EEP 808: the blend still has
+        # the TP-AGB, post-AGB and white dwarfs of -2.5
+        lo30 = fetch_mist_iso_cmd(10.2, -3.0, 'LSST', **kw)
+        self.assertLessEqual(lo30['EEP'][-1], 808)
+        iso = MISTIsochrone(10.2, -2.8, 'LSST', photometry='mist', **kw)
+        self.assertGreater(iso.eep.max(), 1710)
+        self.assertTrue(np.all(iso.eep == np.round(iso.eep)))
