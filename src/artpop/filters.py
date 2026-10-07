@@ -26,6 +26,28 @@ __all__ = ['phot_system_list',
 _trapezoid = getattr(np, 'trapezoid', None) or np.trapz
 
 
+# Curve files already parsed in this process, keyed on (path, mtime, size) so a
+# replaced file is read afresh. Every synthetic-photometry isochrone loads its
+# system's curves two or three times (2026-10-07: ~0.5 s per rendered object).
+_CURVE_MEMO = {}
+
+
+def _load_curve(fn, **kwargs):
+    st = os.stat(fn)
+    try:
+        key = (os.path.abspath(fn), st.st_mtime_ns, st.st_size,
+               tuple(sorted(kwargs.items())))
+        hash(key)
+    except TypeError:                                   # unhashable loadtxt option
+        return np.loadtxt(fn, **kwargs)
+    data = _CURVE_MEMO.get(key)
+    if data is None:
+        data = np.loadtxt(fn, **kwargs)
+        data.setflags(write=False)
+        _CURVE_MEMO[key] = data
+    return data
+
+
 # list of photometric systems with pre-calculated filter properties
 #
 # 'WFIRST' is MIST v1.2's grid, built on a May 2018 preliminary filter set --
@@ -61,7 +83,7 @@ class FilterSystem(object):
 
         self.filter_names = filter_names
         for fn, name in zip(filter_curve_files, filter_names):
-            data = np.loadtxt(fn, **kwargs)
+            data = _load_curve(fn, **kwargs)
             table = Table(data=data, names=['wave', 'trans'])
             setattr(self, name, table)
 

@@ -487,6 +487,21 @@ def photometry_curve_dir(phot_system, curve_dir=None):
     return filter_curve_dir()
 
 
+_SHA1_MEMO = {}
+
+
+def _sha1_file(path):
+    """sha1 of a file's contents, re-hashed only when its (mtime, size) changes:
+    `cache_key` hashes the curves on every isochrone."""
+    import hashlib
+    st = os.stat(path)
+    key = (os.path.abspath(path), st.st_mtime_ns, st.st_size)
+    if key not in _SHA1_MEMO:
+        with open(path, 'rb') as fh:
+            _SHA1_MEMO[key] = hashlib.sha1(fh.read()).hexdigest()
+    return _SHA1_MEMO[key]
+
+
 def curves_provenance(phot_system, bands, curve_dir=None):
     """
     What the filter curves of a table are: directory, sha1 of every curve file,
@@ -494,13 +509,8 @@ def curves_provenance(phot_system, bands, curve_dir=None):
     in every table's ``meta`` so a magnitude can always be traced to the exact
     passbands it was integrated through.
     """
-    import hashlib
     root = os.path.join(photometry_curve_dir(phot_system, curve_dir), phot_system)
-    files = {}
-    for b in bands:
-        path = os.path.join(root, f'{b}.csv')
-        with open(path, 'rb') as fh:
-            files[b] = hashlib.sha1(fh.read()).hexdigest()
+    files = {b: _sha1_file(os.path.join(root, f'{b}.csv')) for b in bands}
     note = None
     prov = os.path.join(root, 'PROVENANCE.md')
     if os.path.isfile(prov):
@@ -968,6 +978,32 @@ def _tensor_interp(table, stencils):
     return out
 
 
+def _contract_axes(table, stencils):
+    """
+    The table at ONE point along its last ``len(stencils)`` axes before the
+    band axis, on every node of the axes in front: ``sum_t w_t *
+    table[..., t, :]``, with ``stencils`` one ``(idx (4,), w (4,))`` per axis.
+
+    Interpolation is a weighted sum, so where every star shares that point
+    (one redshift and one dust pair per population) summing these axes out
+    first and interpolating the stars in the result is the same sum regrouped
+    -- exact up to rounding (2026-10-07: <= 1.4e-10 mag from the bound, ~1e-14
+    measured). Only nonzero weights are read, as in `_tensor_interp`, so a NaN
+    at a node the point does not use cannot reach the result.
+    """
+    from itertools import product
+    k = np.ndim(table) - 1 - len(stencils)
+    out = None
+    for combo in product(*[np.flatnonzero(w != 0.0) for _, w in stencils]):
+        wt = 1.0
+        for (_, w), c in zip(stencils, combo):
+            wt = wt * w[c]
+        key = (slice(None),) * k + tuple(int(i[c]) for (i, _), c in zip(stencils, combo))
+        term = wt * np.asarray(table[key], dtype=float)
+        out = term if out is None else out + term
+    return out
+
+
 def _fill_feh_holes(feh, table, rest):
     """
     Fill, in place, a MARCS model missing at one [Fe/H] from the two blocks on
@@ -1053,6 +1089,12 @@ class KCorrectionGrid:
     _MEMO_MAX = 6
     # dust pairs already warned about by `for_dust`, so a fallback warns once
     _WARNED = set()
+    # Sum the redshift and dust axes out once per (backend, z, dust, method)
+    # and interpolate the stars over the stellar axes alone (`_contract_axes`):
+    # 64 terms per star instead of 2,048 on the dust-axis table. False runs the
+    # full tensor sum per star, the reference the tests compare against.
+    contract_scalar_axes = True
+    _CONTRACTED_MAX = 16
 
     def __init__(self, bands, z_grid, feh_grid, c3k_logg, c3k_logt, c3k,
                  wd_logg, wd_logt, wd, bb_logt, bb, meta=None,
@@ -1447,18 +1489,14 @@ class KCorrectionGrid:
         """
         table, axes = self._backend(which, rest)
         n = stellar_x[0].size
-        tail = [] if rest else [_axis_stencil(self.z_grid, np.full(n, z), False)]
-        if self.has_dust_axes and not rest:
-            # cubic (one-sided at the ends): DP2's u curve has a ~5e-5 red leak
-            # to 940 nm that carries up to ~6 % of a cool giant's u flux and
-            # sees far less dust, so Delta m(A_V) in u curves enough that linear
-            # at 0.25 mag spacing is 2.2 mmag off (0.06 with the syseng curves)
-            dc = method == 'cubic'
-            tail += [_axis_stencil(self.av_host_grid, np.full(n, dust[0]), dc, True),
-                     _axis_stencil(self.av_mw_grid, np.full(n, dust[1]), dc, True)]
+        tail = [] if rest else self._scalar_stencils(z, dust, method)
+        if tail and self.contract_scalar_axes:
+            table, tail = self._contracted(which, z, dust, method, table, tail), []
+        # the reference path: the same (z, dust) weights repeated on every row
+        tail = [(np.broadcast_to(i, (n, 4)), np.broadcast_to(w, (n, 4))) for i, w in tail]
         cubic = method == 'cubic'
         st = [_axis_stencil(ax, x, cubic) for ax, x in zip(axes, stellar_x)]
-        out = _tensor_interp(table, [(i, w) for i, w, _ in st] + [(i, w) for i, w, _ in tail])
+        out = _tensor_interp(table, [(i, w) for i, w, _ in st] + tail)
         linear = ~np.logical_and.reduce([u for _, _, u in st])
         if not cubic:
             return out, np.ones(n, dtype=bool)
@@ -1471,10 +1509,38 @@ class KCorrectionGrid:
             bad |= touch > 0.0
         if bad.any():
             lin = [_axis_stencil(ax, x[bad], False) for ax, x in zip(axes, stellar_x)]
-            tl = [(i[bad], w[bad]) for i, w, _ in tail]
+            tl = [(i[bad], w[bad]) for i, w in tail]
             out[bad] = _tensor_interp(table, [(i, w) for i, w, _ in lin] + tl)
             linear |= bad
         return out, linear
+
+    def _scalar_stencils(self, z, dust, method):
+        """The z [, A_V_host, A_V_mw] stencils, ``(idx (4,), w (4,))`` each: one
+        point, shared by every star of a call."""
+        out = [_axis_stencil(self.z_grid, [z], False)]
+        if self.has_dust_axes:
+            # cubic (one-sided at the ends): DP2's u curve has a ~5e-5 red leak
+            # to 940 nm that carries up to ~6 % of a cool giant's u flux and
+            # sees far less dust, so Delta m(A_V) in u curves enough that linear
+            # at 0.25 mag spacing is 2.2 mmag off (0.06 with the syseng curves)
+            dc = method == 'cubic'
+            out += [_axis_stencil(self.av_host_grid, [dust[0]], dc, True),
+                    _axis_stencil(self.av_mw_grid, [dust[1]], dc, True)]
+        return [(i[0], w[0]) for i, w, _ in out]
+
+    def _contracted(self, which, z, dust, method, table, tail):
+        """`_contract_axes` of one backend at one (z, dust), kept for the next
+        isochrone of the same population (the last `_CONTRACTED_MAX`)."""
+        key = (which, float(z), tuple(float(d) for d in dust), method)
+        memo = self.__dict__.setdefault('_contracted_memo', OrderedDict())
+        hit = memo.get(key)
+        if hit is None:
+            hit = memo[key] = _contract_axes(table, tail)
+            while len(memo) > self._CONTRACTED_MAX:
+                memo.popitem(last=False)
+        else:
+            memo.move_to_end(key)
+        return hit
 
     def interpolate(self, log_teff, log_g, feh, redshift, a_v_host=None,
                     a_v_mw=None, quantity='absolute', method='cubic'):

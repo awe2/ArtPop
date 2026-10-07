@@ -1397,3 +1397,159 @@ class TestMARCSCoolGiants(TestCase):
         self.assertIsNone(self.c3k_only.meta['library']['cool_giants'])
         self.assertNotEqual(KCorrectionGrid.cache_key('LSST'),
                             KCorrectionGrid.cache_key('LSST', cool_giants=None))
+
+
+def _production_dust_table():
+    """The staged dust-axis LSST table (`python -m artpop.stage`), or None."""
+    from artpop.kcorrect import kcorr_cache_dir, DEFAULT_AV_HOST_GRID, DEFAULT_AV_MW_GRID
+    try:
+        key = KCorrectionGrid.cache_key('LSST', a_v_host_grid=DEFAULT_AV_HOST_GRID,
+                                        a_v_mw_grid=DEFAULT_AV_MW_GRID)
+    except Exception:                                   # noqa: BLE001 - not staged
+        return None
+    path = os.path.join(kcorr_cache_dir(), key)
+    return path if os.path.isfile(path) else None
+
+
+def _assert_same_lookup(tc, grid, lt, lg, fe, z, h, m, quantity, method, tol=1e-9):
+    """The contracted lookup against the full per-star tensor sum: values within
+    ``tol`` mag, the same NaNs, and the same per-row bookkeeping."""
+    kw = dict(a_v_host=h, a_v_mw=m, quantity=quantity, method=method)
+    grid.contract_scalar_axes = False
+    try:
+        ref, iref = grid.interpolate(lt, lg, fe, z, **kw)
+    finally:
+        del grid.contract_scalar_axes                   # back to the class default
+    new, inew = grid.interpolate(lt, lg, fe, z, **kw)
+    np.testing.assert_array_equal(np.isnan(new), np.isnan(ref))
+    ok = np.isfinite(ref)
+    d = float(np.max(np.abs(new[ok] - ref[ok]))) if ok.any() else 0.0
+    tc.assertLessEqual(d, tol, (z, h, m, quantity, method))
+    for k in ('source', 'interp_linear', 'marcs_hole', 'c3k_bbfill', 'fallback'):
+        np.testing.assert_array_equal(inew[k], iref[k], err_msg=k)
+    return d
+
+
+class TestContractedScalarAxes(TestCase):
+    """
+    Tier K (2026-10-07): redshift and the two A_V are one value per lookup, so
+    their stencil weights are shared by every star and are summed out once
+    (`_contract_axes`) before the stars are interpolated over the stellar axes.
+    That regroups the same weighted sum, so it may differ from the full
+    per-star tensor sum only by rounding: bound 1.4e-10 mag for the dust-axis
+    table (2,048 terms, |M| <= 26, cubic Lebesgue constant <= 1.63 per axis).
+    Tolerance 1e-9 mag: above rounding, 1e4 below the 0.01 mmag budget.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from artpop.kcorrect import DEFAULT_AV_HOST_GRID, DEFAULT_AV_MW_GRID
+        rng = np.random.default_rng(20261007)
+        cls.AH, cls.AM = DEFAULT_AV_HOST_GRID, DEFAULT_AV_MW_GRID
+        feh = np.arange(-2.5, 0.51, 0.25)
+        lg = np.arange(-1.0, 5.51, 0.5)
+        lt = np.log10(np.geomspace(2500.0, 50000.0, 40))
+        z = np.array([0.0, 0.05, 0.1, 0.15, 0.2, 0.25])
+        bands = ['LSST_u', 'LSST_g', 'LSST_r']
+
+        def smooth(*shape_axes):
+            grids = np.meshgrid(*shape_axes, indexing='ij')
+            v = 10.0 + sum(np.sin(1.3 * (k + 1) * g) for k, g in enumerate(grids))
+            v = v[..., None] + np.arange(len(bands)) * 0.7
+            return (v + 0.01 * rng.standard_normal(v.shape)).astype(np.float32)
+
+        c3k = smooth(feh, lg, lt, z, cls.AH, cls.AM)
+        # NaN nodes, so the cubic stencils that reach them fall back to linear
+        c3k[3, 4, 10:12] = np.nan
+        c3k[7, 9, 25] = np.nan
+        wd_lg, wd_lt = np.arange(6.5, 9.51, 0.5), np.log10(np.geomspace(4000, 1e5, 20))
+        bb_lt = np.log10(np.geomspace(2000, 2e5, 30))
+        cls.synth = KCorrectionGrid(
+            bands, z, feh, lg, lt, c3k, wd_lg, wd_lt, smooth(wd_lg, wd_lt, z, cls.AH, cls.AM),
+            bb_lt, smooth(bb_lt, z, cls.AH, cls.AM), av_host_grid=cls.AH, av_mw_grid=cls.AM,
+            c3k_rest=smooth(feh, lg, lt), wd_rest=smooth(wd_lg, wd_lt), bb_rest=smooth(bb_lt))
+        n = 3000
+        cls.s_lt = rng.uniform(np.log10(2400.0), np.log10(1.5e5), n)
+        cls.s_lg = rng.uniform(-1.2, 9.6, n)
+        cls.s_fe = rng.uniform(-2.7, 0.6, n)
+
+    # dust at nodes, between nodes, and at both ends of both axes (one-sided stencils)
+    DUST = ((0.0, 0.0), (0.25, 0.5), (0.125, 0.375), (0.9, 1.9), (1.0, 2.0), (0.0, 2.0),
+            (1.0, 0.0), (0.6, 1.13))
+    ZS = (0.0, 0.05, 0.0731, 0.2499, 0.25)
+
+    def test_k1_synthetic_table_matches_the_full_sum(self):
+        """K1: a synthetic dust-axis table with NaN nodes, every backend, cubic and
+        linear, absolute / offset / rest: values within 1e-9 mag of the full sum,
+        identical NaNs, sources and fallback flags."""
+        worst = 0.0
+        for method in ('cubic', 'linear'):
+            for quantity in ('absolute', 'offset', 'rest'):
+                for z in self.ZS:
+                    for h, m in self.DUST:
+                        worst = max(worst, _assert_same_lookup(
+                            self, self.synth, self.s_lt, self.s_lg, self.s_fe, z, h, m,
+                            quantity, method))
+        self.assertLess(worst, 1e-9)
+
+    def test_k2_nodes_stay_bit_exact(self):
+        """K2: at a node of every axis the contracted lookup still returns the
+        stored value bit for bit (every weight is 0 or 1)."""
+        g = self.synth
+        i_f, i_g, i_t, i_z, i_h, i_m = 4, 8, 20, 2, 1, 3
+        v, _ = g.interpolate(g.c3k_logt[i_t], g.c3k_logg[i_g], g.feh_grid[i_f],
+                             g.z_grid[i_z], a_v_host=self.AH[i_h], a_v_mw=self.AM[i_m])
+        np.testing.assert_array_equal(
+            v[0], g.c3k[i_f, i_g, i_t, i_z, i_h, i_m].astype(float))
+
+    def test_k3_memo_never_serves_another_point(self):
+        """K3: alternating (z, dust) points on one grid each get their own
+        contraction, not the previous one's."""
+        pts = [(0.05, 0.25, 0.5), (0.1, 0.0, 1.0), (0.05, 0.25, 0.5), (0.05, 0.25, 0.75)]
+        for z, h, m in pts * 2:
+            _assert_same_lookup(self, self.synth, self.s_lt[:200], self.s_lg[:200],
+                                self.s_fe[:200], z, h, m, 'absolute', 'cubic')
+        self.assertLessEqual(len(self.synth._contracted_memo), KCorrectionGrid._CONTRACTED_MAX)
+
+    @skipUnless(_production_dust_table(), 'the dust-axis LSST table is not staged')
+    def test_k4_production_table_matches_the_full_sum(self):
+        """K4: the staged dust-axis table (C3K, Tremblay, blackbody, MARCS with its
+        holes) over stars spanning every backend: within 1e-9 mag, same NaNs,
+        sources, MARCS holes and fallback flags."""
+        g = KCorrectionGrid.load(_production_dust_table())
+        rng = np.random.default_rng(7)
+        n = 1500
+        lt = np.concatenate([rng.uniform(np.log10(2600), np.log10(1.4e5), n),
+                             rng.uniform(np.log10(3000), np.log10(4400), n)])  # MARCS zone
+        lg = np.concatenate([rng.uniform(-1.0, 9.5, n), rng.uniform(-0.7, 3.6, n)])
+        fe = np.concatenate([rng.uniform(-2.7, 0.55, n), rng.uniform(-2.6, 0.55, n)])
+        _, info = g.interpolate(lt, lg, fe, 0.05, a_v_host=0.3, a_v_mw=0.7)
+        for src in (SOURCE_C3K, SOURCE_WD, SOURCE_BB, 3):
+            self.assertTrue((info['source'] == src).any(), src)
+        self.assertGreater(info['n_marcs_hole'], 0)
+        for method in ('cubic', 'linear'):
+            for quantity in ('absolute', 'offset'):
+                for z in (0.0, 0.0123, 0.05, 0.25):
+                    for h, m in ((0.0, 0.0), (0.3, 0.7), (1.0, 2.0), (0.875, 1.875)):
+                        _assert_same_lookup(self, g, lt, lg, fe, z, h, m, quantity, method)
+
+
+class TestCurveFileMemo(TestCase):
+    """The parsed-curve and curve-hash memos re-read a file that was replaced."""
+
+    def test_f1_replaced_curve_is_read_afresh(self):
+        from artpop.filters import FilterSystem
+        from artpop.kcorrect import _sha1_file
+        d = tempfile.mkdtemp(prefix='curve_memo_')
+        fn = os.path.join(d, 'X.csv')
+        with open(fn, 'w') as fh:
+            fh.write('wave,trans\n4000.0,0.1\n5000.0,0.5\n')
+        a = FilterSystem([fn], ['X'], delimiter=',', skiprows=1).get_trans('X')[1]
+        h1 = _sha1_file(fn)
+        os.replace(fn, fn + '.old')
+        with open(fn, 'w') as fh:
+            fh.write('wave,trans\n4000.0,0.2\n5000.0,0.6\n6000.0,0.1\n')
+        b = FilterSystem([fn], ['X'], delimiter=',', skiprows=1).get_trans('X')[1]
+        np.testing.assert_array_equal(a, [0.1, 0.5])
+        np.testing.assert_array_equal(b, [0.2, 0.6, 0.1])
+        self.assertNotEqual(h1, _sha1_file(fn))
