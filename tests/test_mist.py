@@ -343,3 +343,71 @@ class TestFehInterpolationOnEEP(TestCase):
         iso = MISTIsochrone(10.2, -2.8, 'LSST', photometry='mist', **kw)
         self.assertGreater(iso.eep.max(), 1710)
         self.assertTrue(np.all(iso.eep == np.round(iso.eep)))
+
+
+class TestMetalRichLowMassCopy(TestCase):
+    """
+    MIST v2.5's most metal-rich grids ship without 0.1-0.5 M_sun (the opacity
+    tables do not cover them). As alpha-MC (Park et al. 2024, arXiv:2410.21375
+    s2) does, those rows are copied from the nearest metallicity.
+    """
+
+    KW = dict(version='2.5', a_over_fe=0.0)
+
+    def test_F1_table_is_alpha_mc(self):
+        """The donor table is alpha-MC's list; v1.2 and complete grids have none."""
+        from artpop.stars.isochrones import MIST_LOW_MASS_DONOR, low_mass_donor
+        self.assertEqual({(0.50, 0.0): 0.25, (0.50, 0.2): 0.25, (0.25, 0.4): 0.00,
+                          (0.50, 0.4): 0.00, (0.00, 0.6): -0.25, (0.25, 0.6): -0.25},
+                         MIST_LOW_MASS_DONOR)
+        self.assertEqual(0.25, low_mass_donor('2.5', 0.5, 0.0))
+        self.assertIsNone(low_mass_donor('1.2', 0.5, 0.0))
+        self.assertIsNone(low_mass_donor('2.5', 0.25, 0.0))
+
+    def test_F2_on_grid_copy(self):
+        """+0.5 gets +0.25's rows below its first star, verbatim except [Fe/H]."""
+        from artpop.stars.isochrones import fetch_mist_iso_cmd
+        raw = fetch_mist_iso_cmd(10.0, 0.5, 'LSST', **self.KW)
+        donor = fetch_mist_iso_cmd(10.0, 0.25, 'LSST', **self.KW)
+        self.assertGreater(raw['initial_mass'][0], 0.45)
+        iso = MISTIsochrone(10.0, 0.5, 'LSST', photometry='mist', **self.KW)
+        full = iso.isochrone_full
+        rec = iso.low_mass_copied
+        self.assertEqual(1, len(rec))
+        n = rec[0]['n_rows']
+        self.assertGreater(n, 30)
+        self.assertEqual(0.25, rec[0]['donor_feh'])
+        self.assertIn('arXiv:2410.21375', rec[0]['reference'])
+        self.assertEqual(rec, iso.photometry_info['isochrones']['low_mass_copied'])
+        self.assertAlmostEqual(0.1, iso.mini.min(), places=3)
+        self.assertTrue(np.all(np.diff(full['EEP']) > 0))
+        self.assertTrue(np.all(np.diff(full['initial_mass']) >= 0))
+        # the native rows are untouched
+        for c in raw.dtype.names:
+            self.assertTrue(np.array_equal(full[c][n:], raw[c]), c)
+        # the copied rows are the donor's, [Fe/H] moved by +0.25
+        for c in raw.dtype.names:
+            want = donor[c][:n] + (0.25 if c.startswith('[Fe/H]') else 0.0)
+            np.testing.assert_allclose(full[c][:n], want, rtol=0, atol=1e-12, err_msg=c)
+
+    def test_F3_complete_grids_untouched(self):
+        """A grid MIST ships complete is served exactly as read."""
+        from artpop.stars.isochrones import fetch_mist_iso_cmd
+        for feh, kw in ((0.25, self.KW), (0.5, dict(version='1.2'))):
+            iso = MISTIsochrone(10.0, feh, 'LSST', photometry='mist', **kw)
+            raw = fetch_mist_iso_cmd(10.0, feh, 'LSST', **kw)
+            self.assertEqual([], iso.low_mass_copied)
+            for c in ('EEP', 'initial_mass', 'log_Teff', 'log_L'):
+                self.assertTrue(np.array_equal(iso.isochrone_full[c], raw[c]), c)
+
+    def test_F4_blend_takes_the_copy(self):
+        """Between +0.25 and +0.5 the low-mass end is +0.25's, as copied."""
+        from artpop.stars.isochrones import fetch_mist_iso_cmd
+        iso = MISTIsochrone(10.0, 0.4, 'LSST', photometry='mist', **self.KW)
+        donor = fetch_mist_iso_cmd(10.0, 0.25, 'LSST', **self.KW)
+        n = iso.low_mass_copied[0]['n_rows']
+        full = iso.isochrone_full
+        for c in ('initial_mass', 'log_Teff', 'log_L', 'log_g'):
+            np.testing.assert_allclose(full[c][:n], donor[c][:n], rtol=0, atol=1e-12, err_msg=c)
+        np.testing.assert_allclose(full['[Fe/H]_init'][:n], donor['[Fe/H]_init'][:n] + 0.6 * 0.25,
+                                   rtol=0, atol=1e-12)

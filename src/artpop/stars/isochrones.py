@@ -782,6 +782,11 @@ class MISTIsochrone(Isochrone):
     nebular_info : dict or None
         Per row ``q_h`` (captured ionizing photons / s) and spectral source,
         the gas state and the lines used.
+    low_mass_copied : list of dict
+        One entry per MIST v2.5 grid file whose missing 0.1-0.5 M_sun rows were
+        copied from the nearest metallicity (`MIST_LOW_MASS_DONOR`, after
+        alpha-MC): donor [Fe/H], rows and mass range copied. Empty when no
+        file needed it. Also in ``photometry_info['isochrones']``.
     """
 
     # the age grid
@@ -857,6 +862,7 @@ class MISTIsochrone(Isochrone):
             phot_system = [phot_system]
 
         # fetch first isochrone grid, interpolating on [Fe/H] if necessary
+        self.low_mass_copied = []
         self._iso_full = self._fetch_iso(phot_system[0])
 
         # iterate over photometric systems and fetch remaining isochrones
@@ -969,6 +975,7 @@ class MISTIsochrone(Isochrone):
         return dict(library=f'MIST v{self.version}', v_over_vcrit=self.v_over_vcrit,
                     a_over_fe=self.a_over_fe, log_age=float(self.log_age),
                     feh=float(self.feh), mist_path=self.mist_path,
+                    low_mass_copied=list(self.low_mass_copied),
                     used='evolution only (log Teff, log g, log L, [Fe/H], phase, masses)'
                     if self.photometry == 'synthetic' else 'evolution and magnitudes')
 
@@ -1165,10 +1172,31 @@ class MISTIsochrone(Isochrone):
     def _fetch_iso(self, phot_system):
         """Fetch MIST isochrone grid, interpolating on [Fe/H] if necessary."""
         if self.feh in self._feh_grid:
-            iso = fetch_mist_iso_cmd(self.log_age, self.feh, phot_system,
-                                     **self._iso_kw())
+            iso = self._fetch_grid_point(self.feh, phot_system)
         else:
             iso = self._interp_on_feh(phot_system)
+        return iso
+
+    def _fetch_grid_point(self, feh, phot_system):
+        """
+        One MIST grid file's isochrone at this age, with the 0.1-0.5 M_sun
+        rows that MIST v2.5's metal-rich grids lack copied in from the nearest
+        metallicity (`MIST_LOW_MASS_DONOR`, as alpha-MC does). Every copy is
+        recorded in `low_mass_copied`.
+        """
+        iso = fetch_mist_iso_cmd(self.log_age, feh, phot_system, **self._iso_kw())
+        donor_feh = low_mass_donor(self.version, feh, self.a_over_fe)
+        if donor_feh is None or iso['initial_mass'][0] <= MIST_MIN_MASS + 1e-6:
+            return iso
+        donor = fetch_mist_iso_cmd(self.log_age, donor_feh, phot_system,
+                                   **self._iso_kw())
+        iso, n = copy_low_mass_rows(iso, donor, feh - donor_feh)
+        self.low_mass_copied.append(dict(
+            phot_system=phot_system, feh=float(feh), a_over_fe=self.a_over_fe,
+            donor_feh=float(donor_feh), n_rows=int(n),
+            mass_range=[float(iso['initial_mass'][0]),
+                        float(iso['initial_mass'][n - 1])] if n else None,
+            reference=LOW_MASS_COPY_REFERENCE))
         return iso
 
     def _interp_on_feh(self, phot_system):
@@ -1184,10 +1212,8 @@ class MISTIsochrone(Isochrone):
         # NB these used to drop v_over_vcrit, so an object built with
         # v_over_vcrit=0.0 silently interpolated between two vvcrit=0.4 grids
         # whenever its [Fe/H] was off-grid.
-        mist_0 = fetch_mist_iso_cmd(self.log_age, feh_lo, phot_system,
-                                    **self._iso_kw())
-        mist_1 = fetch_mist_iso_cmd(self.log_age, feh_hi, phot_system,
-                                    **self._iso_kw())
+        mist_0 = self._fetch_grid_point(feh_lo, phot_system)
+        mist_1 = self._fetch_grid_point(feh_hi, phot_system)
 
         weight = (self.feh - feh_lo) / (feh_hi - feh_lo)
         return blend_isochrones_on_eep(mist_0, mist_1, weight)
@@ -1232,7 +1258,8 @@ def blend_isochrones_on_eep(iso_0, iso_1, weight):
     LSST pairs differ). Upstream ArtPop blended by row index, so a row was
     averaged with a star a few EEPs -- sometimes a phase -- away, and v2.5's
     [Fe/H] = +0.5 grid, which starts near 0.5 M_sun, was averaged 0.1 M_sun
-    against 0.5 M_sun.
+    against 0.5 M_sun. (`MISTIsochrone` now fills that grid's low-mass end
+    before blending: `copy_low_mass_rows`.)
 
     The result is on the union of the two EEP sets, so neither isochrone's
     coverage is lost: v2.5's [Fe/H] = -3.0 grid at log age >= 10.2 stops at
@@ -1286,3 +1313,62 @@ def blend_isochrones_on_eep(iso_0, iso_1, weight):
         y = y[y[:, im] >= floor * (1 - 1e-9)]
     # np.core.records was removed in NumPy 2
     return np.rec.fromarrays(y.transpose(), dtype=iso_0.dtype)
+
+
+# MIST v2.5's most metal-rich grids ship without their 0.1-0.5 M_sun tracks:
+# the low-temperature opacity tables do not cover those compositions. alpha-MC
+# (Park, Conroy, Johnson, Leja, Dotter & Cargile 2024, arXiv:2410.21375, s2;
+# built on MIST v2.3) copies the 0.1-0.5 M_sun isochrones from the nearest
+# metallicity, and so do we, by this table: ([Fe/H], [a/Fe]) -> donor [Fe/H]
+# at the same [a/Fe]. Their sixth case, (+0.50, +0.6) copied whole from
+# (+0.50, +0.4), has no file in v2.5. The v2.5 LSST files lack exactly these
+# grids' low-mass rows at every age; v1.2 lacks none.
+LOW_MASS_COPY_REFERENCE = ('alpha-MC, Park et al. 2024 (arXiv:2410.21375) s2: '
+                           'M = 0.1-0.5 M_sun copied from the nearest metallicity')
+MIST_LOW_MASS_DONOR = {
+    (0.50, 0.0): 0.25,
+    (0.50, 0.2): 0.25,
+    (0.25, 0.4): 0.00,
+    (0.50, 0.4): 0.00,
+    (0.00, 0.6): -0.25,
+    (0.25, 0.6): -0.25,
+}
+MIST_MIN_MASS = 0.1
+MIST_COPIED_MASS_MAX = 0.5
+
+
+def low_mass_donor(version, feh, a_over_fe):
+    """The donor [Fe/H] for a v2.5 grid that lacks 0.1-0.5 M_sun, else None."""
+    if str(version) != '2.5':
+        return None
+    for (f, a), donor in MIST_LOW_MASS_DONOR.items():
+        if abs(f - feh) < 1e-6 and abs(a - a_over_fe) < 1e-6:
+            return donor
+    return None
+
+
+def copy_low_mass_rows(iso, donor, dfeh):
+    """
+    ``iso`` with the donor isochrone's rows below its first star prepended.
+
+    Copied are the donor's rows below ``min(MIST_COPIED_MASS_MAX, first
+    mass)`` **and** below ``iso``'s first EEP, verbatim, EEP labels included,
+    so EEP still increases and a blend with the donor matches those rows to
+    themselves. A metal-poorer star of one mass is further along, so near
+    0.5 M_sun the donor's EEPs can pass ``iso``'s first one; those rows are
+    left out and the masses between (0.39-0.5 M_sun at worst, log age >= 8)
+    are spanned by interpolation. ``[Fe/H]_init`` and ``[Fe/H]`` are moved by
+    ``dfeh`` to ``iso``'s composition, so the spectra are the target's, as in
+    alpha-MC. Returns ``(isochrone, number of rows copied)``.
+    """
+    m0, e0 = float(iso['initial_mass'][0]), float(iso['EEP'][0])
+    take = ((np.asarray(donor['initial_mass']) < min(MIST_COPIED_MASS_MAX, m0))
+            & (np.asarray(donor['EEP']) < e0))
+    if not take.any():
+        return iso, 0
+    rows = np.array(donor[take], dtype=iso.dtype)
+    for col in ('[Fe/H]_init', '[Fe/H]'):
+        if col in rows.dtype.names:
+            rows[col] = rows[col] + dfeh
+    out = np.concatenate([rows, np.asarray(iso)])
+    return out, int(take.sum())
