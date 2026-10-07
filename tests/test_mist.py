@@ -15,8 +15,10 @@ class TestMIST(TestCase):
 
     def setUp(self):
         """Build single isochrone and ssp objects for all test cases."""
-        self.ab = MISTIsochrone(10, -1.5, 'LSST', ab_or_vega='ab')
-        self.vega = MISTIsochrone(10, -1.5, 'LSST', ab_or_vega='vega')
+        # MIST's own columns: these tests check MIST's AB / Vega zero points,
+        # which the synthetic default (AB by integration) does not use
+        self.ab = MISTIsochrone(10, -1.5, 'LSST', ab_or_vega='ab', photometry='mist')
+        self.vega = MISTIsochrone(10, -1.5, 'LSST', ab_or_vega='vega', photometry='mist')
         self.rng = np.random.RandomState(1234)
         self.ssp = MISTSSP(10.1, -1, 'LSST',  num_stars=1e4,
                            random_state=self.rng)
@@ -81,8 +83,8 @@ class TestZeroPointNames(TestCase):
 
     def test_wfirst_isochrone_is_converted_to_ab(self):
         """The WFIRST grid is Vega-native; ab_or_vega='ab' must shift it."""
-        ab = MISTIsochrone(10, -1.5, 'WFIRST', ab_or_vega='ab')
-        vega = MISTIsochrone(10, -1.5, 'WFIRST', ab_or_vega='vega')
+        ab = MISTIsochrone(10, -1.5, 'WFIRST', ab_or_vega='ab', photometry='mist')
+        vega = MISTIsochrone(10, -1.5, 'WFIRST', ab_or_vega='vega', photometry='mist')
         for filt, offset in self.WFIRST_TO_AB.items():
             diff = np.unique(np.round(
                 np.asarray(ab.mag_table[filt]) -
@@ -96,7 +98,7 @@ class TestZeroPointNames(TestCase):
         """Building a WFIRST isochrone must not warn about a missing offset."""
         with self.assertLogs('artpop', level='WARNING') as ctx:
             logging.getLogger('artpop').warning('sentinel')
-            MISTIsochrone(10, -1.5, 'WFIRST', ab_or_vega='ab')
+            MISTIsochrone(10, -1.5, 'WFIRST', ab_or_vega='ab', photometry='mist')
         missing = [m for m in ctx.output if 'No AB / Vega conversion' in m]
         self.assertEqual([], missing)
 

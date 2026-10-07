@@ -696,7 +696,8 @@ class UniformSSP(Source):
             self.ssp_kw['version'] = isochrone.version
             self.ssp_kw['a_over_fe'] = isochrone.a_over_fe
             for attr in ('redshift', 'a_v_host', 'a_v_mw', 'r_v',
-                         'extinction_law', 'nebular'):
+                         'extinction_law', 'nebular', 'photometry', 'bolometric',
+                         'cool_giants'):
                 self.ssp_kw[attr] = getattr(isochrone, attr)
             self.sp = MISTSSP(**self.ssp_kw)
             labels = _check_label_type(self.sp, label_type)

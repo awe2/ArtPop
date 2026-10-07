@@ -15,7 +15,7 @@ from .. import MIST_PATH
 from ..log import logger
 from ..filters import phot_system_list, get_filter_names
 from ..filters import load_zero_point_converter, phot_system_lookup
-from ..kcorrect import KCorrectionGrid
+from ..kcorrect import KCorrectionGrid, photometry_curve_dir
 from ..nebular import NebularConfig, apply_to_rows as apply_nebular_to_rows
 from ..nebular import is_active as is_nebular_active
 from ..util import (check_units, fetch_mist_grid_if_needed,
@@ -699,23 +699,45 @@ class MISTIsochrone(Isochrone):
         MIST release, ``'1.2'`` (default) or ``'2.5'``.
     a_over_fe : float, optional
         Alpha enhancement [a/Fe]; must be on the MIST grid.
+    photometry : str, optional
+        Where the magnitude columns come from.
+
+        * ``'synthetic'`` (default): integrated **per star** from a spectral
+          library through the filter curves, ``M_x = M_x^{1 L_sun}(log Teff,
+          log g, [Fe/H], z, A) - 2.5 log_L`` (`~artpop.kcorrect.KCorrectionGrid`).
+          MIST supplies the evolution only (log Teff, log g, log L, surface
+          [Fe/H], phase, masses); every magnitude, z = 0 included, is ours, AB,
+          under the assumptions in `photometry_info`.
+        * ``'mist'``: MIST's shipped columns, unchanged (upstream ArtPop). Only
+          at ``redshift = 0`` without dust: the differential form that used to
+          add a correction from our library to MIST's magnitudes is retired
+          (2026-10-06), because an offset from one library on magnitudes from
+          another is not one photometric system.
+    bolometric : str, optional
+        How a library spectrum is scaled to the star's luminosity, for
+        ``photometry='synthetic'``: ``'teff'`` (default; the model's surface
+        flux at Teff over 4 pi R^2 = L / sigma Teff^4 -- the textbook BC
+        definition, and MIST's) or ``'spectrum'`` (by its own bolometric
+        integral, so the spectrum carries exactly MIST's L; ~13-22 mmag
+        fainter for C3K, grey). See `~artpop.kcorrect.BOLOMETRIC_CONVENTIONS`.
+    cool_giants : str or None, optional
+        ``'marcs'`` (default): M giants from MARCS spherical models instead of
+        C3K, full below 3900 K and log g 3.0, handed over to C3K by 4250 K /
+        log g 3.5 (`~artpop.kcorrect.marcs_weight`). ``None``: C3K alone.
     redshift : float, optional
-        Redshift of the population. Adds a **per-star** K-correction to the
-        magnitude columns, computed from the spectral libraries MIST itself
-        integrated. Independent of distance: nothing here derives one from the
-        other. ``0.0`` (default) is a no-op, bit for bit.
+        Redshift of the population. The synthetic magnitudes are integrated at
+        this redshift, per star (``photometry='synthetic'`` only). Independent
+        of distance: nothing here derives one from the other.
     a_v_host : float, optional
         V-band extinction from dust **inside the host galaxy**, which reddens
-        the star's spectrum in its own rest frame -- the frame MIST's own
-        ``A_V`` axis works in. Default: 0.0.
+        the star's spectrum in its own rest frame. Default: 0.0.
     a_v_mw : float, optional
         V-band extinction from **Milky Way foreground** dust, which attenuates
         observer-frame wavelengths. At ``z = 0`` this is identical to
         ``a_v_host``; at ``z > 0`` it is not, and treating them as one is the
         approximation this parameter exists to remove. Default: 0.0.
     r_v : float, optional
-        ``A_V / E(B-V)`` for both screens. Default: 3.1, which is what MIST's
-        BC tables use.
+        ``A_V / E(B-V)`` for both screens. Default: 3.1.
     extinction_law : str, optional
         ``'F99'`` (default), ``'CCM89'`` or ``'grey'``. See
         `~artpop.kcorrect.extinction_curve`.
@@ -736,12 +758,21 @@ class MISTIsochrone(Isochrone):
     Attributes
     ----------
     delta_mag : dict
-        The per-star magnitude offset applied in each filter, so what moved is
-        always inspectable.
+        Per star and filter, what redshift and dust moved: the synthetic
+        magnitude at (z, A) minus the synthetic magnitude at (0, 0). 0.0 at
+        z = 0 without dust, and for ``photometry='mist'``.
     kcorr_info : dict
         Per photometric system: which spectral-library backend served each row
-        (C3K, Tremblay or the blackbody fallback) and how many rows had their
-        [Fe/H] clipped to the library's range. Nothing is served silently.
+        (C3K, Tremblay or the blackbody fallback), which were interpolated
+        linearly rather than cubically, and how many rows had their [Fe/H]
+        clipped to the library's range. Nothing is served silently.
+    photometry_info : dict
+        The stated assumptions behind the magnitude columns: isochrones
+        (MIST release, rotation, [a/Fe]), spectral library, filter curves (with
+        the sha1 of every file and their provenance), bolometric convention,
+        L_sun, dust law, interpolation.
+    mag_table_mist : `~astropy.table.Table`
+        MIST's own shipped columns (AB), kept for comparison only.
     nebular_delta_mag : dict
         The nebular offset per row and filter (after K and dust); 0.0 when
         inactive.
@@ -773,7 +804,22 @@ class MISTIsochrone(Isochrone):
                  version=DEFAULT_MIST_VERSION, a_over_fe=0.0,
                  redshift=0.0, a_v_host=0.0, a_v_mw=0.0, r_v=3.1,
                  extinction_law='F99', kcorr_grid=None, kcorr_kw=None,
-                 nebular=None):
+                 nebular=None, photometry='synthetic', bolometric='teff',
+                 cool_giants='marcs'):
+
+        if photometry not in ('synthetic', 'mist'):
+            raise ValueError(f"photometry must be 'synthetic' or 'mist', got {photometry!r}")
+        if photometry == 'mist' and (redshift != 0.0 or a_v_host != 0.0 or a_v_mw != 0.0):
+            raise ValueError(
+                "photometry='mist' serves MIST's shipped magnitudes at z = 0 without "
+                'dust only; the correction that used to be added to them came from '
+                "a different spectral library. Use photometry='synthetic'.")
+        if photometry == 'synthetic' and ab_or_vega.lower() != 'ab':
+            raise ValueError("photometry='synthetic' is integrated in AB; Vega "
+                             "would need a Vega spectrum through the same curves")
+        self.photometry = photometry
+        self.bolometric = bolometric
+        self.cool_giants = cool_giants
 
         # verify age are metallicity are within model grids
         if log_age < self._log_age_min or log_age > self._log_age_max:
@@ -862,20 +908,28 @@ class MISTIsochrone(Isochrone):
             self.zpt_offsets[filt] = m_convert
             self._iso_full[filt] = self._iso_full[filt] + m_convert
 
-        # redshift and the two dust frames, applied DIFFERENTIALLY on top of
-        # MIST's shipped columns. See `_apply_band_offsets` for why that is the
-        # only defensible way to do it, and why it is done here rather than at
-        # the population level.
+        # MIST's own columns, now AB, kept for comparison only
+        self.mag_table_mist = Table(self._iso_full[filters].copy())
+
+        # the magnitudes: integrated per star from the spectral library at this
+        # redshift and dust (see `_apply_synthetic`), or MIST's own at z = 0
         self.redshift = float(redshift)
         self.a_v_host = float(a_v_host)
         self.a_v_mw = float(a_v_mw)
         self.r_v = float(r_v)
         self.extinction_law = extinction_law
+        self._kcorr_kw = dict(kcorr_kw or {})
         self.delta_mag = {f: 0.0 for f in filters}
         self.kcorr_info = None
         self._mags_rest = None
-        if self.redshift != 0.0 or self.a_v_host != 0.0 or self.a_v_mw != 0.0:
-            self._apply_band_offsets(filters, kcorr_grid, kcorr_kw or {})
+        self.photometry_info = None
+        if self.photometry == 'synthetic':
+            self._apply_synthetic(filters, kcorr_grid)
+        else:
+            self.photometry_info = dict(
+                photometry='mist', isochrones=self._isochrone_info(),
+                magnitudes=f'MIST v{self.version} shipped columns, '
+                           f'{ab_or_vega.upper()} (zeropoints.txt offsets applied)')
 
         # nebular emission around young O/B stars, on top of K and dust. An
         # inactive config (None or knob = 0) touches nothing (test N1).
@@ -911,71 +965,95 @@ class MISTIsochrone(Isochrone):
             return np.asarray(self._iso_full['[Fe/H]'], dtype=float)
         return np.full(len(self._iso_full), float(self.feh))
 
-    def _apply_band_offsets(self, filters, kcorr_grid, kcorr_kw):
+    def _isochrone_info(self):
+        return dict(library=f'MIST v{self.version}', v_over_vcrit=self.v_over_vcrit,
+                    a_over_fe=self.a_over_fe, log_age=float(self.log_age),
+                    feh=float(self.feh), mist_path=self.mist_path,
+                    used='evolution only (log Teff, log g, log L, [Fe/H], phase, masses)'
+                    if self.photometry == 'synthetic' else 'evolution and magnitudes')
+
+    def _apply_synthetic(self, filters, kcorr_grid=None):
         """
-        Add ``Delta m(z, A_host, A_MW)`` to every magnitude column, per star.
+        Replace every magnitude column by the star's own synthetic magnitude.
 
-        Why differential, and why here.
-
-        Regenerating the magnitudes from MIST's bolometric-correction tables is
-        the obvious alternative and it does not work: with straightforward
-        interpolation the round trip closes only to 0.05-0.15 mag, which is
-        larger than the entire effect being modelled at z = 0.05
-        (HANDOFF_REDSHIFT.md s1a). Adding a *difference* on top of the shipped
-        columns cancels that error to first order and preserves MIST's z = 0
-        calibration exactly.
+        ``M_x = M_x^{1 L_sun}(log Teff, log g, [Fe/H]_star; z, A_host, A_MW)
+        - 2.5 log_L``, from the table `~artpop.kcorrect.KCorrectionGrid`
+        integrates from the spectral library through the filter curves. The
+        per-row MIST [Fe/H] (`feh_star`) is the library key.
 
         Applying it to the isochrone rather than the population is what makes
         the rest of the stack correct without further care. Everything
         downstream reads `mag_table`: ``ssp_mag``/``ssp_color``/``ssp_sbf_mag``,
-        the sampled stars' ``abs_mags``, and -- the one that matters --
-        ``integrated_abs_mags`` and ``_integrated_log_lumlum``, which are
-        built as ``10**(-0.4 m)`` and ``10**(-0.8 m)`` from these same columns.
-        The second of those is a second moment, so it needs ``10**(-0.8 K)``,
-        not ``10**(-0.4 K)``; getting that wrong is invisible to every flux
-        test. Applying K here makes both powers right by construction. It also
-        means the ``mag_limit`` row split is computed on corrected magnitudes,
-        so the bright and faint sets stay exact complements.
+        the sampled stars' ``abs_mags``, and ``integrated_abs_mags`` and
+        ``_integrated_log_lumlum``, built as ``10**(-0.4 m)`` and
+        ``10**(-0.8 m)`` from these same columns -- so the second moment is
+        right by construction. The ``mag_limit`` row split is computed on these
+        magnitudes too, so the bright and faint sets stay exact complements.
 
-        The correction is per STAR, never per galaxy: at z = 0.05 it varies by
-        0.12-0.45 mag across the stars of a single population, so it changes
-        the shape of the CMD rather than its zero point. That is also why the
-        SBF K-correction (f^2-weighted, dominated by the RGB tip) differs from
-        the integrated-light one by 0.06-0.20 mag and flips sign in the NIR.
+        The redshift-and-dust part is per STAR, never per galaxy: at z = 0.05 it
+        varies by 0.12-0.45 mag across the stars of one population, which
+        changes the shape of the CMD rather than its zero point. It is kept in
+        `delta_mag`; `mag_table_rest` holds the z = 0, dust-free magnitudes.
         """
+        from ..filters import load_filter_system
         log_teff = np.asarray(self._iso_full['log_Teff'], dtype=float)
         log_g = np.asarray(self._iso_full['log_g'], dtype=float)
+        log_l = np.asarray(self._iso_full['log_L'], dtype=float)
         feh_star = self.feh_star
-
-        # keep the pre-correction columns: every diagnostic and every test that
-        # asks "what did this actually move?" needs them
-        self._mags_rest = Table(self._iso_full[filters].copy())
 
         by_system = {}
         lookup = phot_system_lookup()
         for filt in filters:
             by_system.setdefault(lookup[filt], []).append(filt)
 
-        grid_kw = dict(a_v_host=self.a_v_host, a_v_mw=self.a_v_mw,
-                       extinction_law=self.extinction_law, r_v=self.r_v)
-        grid_kw.update(kcorr_kw)
-        info = {}
+        grid_kw = dict(extinction_law=self.extinction_law, r_v=self.r_v,
+                       bolometric=self.bolometric, cool_giants=self.cool_giants)
+        grid_kw.update(self._kcorr_kw)
+        dusty = self.a_v_host != 0.0 or self.a_v_mw != 0.0
+        info, meta, rest = {}, {}, {}
         for system, bands in by_system.items():
+            try:
+                load_filter_system(system, bands=bands, curve_dir=photometry_curve_dir(
+                    system, grid_kw.get('curve_dir')))
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(
+                    f'{system}: no filter curves to integrate synthetic photometry '
+                    f"through ({exc}); pass photometry='mist' for MIST's shipped "
+                    'magnitudes at z = 0') from exc
             if kcorr_grid is None:
-                # the dust-axis table for any pair inside its axes; an exact
-                # (baked, warned) table for a pair outside them
-                grid, dust_kw = KCorrectionGrid.for_dust(system, bands=bands, **grid_kw)
+                grid, dust_kw = KCorrectionGrid.for_dust(
+                    system, bands=bands, a_v_host=self.a_v_host,
+                    a_v_mw=self.a_v_mw, **grid_kw)
             else:
                 grid = kcorr_grid
                 dust_kw = (dict(a_v_host=self.a_v_host, a_v_mw=self.a_v_mw)
                            if grid.has_dust_axes else {})
-            delta, inf = grid.offsets(log_teff, log_g, feh_star,
-                                      self.redshift, bands=bands, **dust_kw)
+            mags, inf = grid.magnitudes(log_teff, log_g, feh_star, self.redshift,
+                                        log_l=log_l, bands=bands, **dust_kw)
+            # the z = 0, dust-free reference every table carries
+            if self.redshift == 0.0 and not dusty:
+                ref = mags
+            else:
+                ref, _ = grid.magnitudes(log_teff, log_g, feh_star, 0.0, log_l=log_l,
+                                         bands=bands, rest=True, **dust_kw)
             info[system] = inf
+            meta[system] = {k: grid.meta.get(k) for k in (
+                'library', 'curves', 'bolometric', 'l_sun_erg_s', 'extinction_law',
+                'r_v', 'table_version', 'resolution', 'a_over_fe', 'cool_giants',
+                'marcs_blend')}
             for filt in bands:
-                self.delta_mag[filt] = delta[filt]
-                self._iso_full[filt] = self._iso_full[filt] + delta[filt]
+                rest[filt] = ref[filt]
+                self._iso_full[filt] = mags[filt]
+                self.delta_mag[filt] = mags[filt] - ref[filt]
+        self._mags_rest = Table({f: rest[f] for f in filters})
         self.kcorr_info = info
+        self.photometry_info = dict(
+            photometry='synthetic', isochrones=self._isochrone_info(),
+            tables=meta, interpolation='cubic (Lagrange) in [Fe/H], log g, '
+            'log Teff on the library mesh; linear in z and A_V; linear fallback '
+            'flagged per row in kcorr_info',
+            frame=dict(redshift=self.redshift, a_v_host=self.a_v_host,
+                       a_v_mw=self.a_v_mw))
 
     def _reset_nebular(self, filters):
         """The no-nebular state: nothing moved, no blob."""
@@ -987,7 +1065,7 @@ class MISTIsochrone(Isochrone):
         """
         Birth-cloud dust + nebular lines on the young O/B rows, per band.
 
-        Runs after `_apply_band_offsets`, on the K- and dust-corrected columns,
+        Runs after `_apply_synthetic`, on the redshifted, reddened columns,
         for the same reason that one lives here: every consumer of `mag_table`
         -- the sampled stars, the smooth component's two moments, SBF and the
         ``mag_limit`` row split -- then sees the nebular light consistently.
@@ -1005,7 +1083,9 @@ class MISTIsochrone(Isochrone):
             by_system.setdefault(lookup[filt], []).append(filt)
         curves = {}
         for system, bands in by_system.items():
-            fs = load_filter_system(system, bands=bands)
+            # the same passbands the magnitudes were integrated through
+            fs = load_filter_system(system, bands=bands, curve_dir=photometry_curve_dir(
+                system, self._kcorr_kw.get('curve_dir')))
             curves.update({b: fs.get_trans(b) for b in bands})
 
         mags = {f: np.asarray(self._iso_full[f], dtype=float) for f in filters}
@@ -1029,10 +1109,8 @@ class MISTIsochrone(Isochrone):
     @property
     def mag_table_rest(self):
         """
-        The magnitude columns before any redshift or dust correction.
-
-        `None` when nothing was applied, in which case `mag_table` is already
-        the rest-frame table.
+        The synthetic magnitudes at z = 0 without dust (`None` for
+        ``photometry='mist'``, whose columns are already that).
         """
         return self._mags_rest
 
@@ -1040,24 +1118,26 @@ class MISTIsochrone(Isochrone):
         """
         Recompute the magnitude columns at a new redshift (and/or dust).
 
-        The pre-correction columns are kept, so this restores them and applies
-        the new correction rather than correcting an already-corrected table --
-        which would be wrong by the old offset and would look almost right.
+        The synthetic magnitudes are integrated afresh from the library, never
+        shifted from the previous ones (which would carry the old offset and
+        would look almost right). ``photometry='mist'`` admits only z = 0
+        without dust.
         """
         filters = list(self.mag_table.colnames)
-        if self._mags_rest is not None:
-            for filt in filters:
-                self._iso_full[filt] = self._mags_rest[filt]
-        self.redshift = float(redshift)
-        if a_v_host is not None:
-            self.a_v_host = float(a_v_host)
-        if a_v_mw is not None:
-            self.a_v_mw = float(a_v_mw)
+        redshift = float(redshift)
+        a_h = self.a_v_host if a_v_host is None else float(a_v_host)
+        a_m = self.a_v_mw if a_v_mw is None else float(a_v_mw)
+        if self.photometry == 'mist' and (redshift != 0.0 or a_h != 0.0 or a_m != 0.0):
+            raise ValueError("photometry='mist' serves z = 0 without dust only; "
+                             "build with photometry='synthetic'")
+        self.redshift, self.a_v_host, self.a_v_mw = redshift, a_h, a_m
         self.delta_mag = {f: 0.0 for f in filters}
         self.kcorr_info = None
-        self._mags_rest = None
-        if self.redshift != 0.0 or self.a_v_host != 0.0 or self.a_v_mw != 0.0:
-            self._apply_band_offsets(filters, None, {})
+        if self.photometry == 'synthetic':
+            self._apply_synthetic(filters)
+        else:
+            for filt in filters:        # undo any nebular light before reapplying
+                self._iso_full[filt] = self.mag_table_mist[filt]
         # the lines land in different bands at a new z: recompute, never shift
         self._reset_nebular(filters)
         if is_nebular_active(self.nebular):

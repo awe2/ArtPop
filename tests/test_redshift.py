@@ -39,6 +39,7 @@ from artpop.filters import load_filter_system
 from artpop.stars import Isochrone, SSP
 from artpop.source import SersicSP
 from artpop.image import IdealImager, moffat_psf
+from artpop.kcorrect import photometry_curve_dir
 from artpop.kcorrect import (KCorrectionGrid, C3KLibrary, TremblayWDLibrary,
                              BlackbodyLibrary, band_offset, k_correction,
                              band_weights, extinction_curve, planck_lam,
@@ -342,43 +343,45 @@ class TestKCorrectionGrid(TestCase):
         into the falling part of their spectrum can only cost flux.
         """
         z = np.linspace(0.0, 0.2, 11)
-        k = [self.grid.interpolate(np.log10(4000.0), 0.5, -1.0, zz)[0][0, 0]
-             for zz in z]
+        k = [self.grid.interpolate(np.log10(4000.0), 0.5, -1.0, zz,
+                                   quantity='offset')[0][0, 0] for zz in z]
         self.assertTrue(np.all(np.diff(k) > 0), f'K(u) not monotone: {k}')
 
     def test_b3_k_orders_by_temperature_but_not_monotonically_everywhere(self):
         """B3: K orders by temperature on the giant branch, and turns in u and z.
 
-        HANDOFF_REDSHIFT.md's B3 claims the ordering "holds across the grid".
-        Measured at log g 2.5, [Fe/H] = -1, z = 0.05, that is true on the cool
-        branch and false at the hot end of two bands:
+        Measured at log g 2.5, [Fe/H] = -1, z = 0.05 through DP2's standard
+        passbands (2026-10-06; with the syseng v1.1 curves the u minimum sat at
+        5000 K, K(u) = +0.473 / +0.309 / +0.214 / +0.203 at 3500-5000 K):
 
         ===== ====== ====== ====== ====== ====== ====== ====== ======
         T (K)   3500   4000   4500   5000   5500   6000   7000   8000
-        K(u)  +0.473 +0.309 +0.214 +0.203 +0.230 +0.279 +0.429 +0.555
-        K(z)  +0.054 +0.019 -0.006 -0.027 -0.041 -0.051 -0.055 -0.044
+        K(u)  +0.402 +0.240 +0.169 +0.181 +0.234 +0.304 +0.488 +0.637
+        K(z)  +0.055 +0.019 -0.006 -0.027 -0.041 -0.052 -0.056 -0.046
         ===== ====== ====== ====== ====== ====== ====== ====== ======
 
         Both turns are a spectral edge crossing the band as the filter
-        blueshifts: the Balmer jump at 3646 A for *u*, the Paschen jump at
-        8204 A for *z*. g, r, i and y are monotone throughout.
+        blueshifts: the Balmer jump at 3646 A for *u* (DP2's u is redder, pivot
+        3707 A against 3665 A, so it turns at a cooler star), the Paschen jump
+        at 8204 A for *z*. g, r, i and y are monotone throughout.
 
-        The ordering is asserted where it holds -- the giant branch, which is
-        where the flux and all of the SBF weight live -- and the turns are
-        asserted too, because structure like this is precisely what a
-        per-galaxy scalar cannot represent.
+        The ordering is asserted where it holds -- the cool giant branch, where
+        the flux and all of the SBF weight live -- and the turns are asserted
+        too, because structure like this is precisely what a per-galaxy scalar
+        cannot represent.
         """
-        cool = [3500.0, 4000.0, 4500.0, 5000.0]
-        k_cool = np.array([self.grid.interpolate(np.log10(t), 2.5, -1.0,
-                                                 Z_REF)[0][0] for t in cool])
+        kw = dict(quantity='offset')
+        cool = [3500.0, 4000.0, 4500.0]
+        k_cool = np.array([self.grid.interpolate(np.log10(t), 2.5, -1.0, Z_REF,
+                                                 **kw)[0][0] for t in cool])
         for j, band in enumerate(self.grid.bands):
             self.assertTrue(np.all(np.diff(k_cool[:, j]) < 0),
                             f'K({band}) not ordered on the giant branch: '
                             f'{k_cool[:, j]}')
 
         full = [3500.0, 4000.0, 4500.0, 5000.0, 5500.0, 6000.0, 7000.0, 8000.0]
-        k_all = np.array([self.grid.interpolate(np.log10(t), 2.5, -1.0,
-                                                Z_REF)[0][0] for t in full])
+        k_all = np.array([self.grid.interpolate(np.log10(t), 2.5, -1.0, Z_REF,
+                                                **kw)[0][0] for t in full])
         turns = {'LSST_u', 'LSST_z'}
         for j, band in enumerate(self.grid.bands):
             if band in turns:
@@ -395,8 +398,12 @@ class TestKCorrectionGrid(TestCase):
             path = self.grid.save(os.path.join(tmp, 'grid.npz'))
             other = KCorrectionGrid.load(path)
         for name in self.grid._ARRAYS:
-            self.assertTrue(np.array_equal(getattr(self.grid, name),
-                                           getattr(other, name)), name)
+            a, b = getattr(self.grid, name), getattr(other, name)
+            if a is None:
+                self.assertIsNone(b, name)
+                continue
+            # the MARCS table holds NaN where MARCS has no model, by design
+            self.assertTrue(np.array_equal(a, b, equal_nan=np.asarray(a).dtype.kind == 'f'), name)
         self.assertEqual(self.grid.bands, other.bands)
         self.assertEqual(self.grid.meta, other.meta)
 
@@ -438,21 +445,24 @@ class TestKCorrectionGrid(TestCase):
         z_max = float(self.grid.z_grid[-1])
         blue_edge = C3KLibrary().wave[0]
         for band in FILTERS:
-            lam, trans = load_filter_system('LSST').get_trans(band)
+            lam, trans = load_filter_system(
+                'LSST', curve_dir=photometry_curve_dir('LSST')).get_trans(band)
             lam_rest_min = lam[trans > 0].min() / (1.0 + z_max)
             self.assertGreater(lam_rest_min, blue_edge)
 
-    def test_b7_redshift_zero_slice_is_identically_zero(self):
-        """B7: the z = 0 slice of every backend is exactly zero.
-
-        The numerator and denominator of the z = 0 column are computed by the
-        same code path with the same arguments, so they must be bit-identical.
-        This is the grid-level statement of the bit-identity C1 asserts
-        end to end.
-        """
-        for arr in (self.grid.c3k, self.grid.wd, self.grid.bb):
+    def test_b7_redshift_zero_offset_is_identically_zero(self):
+        """B7: the z = 0 column of every backend IS its rest table, so the
+        offset at z = 0 without dust is 0.0 bit for bit, at nodes and between
+        them."""
+        for arr, rest in ((self.grid.c3k, self.grid.c3k_rest),
+                          (self.grid.wd, self.grid.wd_rest),
+                          (self.grid.bb, self.grid.bb_rest)):
             if arr.size:
-                self.assertEqual(np.nanmax(np.abs(arr[..., 0, :])), 0.0)
+                np.testing.assert_array_equal(arr[..., 0, :], rest)
+        lt = np.log10([3700.0, 5123.0, 9876.0, 23456.0, 60000.0])
+        lg = np.array([0.7, 2.3, 4.1, 7.2, 6.0])
+        off, _ = self.grid.interpolate(lt, lg, -1.37, 0.0, quantity='offset')
+        self.assertEqual(float(np.nanmax(np.abs(off))), 0.0)
 
     def test_b8_redshift_outside_the_grid_raises(self):
         """B8: a redshift off the end of the grid raises rather than extrapolating."""
@@ -461,28 +471,24 @@ class TestKCorrectionGrid(TestCase):
                                   float(self.grid.z_grid[-1]) + 0.05)
 
     @skipUnless(_HAVE_WD, 'Tremblay WD library not staged')
-    def test_b9_differential_form_suppresses_the_library_seam(self):
-        """B9: the seam is real, and the differential form is what tames it.
+    def test_b9_library_seam_is_real_and_its_redshift_part_small(self):
+        """B9: the C3K / Tremblay seam is real in absolute photometry, and
+        the redshift part of it is small.
 
         C3K at log g 5.5 and Tremblay at log g 6.5 are not the same star
         computed twice -- one is a metal atmosphere, the other a pure-hydrogen
-        DA -- so their absolute photometry genuinely steps across the join.
-        That step is in MIST's composite already: at log Teff = 3.17609 in
+        DA -- so their absolute photometry genuinely steps across the join, and
+        since 2026-10-06 (absolute synthetic magnitudes) that step is in our
+        magnitudes, as it is in MIST's composite (at log Teff = 3.17609 in
         ``bcl/feh+0.00_afe+0.0.LSST`` every row with log g <= 6.0 carries an
-        identical BC and log g = 6.5 jumps.
-
-        So the thing worth asserting is not that K is continuous -- it is not,
-        and it should not be -- but that the **difference** cancels most of the
-        seam, which is the entire argument for applying redshift
-        differentially rather than regenerating magnitudes. Measured at
-        [Fe/H] = -1, z = 0.05: the colour step across the join is 0.39 mag at
-        20 kK and 0.49 mag at 40 kK, while the step in the K-colours is 0.054
-        and 0.018 -- a suppression of 7x and 27x.
+        identical BC and log g = 6.5 jumps). Measured at [Fe/H] = -1,
+        z = 0.05: the colour step across the join is 0.39 mag at 20 kK and
+        0.49 mag at 40 kK, while the step in the K-colours is 0.054 and 0.018.
 
         For scale, the rows this affects carry under 0.1% of an old
         population's flux and none of its SBF weight.
         """
-        fs = load_filter_system('LSST')
+        fs = load_filter_system('LSST', curve_dir=photometry_curve_dir('LSST'))
         c3k, wd = C3KLibrary(), TremblayWDLibrary()
         lg_c, lt_c, cube = c3k.grid(-1.0)
         lg_w, lt_w, flux_w = wd.grid()
@@ -499,8 +505,10 @@ class TestKCorrectionGrid(TestCase):
             j_g = int(np.argmin(abs(lg_w - 6.5)))
             m_c = [ab_mag(c3k.wave, cube[i_g, i_t], b) for b in FILTERS]
             m_w = [ab_mag(wd.wave, flux_w[j_g, j_t], b) for b in FILTERS]
-            k_c = self.grid.interpolate(np.log10(teff), 5.5, -1.0, Z_REF)[0][0]
-            k_w = self.grid.interpolate(np.log10(teff), 6.5, -1.0, Z_REF)[0][0]
+            k_c = self.grid.interpolate(np.log10(teff), 5.5, -1.0, Z_REF,
+                                        quantity='offset')[0][0]
+            k_w = self.grid.interpolate(np.log10(teff), 6.5, -1.0, Z_REF,
+                                        quantity='offset')[0][0]
 
             # colours, so the arbitrary normalisation of each library cancels
             step_mag = max(abs((m_c[i] - m_c[i + 1]) - (m_w[i] - m_w[i + 1]))
@@ -509,8 +517,8 @@ class TestKCorrectionGrid(TestCase):
                          for i in range(len(FILTERS) - 1))
             self.assertLess(step_k, 0.15, f'K seam at {teff:.0f} K too large')
             self.assertGreater(step_mag / step_k, 3.0,
-                               f'differential form suppresses the {teff:.0f} K '
-                               f'seam by only {step_mag / step_k:.1f}x')
+                               f'the K-colour step at {teff:.0f} K is only '
+                               f'{step_mag / step_k:.1f}x below the colour step')
 
     @skipUnless(_HAVE_WD, 'Tremblay WD library not staged')
     def test_b10_blackbody_bridges_the_log_g_gap(self):
@@ -523,9 +531,10 @@ class TestKCorrectionGrid(TestCase):
         wrong wavelength or flux convention.
         """
         teff = 40000.0
-        k_c = self.grid.interpolate(np.log10(teff), 5.5, -1.0, Z_REF)[0][0]
-        k_w = self.grid.interpolate(np.log10(teff), 6.5, -1.0, Z_REF)[0][0]
-        k_b, info = self.grid.interpolate(np.log10(teff), 6.0, -1.0, Z_REF)
+        kw = dict(quantity='offset')
+        k_c = self.grid.interpolate(np.log10(teff), 5.5, -1.0, Z_REF, **kw)[0][0]
+        k_w = self.grid.interpolate(np.log10(teff), 6.5, -1.0, Z_REF, **kw)[0][0]
+        k_b, info = self.grid.interpolate(np.log10(teff), 6.0, -1.0, Z_REF, **kw)
         self.assertEqual(info['source'][0], SOURCE_BB)
         span = np.abs(k_c - k_w).max()
         self.assertLess(np.abs(k_b[0] - 0.5 * (k_c + k_w)).max(),
@@ -856,52 +865,57 @@ class TestRedshiftIntegration(TestCase):
 @skipUnless(os.path.isdir(os.path.join(MIST_PATH, 'MIST_v2.5_LSST'))
             and _HAVE_C3K, 'MIST v2.5 LSST grid or C3K not staged')
 class TestRedshiftMIST(TestCase):
-    """The two claims that can only be made against MIST's own columns."""
+    """The claims that can only be made against MIST's own columns."""
 
     _kw = dict(log_age=10.0, feh=-1.0, phot_system='LSST', version='2.5')
 
-    def test_c1_mist_zero_redshift_is_bit_identical(self):
-        """C1 (MIST): ``MISTIsochrone(redshift=0.0)`` is byte-for-byte stock."""
+    def test_c1_mist_photometry_is_bit_identical_to_stock(self):
+        """C1 (MIST): ``photometry='mist'`` serves MIST's shipped columns
+        byte for byte, and they are kept as ``mag_table_mist`` on the
+        synthetic default; MIST with a redshift or dust raises."""
         from artpop import MISTIsochrone
-        stock = MISTIsochrone(**self._kw)
-        zeroed = MISTIsochrone(redshift=0.0, a_v_host=0.0, a_v_mw=0.0,
-                               **self._kw)
+        mist = MISTIsochrone(photometry='mist', **self._kw)
+        synth = MISTIsochrone(**self._kw)
         for filt in FILTERS:
-            self.assertTrue(np.array_equal(
-                np.asarray(stock.mag_table[filt]),
-                np.asarray(zeroed.mag_table[filt])), filt)
-        self.assertIsNone(zeroed.mag_table_rest)
+            self.assertTrue(np.array_equal(np.asarray(mist.mag_table[filt]),
+                                           np.asarray(synth.mag_table_mist[filt])), filt)
+        self.assertIsNone(mist.mag_table_rest)
+        for bad in (dict(redshift=Z_REF), dict(a_v_mw=0.1), dict(a_v_host=0.1)):
+            with self.assertRaises(ValueError):
+                MISTIsochrone(photometry='mist', **bad, **self._kw)
+        with self.assertRaises(ValueError):
+            mist.set_redshift(Z_REF)
+        with self.assertRaises(ValueError):
+            MISTIsochrone(ab_or_vega='vega', **self._kw)
 
-    def test_c2_columns_equal_stock_plus_the_interpolated_correction(self):
-        """C2: at z > 0 the columns are exactly stock + the interpolated offset.
-
-        Differential by construction: MIST's z = 0 calibration is preserved
-        exactly and only a small, smooth correction is added on top. That is
-        what makes the 0.05-0.15 mag error of regenerating magnitudes from the
-        BC tables cancel rather than accumulate.
-        """
+    def test_c2_columns_are_the_library_integral(self):
+        """C2: every column is the grid's absolute magnitude minus 2.5 log L, at
+        z = 0 as at z > 0; ``delta_mag`` is exactly what redshift moved."""
         from artpop import MISTIsochrone
-        stock = MISTIsochrone(**self._kw)
+        rest = MISTIsochrone(**self._kw)
         shifted = MISTIsochrone(redshift=Z_REF, **self._kw)
+        I = shifted.isochrone_full
+        grid = KCorrectionGrid.for_dust('LSST', bands=FILTERS)[0]
+        want, _ = grid.magnitudes(I['log_Teff'], I['log_g'], shifted.feh_star,
+                                  Z_REF, log_l=I['log_L'], bands=FILTERS)
         for filt in FILTERS:
-            rest = np.asarray(shifted.mag_table_rest[filt])
-            self.assertTrue(np.array_equal(
-                rest, np.asarray(stock.mag_table[filt])), filt)
-            self.assertTrue(np.allclose(
-                np.asarray(shifted.mag_table[filt]),
-                rest + shifted.delta_mag[filt], rtol=0, atol=0), filt)
+            np.testing.assert_array_equal(np.asarray(shifted.mag_table[filt]), want[filt])
+            np.testing.assert_array_equal(np.asarray(shifted.mag_table_rest[filt]),
+                                          np.asarray(rest.mag_table[filt]))
+            np.testing.assert_allclose(np.asarray(shifted.mag_table[filt]),
+                                       np.asarray(shifted.mag_table_rest[filt])
+                                       + shifted.delta_mag[filt], rtol=0, atol=1e-12)
         info = shifted.kcorr_info['LSST']
-        self.assertGreater(info['n_c3k'], 0.7 * len(stock.mini))
+        self.assertGreater(info['n_c3k'] + info['n_marcs'], 0.7 * len(rest.mini))
         self.assertEqual(info['n_feh_clipped'], 0)
+        p = shifted.photometry_info
+        self.assertEqual(p['photometry'], 'synthetic')
+        self.assertEqual(set(p['tables']['LSST']['curves']['sha1']), set(FILTERS))
+        self.assertEqual(p['tables']['LSST']['bolometric'], 'teff')
 
-    def test_c2b_set_redshift_restores_before_reapplying(self):
-        """C2b: ``set_redshift`` corrects the *rest-frame* columns, not the
-        already-corrected ones.
-
-        Applying a second correction on top of the first would be wrong by the
-        old offset and would look almost right, which is the only reason this
-        is worth a test.
-        """
+    def test_c2b_set_redshift_recomputes_rather_than_shifts(self):
+        """C2b: ``set_redshift`` integrates afresh: z = 0.05 -> 0.10 equals a
+        direct z = 0.10 build, and back to 0 equals the z = 0 build."""
         from artpop import MISTIsochrone
         iso = MISTIsochrone(redshift=Z_REF, **self._kw)
         direct = MISTIsochrone(redshift=0.10, **self._kw)
@@ -916,6 +930,19 @@ class TestRedshiftMIST(TestCase):
             np.testing.assert_allclose(np.asarray(iso.mag_table[filt]),
                                        np.asarray(stock.mag_table[filt]),
                                        rtol=0, atol=1e-12)
+
+    def test_c2c_bolometric_teff_is_a_grey_shift(self):
+        """C2c: ``bolometric='teff'`` (default) sits a grey
+        -2.5 log10(INT F / sigma T^4) above ``'spectrum'``: every band of a star
+        moves by the same amount, so colours do not change."""
+        from artpop import MISTIsochrone
+        a = MISTIsochrone(bolometric='spectrum', **self._kw)
+        b = MISTIsochrone(**self._kw)
+        src = a.kcorr_info['LSST']['source'] == SOURCE_C3K
+        d = np.stack([np.asarray(b.mag_table[f]) - np.asarray(a.mag_table[f]) for f in FILTERS])
+        # grey to the cubic interpolation of a ratio that is itself smooth
+        self.assertLess(float(np.max(np.ptp(d[:, src], axis=0))), 2e-3)
+        self.assertLess(float(np.median(d[:, src])), 0.0)
 
 
 @skipUnless(_HAVE_C3K, f'C3K not staged under {spectra_path()}')
@@ -952,17 +979,19 @@ class TestC3KEmptyCells(TestCase):
         g, t, f = self.lib.grid(0.0)
         lam = np.asarray(self.lib.wave, dtype=float)
         miss = c3k_missing_mask(f, lam)
-        fs = load_filter_system('LSST', bands=['LSST_r'])
+        fs = load_filter_system('LSST', bands=['LSST_r'], curve_dir=photometry_curve_dir('LSST'))
         tw, tt = fs.get_trans('LSST_r')
         i0 = int(np.argmin(abs(self.grid.feh_grid - 0.0)))
         b = self.grid.bands.index('LSST_r')
         ig, it = map(int, np.argwhere(miss)[len(np.argwhere(miss)) // 2])
         bb = planck_lam(lam, 10 ** t[it]) * lam ** 2
         want = band_offset(lam, bb, tw, tt, 0.05, flux_unit='f_nu')
-        self.assertAlmostEqual(float(self.grid.c3k[i0, ig, it, 1, b]), want, places=5)
+        got = float(self.grid.c3k[i0, ig, it, 1, b]) - float(self.grid.c3k_rest[i0, ig, it, b])
+        self.assertAlmostEqual(got, want, places=5)
         jg, jt = map(int, np.argwhere(~miss)[0])
         want = band_offset(lam, np.asarray(f[jg, jt], float), tw, tt, 0.05, flux_unit='f_nu')
-        self.assertAlmostEqual(float(self.grid.c3k[i0, jg, jt, 1, b]), want, places=5)
+        got = float(self.grid.c3k[i0, jg, jt, 1, b]) - float(self.grid.c3k_rest[i0, jg, jt, b])
+        self.assertAlmostEqual(got, want, places=5)
 
     def test_e3_rows_touching_empty_cells_are_flagged(self):
         """E3: a 45 kK, log g 3.3 row (next to the Eddington limit) is flagged;
@@ -975,7 +1004,7 @@ class TestC3KEmptyCells(TestCase):
     def test_e4_cache_key_is_versioned(self):
         """E4: a table written before the fix can never be loaded for it."""
         from artpop.kcorrect import KCORR_TABLE_VERSION
-        self.assertGreaterEqual(KCORR_TABLE_VERSION, 2)
+        self.assertGreaterEqual(KCORR_TABLE_VERSION, 4)
         self.assertTrue(KCorrectionGrid.cache_key('LSST').startswith(
             f'kcorr_v{KCORR_TABLE_VERSION}_'))
 
@@ -1140,3 +1169,231 @@ class TestRepeatedIsochroneNoLeak(TestCase):
         for f in FILTERS:
             np.testing.assert_array_equal(np.asarray(first.mag_table[f]), np.asarray(second.mag_table[f]))
             np.testing.assert_array_equal(np.asarray(first.mag_table_rest[f]), np.asarray(stock.mag_table[f]))
+
+
+@skipUnless(_HAVE_C3K, f'C3K not staged under {spectra_path()}')
+class TestSyntheticPhotometry(TestCase):
+    """
+    Tier S (2026-10-06): the table holds absolute AB magnitudes of a 1 L_sun
+    star, integrated from the library -- every rendered magnitude comes from
+    here, z = 0 included. These pin the absolute zero point, the identity
+    with `band_offset`, the blackbody, the interpolation and the provenance.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # 'spectrum': S1's independent route normalises by the spectrum's integral
+        cls.grid = KCorrectionGrid.build('LSST', z_grid=np.array([0.0, 0.05, 0.1]),
+                                         bolometric='spectrum')
+        cls.lib = C3KLibrary()
+        cls.fs = load_filter_system('LSST', curve_dir=photometry_curve_dir('LSST'))
+
+    def _direct(self, lam, f_nu, band, z=0.0):
+        """Independent route: AB magnitude of L_sun * f / INT f at 10 pc,
+        np.trapezoid, f_nu -> f_lam by hand, the source redshifted rather than
+        the filter blueshifted, integrated in the OBSERVER frame on the
+        redshifted library grid (the library resolves the lines; DP2's 5 A
+        curve grid would not)."""
+        from artpop.kcorrect import L_SUN, FOUR_PI_D10_SQ, C_AA
+        tw, tt = self.fs.get_trans(band)
+        f_lam = np.asarray(f_nu, float) * C_AA / lam ** 2
+        L = f_lam / np.trapezoid(f_lam, lam) * L_SUN / FOUR_PI_D10_SQ
+        # observed f_lam(l_obs) = L(l_obs / (1+z)) / (1+z), luminosity distance out
+        l_obs, obs = lam * (1 + z), L / (1 + z)
+        T = np.interp(l_obs, tw, tt, left=0.0, right=0.0)
+        f0 = 3631e-23 * C_AA / l_obs ** 2
+        return -2.5 * np.log10(np.trapezoid(obs * T * l_obs, l_obs) / np.trapezoid(f0 * T * l_obs, l_obs))
+
+    def test_s1_node_equals_an_independent_integral(self):
+        """S1: at C3K nodes the table equals an independently coded AB integral
+        to < 0.3 mmag, at z = 0 and z = 0.1 (the two routes integrate on
+        different grids -- library vs curve -- which costs ~0.1 mmag in u for
+        cool stars; a zero-point or normalisation error would be >> 1 mmag)."""
+        lg, lt, f = self.lib.grid(-1.0)
+        lam = np.asarray(self.lib.wave, float)
+        i0 = list(self.grid.feh_grid).index(-1.0)
+        for ig, it in ((10, 30), (6, 20), (12, 55), (4, 15)):
+            for iz, z in ((0, 0.0), (2, 0.1)):
+                for b, band in enumerate(self.grid.bands):
+                    want = self._direct(lam, f[ig, it], band, z)
+                    self.assertLess(abs(float(self.grid.c3k[i0, ig, it, iz, b]) - want), 3e-4,
+                                    (ig, it, z, band))
+
+    def test_s2_redshift_part_is_band_offset(self):
+        """S2: M(z) - M(0) at a node is `band_offset` of the node's spectrum."""
+        lg, lt, f = self.lib.grid(0.0)
+        lam = np.asarray(self.lib.wave, float)
+        for ig, it in ((10, 30), (6, 20)):
+            got, _ = self.grid.interpolate(lt[it], lg[ig], 0.0, 0.05, quantity='offset')
+            for b, band in enumerate(self.grid.bands):
+                want = band_offset(lam, f[ig, it], *self.fs.get_trans(band), redshift=0.05,
+                                   flux_unit='f_nu')
+                self.assertLess(abs(got[0, b] - want), 1e-5, band)
+
+    def test_s3_blackbody_is_analytic(self):
+        """S3: the blackbody backend is a 1 L_sun blackbody, L_lam = L pi B /
+        (sigma T^4), on a grid wide enough for the Planck integral."""
+        from artpop.kcorrect import L_SUN, FOUR_PI_D10_SQ, SIGMA_SB, C_AA
+        for T in (40000.0, 2.0e5):
+            lt = np.log10(T)
+            got, info = self.grid.interpolate(lt, 6.0, -1.0, 0.0)
+            self.assertEqual(info['source'][0], SOURCE_BB)
+            for b, band in enumerate(self.grid.bands):
+                tw, tt = self.fs.get_trans(band)
+                L = np.pi * planck_lam(tw, T) * 1e-8 / (SIGMA_SB * T ** 4) * L_SUN / FOUR_PI_D10_SQ
+                f0 = 3631e-23 * C_AA / tw ** 2
+                want = -2.5 * np.log10(np.trapezoid(L * tt * tw, tw) / np.trapezoid(f0 * tt * tw, tw))
+                # T is between blackbody nodes: cubic in log T on a 0.05 dex mesh
+                self.assertLess(abs(got[0, b] - want), 2e-3, (T, band))
+
+    def test_s4_cubic_beats_linear_on_held_out_nodes(self):
+        """S4: drop every other log Teff node, interpolate the dropped ones:
+        cubic is better than linear in every band, and its 95th-percentile error
+        at TWICE the native spacing (4000-10000 K, log g 1-5, [Fe/H] = -1) is
+        < 40 mmag in u and < 15 in g..y (measured 31, 13, 5, 6, 6, 6). For a
+        fourth-order scheme the error at the native spacing is ~1/16 of that."""
+        import copy
+        g = self.grid
+        h = copy.copy(g)
+        h.c3k_logt = g.c3k_logt[::2]
+        h.c3k, h.c3k_rest, h.c3k_bbfill = g.c3k[:, :, ::2], g.c3k_rest[:, :, ::2], g.c3k_bbfill[:, :, ::2]
+        T = 10 ** g.c3k_logt
+        it = np.flatnonzero((np.arange(T.size) % 2 == 1) & (T > 4000) & (T < 10000))
+        ig = np.flatnonzero((g.c3k_logg >= 1) & (g.c3k_logg <= 5))
+        i0 = list(g.feh_grid).index(-1.0)
+        tt, gg = np.meshgrid(it, ig, indexing='ij')
+        tt, gg = tt.ravel(), gg.ravel()
+        keep = ~g.c3k_bbfill[i0, gg, tt]
+        tt, gg = tt[keep], gg[keep]
+        truth = g.c3k_rest[i0, gg, tt].astype(float)
+        cub, info_c = h.interpolate(g.c3k_logt[tt], g.c3k_logg[gg], -1.0, 0.0, quantity='rest')
+        lin, _ = h.interpolate(g.c3k_logt[tt], g.c3k_logg[gg], -1.0, 0.0, quantity='rest',
+                               method='linear')
+        ok = ~info_c['interp_linear']
+        e_c = np.nanpercentile(np.abs(cub - truth)[ok], 95, axis=0)
+        e_l = np.nanpercentile(np.abs(lin - truth)[ok], 95, axis=0)
+        self.assertTrue(np.all(e_c < e_l), (e_c, e_l))
+        self.assertTrue(np.all(e_c < np.array([0.040, 0.015, 0.015, 0.015, 0.015, 0.015])), e_c)
+
+    def test_s5_cache_key_follows_the_curves_and_convention(self):
+        """S5: changing one number in one curve file, or the bolometric
+        convention, changes the cache key -- a table can never be served for
+        passbands it was not integrated through."""
+        import shutil
+        from artpop.kcorrect import photometry_curve_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copytree(os.path.join(photometry_curve_dir('LSST'), 'LSST'), os.path.join(tmp, 'LSST'))
+            k0 = KCorrectionGrid.cache_key('LSST', curve_dir=tmp)
+            self.assertEqual(k0, KCorrectionGrid.cache_key('LSST'))
+            path = os.path.join(tmp, 'LSST', 'LSST_u.csv')
+            lines = open(path).read().splitlines()
+            w, t = lines[200].split(',')
+            lines[200] = f'{w},{float(t) * 1.001!r}'
+            open(path, 'w').write('\n'.join(lines) + '\n')
+            self.assertNotEqual(k0, KCorrectionGrid.cache_key('LSST', curve_dir=tmp))
+        self.assertNotEqual(KCorrectionGrid.cache_key('LSST'),
+                            KCorrectionGrid.cache_key('LSST', bolometric='spectrum'))
+
+    def test_s6_meta_states_the_assumptions(self):
+        """S6: the table names its library, curves (sha1 per file, provenance),
+        bolometric convention and L_sun."""
+        m = self.grid.meta
+        self.assertIn('C3K', m['library']['c3k'])
+        self.assertEqual(set(m['curves']['sha1']), set(FILTERS))
+        self.assertIn('standard_passband', m['curves']['provenance'])
+        from artpop.kcorrect import DEFAULT_BOLOMETRIC
+        self.assertEqual(m['bolometric'], 'spectrum')      # as this class builds it
+        self.assertEqual(DEFAULT_BOLOMETRIC, 'teff')
+        self.assertEqual(m['l_sun_erg_s'], 3.828e33)
+
+    def test_s7_lsst_photometry_uses_dp2_passbands(self):
+        """S7: LSST synthetic photometry integrates through DP2's
+        ``standard_passband`` (``passbands/LSST``); the inherited syseng v1.1
+        curves that feed the imager stay selectable with ``curve_dir``, and
+        name a different table."""
+        from artpop.kcorrect import photometry_curve_dir
+        from artpop.filters import filter_curve_dir
+        root = photometry_curve_dir('LSST')
+        self.assertEqual(os.path.basename(root.rstrip(os.sep)), 'passbands')
+        self.assertIn('fgcmcal', open(os.path.join(root, 'LSST', 'PROVENANCE.md')).read())
+        self.assertNotEqual(KCorrectionGrid.cache_key('LSST'),
+                            KCorrectionGrid.cache_key('LSST', curve_dir=filter_curve_dir()))
+        self.assertEqual(photometry_curve_dir('Roman'), filter_curve_dir())
+
+
+_HAVE_MARCS = __import__('artpop.kcorrect', fromlist=['MARCSLibrary']).MARCSLibrary().available
+
+
+@skipUnless(_HAVE_C3K and _HAVE_MARCS, 'C3K or MARCS not staged')
+class TestMARCSCoolGiants(TestCase):
+    """
+    Tier M (2026-10-07): the MARCS spherical patch for M giants. Full MARCS at
+    Teff <= 3900 K and log g <= 3.0, cos^2 handover to C3K by 4250 K / 3.5.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from artpop.kcorrect import MARCSLibrary
+        cls.grid = KCorrectionGrid.build('LSST', z_grid=np.array([0.0, 0.05]))
+        cls.c3k_only = KCorrectionGrid.build('LSST', z_grid=np.array([0.0, 0.05]),
+                                             cool_giants=None)
+        cls.lib = MARCSLibrary()
+        cls.fs = load_filter_system('LSST', curve_dir=photometry_curve_dir('LSST'))
+
+    def test_m1_marcs_node_is_the_marcs_integral(self):
+        """M1: at a MARCS node inside the full-MARCS zone the table returns the
+        MARCS model's own AB magnitude (sigma T^4, surface flux), to < 0.3 mmag,
+        computed independently on the filter curve with np.trapezoid."""
+        from artpop.kcorrect import L_SUN, FOUR_PI_D10_SQ, SIGMA_SB, C_AA
+        lg, lt, f = self.lib.grid(0.0)
+        lam = np.asarray(self.lib.wave, float)
+        for ig, it in ((3, 10), (2, 6), (5, 13)):          # (1.0, 3500), (0.5, 3100), (2.0, 3800)
+            T = 10 ** lt[it]
+            got, info = self.grid.interpolate(lt[it], lg[ig], 0.0, 0.0)
+            self.assertEqual(info['source'][0], 3)
+            L = f[ig, it] / (SIGMA_SB * T ** 4) * L_SUN / FOUR_PI_D10_SQ
+            for b, band in enumerate(self.grid.bands):
+                tw, tt = self.fs.get_trans(band)
+                Tl = np.interp(lam, tw, tt, left=0.0, right=0.0)
+                f0 = 3631e-23 * C_AA / lam ** 2
+                want = -2.5 * np.log10(np.trapezoid(L * Tl * lam, lam) / np.trapezoid(f0 * Tl * lam, lam))
+                self.assertLess(abs(got[0, b] - want), 3e-4, (ig, it, band))
+
+    def test_m2_weight_and_handover(self):
+        """M2: weight 1 at and below 3900 K, exactly 0 from 4250 K and above
+        log g 3.5; values equal C3K-alone where the weight is 0 and change
+        continuously across the handover."""
+        T = np.array([3500, 3900, 4000, 4100, 4249, 4250, 4400, 6000.])
+        v, info = self.grid.interpolate(np.log10(T), 1.5, -0.5, 0.0)
+        v0, _ = self.c3k_only.interpolate(np.log10(T), 1.5, -0.5, 0.0)
+        w = info['marcs_weight']
+        self.assertEqual(list(w[:2]), [1.0, 1.0])
+        self.assertTrue(np.all(w[5:] == 0.0))
+        np.testing.assert_array_equal(v[5:], v0[5:])
+        _, info_d = self.grid.interpolate(np.log10(3500.0), 4.6, -0.5, 0.0)
+        self.assertEqual(info_d['marcs_weight'][0], 0.0)        # dwarfs stay C3K
+        Tf = np.linspace(3850, 4300, 91)
+        vf, _ = self.grid.interpolate(np.log10(Tf), 1.5, -0.5, 0.0)
+        self.assertLess(float(np.max(np.abs(np.diff(vf, axis=0)))), 0.05)
+
+    def test_m3_holes_fall_back_and_are_flagged(self):
+        """M3: where MARCS has no model even after the [Fe/H] fill (log g -0.5
+        at [Fe/H] -1), the row is served by C3K and flagged, never extrapolated."""
+        v, info = self.grid.interpolate(np.log10(3300.0), -0.4, -1.0, 0.0)
+        v0, _ = self.c3k_only.interpolate(np.log10(3300.0), -0.4, -1.0, 0.0)
+        self.assertTrue(info['marcs_hole'][0])
+        self.assertEqual(info['marcs_weight'][0], 0.0)
+        np.testing.assert_array_equal(v, v0)
+
+    def test_m4_marcs_conserves_flux_and_is_recorded(self):
+        """M4: staged MARCS models integrate to sigma T^4 within 1 %; the table
+        names the patch and the cache key separates it from C3K alone."""
+        lg, lt, f = self.lib.grid(-1.0)
+        lam = np.asarray(self.lib.wave, float)
+        ok = np.isfinite(f[..., 0])
+        ratio = np.trapezoid(f[ok], lam, axis=-1) / (5.670374419e-5 * (10 ** np.broadcast_to(lt, ok.shape)[ok]) ** 4)
+        self.assertLess(float(np.max(np.abs(ratio - 1))), 0.01)
+        self.assertIn('MARCS', self.grid.meta['library']['cool_giants'])
+        self.assertIsNone(self.c3k_only.meta['library']['cool_giants'])
+        self.assertNotEqual(KCorrectionGrid.cache_key('LSST'),
+                            KCorrectionGrid.cache_key('LSST', cool_giants=None))
