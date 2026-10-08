@@ -798,3 +798,97 @@ class TestContinuumMIST(TestCase):
             d = np.asarray(on.mag_table[f]) - np.asarray(off.mag_table[f])
             self.assertTrue(np.all(d[hot] < 0), f)
             self.assertTrue(np.all(d[~hot] == 0), f)
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-08: lines the distributed MAPPINGS list leaves out
+# ---------------------------------------------------------------------------
+_HAVE_HI = os.path.isfile(neb.default_hi_line_table_path())
+
+
+@skipUnless(_HAVE_TABLE, 'MAPPINGS table not built (tools/build_nebular_grid.py)')
+class TestDerivedDoublets(TestCase):
+
+    def test_ml1_weak_doublet_members_at_their_atomic_ratio(self):
+        """ML1: [O III] 4959 and [N II] 6548 are in the table at 5007/2.984 and
+        6583/2.942 -- at the nodes, between them, below the grid and at other
+        U and P -- with vacuum wavelengths, and the header says they are derived."""
+        t = MappingsLineTable()
+        self.assertEqual(set(t.meta['derived_lines']), {'OIII4959', 'NII6548'})
+        for oh, lu, lp in ((t.axes[0][4], -3.0, 6.2), (7.91, -2.6, 7.3),
+                           (8.43, -3.7, 5.0), (6.8, -3.0, 6.2)):
+            names, lam, r = t.ratios(oh, lu, lp)
+            i = names.index
+            np.testing.assert_allclose(r[i('OIII5007')] / r[i('OIII4959')], 2.984, rtol=2e-6)
+            np.testing.assert_allclose(r[i('NII6583')] / r[i('NII6548')], 2.942, rtol=2e-6)
+        self.assertAlmostEqual(lam[i('OIII4959')], 4960.29, delta=0.05)
+        self.assertAlmostEqual(lam[i('NII6548')], 6549.86, delta=0.05)
+
+
+@skipUnless(_HAVE_HI and _HAVE_TABLE, 'H I line table not built (tools/build_hi_recombination_lines.py)')
+class TestHILines(TestCase):
+
+    def test_hi1_table_case_b_values_and_no_overlap(self):
+        """HI1: case-B ratios at 10^4 K (Storey & Hummer 1995: Hepsilon 0.160,
+        H8 0.105, H9 0.073), Rydberg vacuum wavelengths, each series falling with
+        n, T outside the nodes raises, and no line duplicates a MAPPINGS one;
+        MAPPINGS' own Hdelta joins the case-B series."""
+        h = neb.HILineTable()
+        names, lam, r = h.ratios(1.0e4)
+        i = names.index
+        for nm, want in (('H7', 0.1598), ('H8', 0.1055), ('H9', 0.0734)):
+            self.assertAlmostEqual(r[i(nm)], want, delta=0.001)
+        self.assertAlmostEqual(lam[i('H7')], 3971.2, delta=0.1)       # Hepsilon, vacuum
+        self.assertAlmostEqual(lam[i('Pa8')], 9548.6, delta=0.1)
+        for s in ('H', 'Pa', 'Br'):          # (SH95 via PyNeb has a 1 % Br29 < Br30 blip at 3e-4 Hbeta)
+            k = [j for j, n in enumerate(names) if n[:len(s)] == s and n[len(s):].isdigit()
+                 and int(n[len(s):]) <= 25]
+            self.assertTrue(np.all(np.diff(r[k]) < 0), s)
+        with self.assertRaises(ValueError):
+            h.ratios(4000.0)
+        t = MappingsLineTable()
+        self.assertFalse(set(names) & set(t.names))
+        # no MAPPINGS H I line is repeated; the only near-coincidences are real
+        # blends with other species (H8 + He I 3889, H14 + [S III] 3722)
+        hi_m = [k for k, n in enumerate(t.names) if n[:2] in ('Ha', 'Hb', 'Hg', 'Hd', 'Pa', 'Br')]
+        self.assertGreater(np.min(np.abs(lam[:, None] - t.lambda_vac[hi_m][None, :])), 5.0)
+        a, b = np.where(np.abs(lam[:, None] - t.lambda_vac[None, :]) < 2.0)
+        self.assertEqual(sorted((names[x], t.names[y]) for x, y in zip(a, b)),
+                         [('H14', 'SIII3722'), ('H8', 'HeI3889')])
+        _, _, rm = t.ratios(8.2, -3.0, 6.2)
+        self.assertLess(abs(rm[t.names.index('Hdelta')] / 0.2589 - 1), 0.02)
+
+    def _run(self, **kw):
+        lt = np.log10([45e3, 35e3])
+        lg = np.array([4.0, 4.0])
+        mags = {b: np.zeros(2) for b in FILTERS}
+        cfg = NebularConfig(**dict(dict(knob=1.0, a_v_max=0.0, size_mode='stromgren',
+                                        continuum=False), **kw))
+        return apply_to_rows(cfg, mags, _lsst_curves(), 6.5, -1.0, lt, lg,
+                             np.array([5.3, 4.5]), redshift=0.02, a_v_host=0.2, a_v_mw=0.1)
+
+    @skipUnless(_HAVE_C3K, 'needs C3K')
+    def test_hi2_rows_gain_exactly_the_hi_lines(self):
+        """HI2: hi_lines adds, per row and band, exactly L(Hbeta) x the case-B
+        ratios through `line_band_abs_mags`, behind the same dust; linear in k;
+        on by default; nothing in r (no Balmer n >= 7 or Paschen n >= 8 there)."""
+        self.assertTrue(NebularConfig().hi_lines)
+        curves = _lsst_curves()
+        on, _, info = self._run()
+        off, _, info_off = self._run(hi_lines=False)
+        half, _, _ = self._run(knob=0.5)
+        half_off, _, _ = self._run(knob=0.5, hi_lines=False)
+        self.assertIn('H8', info['lines'])
+        self.assertNotIn('H8', info_off['lines'])
+        names, lam, r = neb.HILineTable.cached().ratios(1.0e4)
+        ext = extinction_curve('F99', 3.1)
+        lum = (HBETA_ERG_PER_ION * info['q_h'])[:, None] * r[None, :]
+        for band in FILTERS:
+            m = line_band_abs_mags(lum, lam, *curves[band], 0.02, 0.2, 0.1, ext)
+            want = np.where(np.isfinite(m), 10 ** (-0.4 * m), 0.0)
+            got = 10 ** (-0.4 * on[band]) - 10 ** (-0.4 * off[band])
+            np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-30, err_msg=band)
+            got_h = 10 ** (-0.4 * half[band]) - 10 ** (-0.4 * half_off[band])
+            np.testing.assert_allclose(got_h, 0.5 * got, rtol=1e-8, atol=1e-30, err_msg=band)
+        self.assertTrue(np.all(on['LSST_u'] < off['LSST_u']))
+        np.testing.assert_array_equal(on['LSST_r'], off['LSST_r'])

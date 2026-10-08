@@ -27,6 +27,11 @@ fraction of the star's ionizing photons the nebula captures (1 - f_esc):
    table of atomic coefficients per Hbeta (`NebularContinuumTable`), so it
    scales with the same ``k Q_H``, sits behind the same dust and goes where
    the line light goes (``NebularConfig.continuum``, on by default).
+   Two kinds of line the distributed MAPPINGS list leaves out are restored
+   (2026-10-08): the weak members of the fixed-ratio doublets [O III] 4959 and
+   [N II] 6548 (derived in the table from 5007 and 6583), and the high-order
+   H I recombination lines (Hepsilon, H8, ..., Pa8, ...) at their case-B
+   ratios (`HILineTable`, ``NebularConfig.hi_lines``, on by default).
 3. **Spatial blob.** In each band the fraction
    ``f_blob = (k F_star + F_lines) / (F_star + F_lines)`` of the star's light
    is spread by a unit-sum Gaussian of physical FWHM ``fwhm_pc`` (converted to
@@ -73,7 +78,8 @@ __all__ = ['NebularConfig', 'MappingsLineTable', 'row_spectra', 'ionizing_rate',
            'L_SUN', 'HBETA_ERG_PER_ION', 'LYMAN_EDGE_AA',
            'stromgren_diameter_pc', 'sphere_kernel', 'stromgren_classes',
            'NebularContinuumTable', 'continuum_band_abs_mags',
-           'default_continuum_table_path']
+           'default_continuum_table_path', 'HILineTable',
+           'default_hi_line_table_path']
 
 # its own channel, like `ArtPop Logger.dust`, so pipeline log muting of the
 # parent logger does not hide an O/H extrapolation or clip
@@ -98,6 +104,13 @@ def default_line_table_path():
     """The converted MAPPINGS grid shipped in ``artpop/data/nebular/``."""
     return os.path.join(os.path.dirname(__file__), 'data', 'nebular',
                         'mappings51_hii_lines.ecsv')
+
+
+def default_hi_line_table_path():
+    """The case-B high-order H I line table (PyNeb, Storey & Hummer 1995) shipped
+    in ``artpop/data/nebular/``; built by ``tools/build_hi_recombination_lines.py``."""
+    return os.path.join(os.path.dirname(__file__), 'data', 'nebular',
+                        'hi_recombination_lines.ecsv')
 
 
 def default_continuum_table_path():
@@ -181,6 +194,15 @@ class NebularConfig:
         most of Q_H).
     continuum_table : str or None
         Override path of the continuum table.
+    hi_lines : bool
+        Add the high-order H I recombination lines the MAPPINGS list omits
+        (Balmer n >= 7 -- Hepsilon, H8, ... --, Paschen and Brackett n >= 8,
+        Pfund below 3 um; up to n = 40) at their case-B ratios to Hbeta at
+        ``t_e_k`` (2026-10-08, user). Like the continuum they are fixed atomic
+        physics per captured photon and follow k exactly. Default True; False
+        reproduces the MAPPINGS-only line list.
+    hi_line_table : str or None
+        Override path of the H I line table.
     """
     knob: float = 0.0
     a_v_max: float = 1.5
@@ -201,6 +223,8 @@ class NebularConfig:
     t_e_k: float = 1.0e4
     he1_h: float = 0.08
     continuum_table: str = None
+    hi_lines: bool = True
+    hi_line_table: str = None
 
     def __post_init__(self):
         k = float(self.knob)
@@ -307,6 +331,13 @@ class MappingsLineTable:
     It stops at ``OH_EXTRAPOLATION_FLOOR`` (6.5, below any star-forming galaxy
     known and the prior's lowest young O/H, 6.60) and **raises** below it.
     Above the top node (9.30) the edge value is used, with a warning.
+
+    **Derived columns** (2026-10-08): the distributed list carries only the
+    strong member of [O III] 4959/5007 and [N II] 6548/6583; the table adds
+    ``OIII4959 = OIII5007 / 2.984`` and ``NII6548 = NII6583 / 2.942`` (same
+    upper level, so T- and n-independent; header ``derived_lines``). A
+    constant factor shifts log(ratio) by a constant, so every interpolation and
+    extrapolation above keeps the doublet ratio exact.
     """
 
     _AXES = ('oh', 'log_u', 'log_p')
@@ -686,6 +717,61 @@ class NebularContinuumTable:
         return self.lambda_vac, interp(self.h) + float(he1_h) * interp(self.he1)
 
 
+class HILineTable:
+    """
+    High-order H I recombination lines relative to Hbeta, case B.
+
+    The MAPPINGS list NebulaBayes distributes stops at Hdelta, Padelta and
+    Brgamma (Thomas et al. 2018 drop higher-order recombination lines as hard
+    to predict without a full cascade solution). For hydrogen that solution is
+    Storey & Hummer (1995), via PyNeb (``tools/build_hi_recombination_lines.py``):
+    Balmer n_u >= 7, Paschen and Brackett n_u >= 8 and the Pfund lines below
+    3 um, up to n_u = 40, on the continuum table's temperature nodes at
+    n_e = 100 cm^-3. ``ratios`` interpolates ``log r`` linearly in ``log T``
+    and **raises** outside the nodes. Per captured photon these are fixed
+    numbers, so ``L(line) = L(Hbeta) r(T_e)``, scaled by k like every line.
+    """
+
+    def __init__(self, path=None):
+        from astropy.table import Table
+        self.path = path or default_hi_line_table_path()
+        if not os.path.isfile(self.path):
+            raise FileNotFoundError(
+                f'H I line table not found at {self.path}; build it with '
+                'tools/build_hi_recombination_lines.py')
+        t = Table.read(self.path, format='ascii.ecsv')
+        self.meta = dict(t.meta)
+        self.names = [str(n) for n in t['name']]
+        self.lambda_vac = np.asarray(t['lambda_vac'], dtype=float)
+        self.t_nodes = np.asarray(self.meta['t_nodes_k'], dtype=float)
+        self.r = np.stack([np.asarray(t[f'r_{int(x)}'], dtype=float)
+                           for x in self.t_nodes])          # (n_T, n_line)
+        if not (self.r > 0).all():
+            raise ValueError(f'{self.path}: non-positive ratios')
+
+    _cache = OrderedDict()
+
+    @classmethod
+    def cached(cls, path=None):
+        key = path or default_hi_line_table_path()
+        if key not in cls._cache:
+            cls._cache[key] = cls(key)
+        return cls._cache[key]
+
+    def ratios(self, t_e_k=1.0e4):
+        """``(names, lambda_vac, ratio_to_Hbeta)`` at electron temperature ``t_e_k``."""
+        t = float(t_e_k)
+        lo, hi = self.t_nodes[0], self.t_nodes[-1]
+        if not lo <= t <= hi:
+            raise ValueError(f't_e_k = {t:g} K is outside the H I line table '
+                             f'({lo:g}-{hi:g} K)')
+        lt = np.log(self.t_nodes)
+        j = int(np.clip(np.searchsorted(lt, np.log(t)) - 1, 0, lt.size - 2))
+        w = (np.log(t) - lt[j]) / (lt[j + 1] - lt[j])
+        r = np.exp((1.0 - w) * np.log(self.r[j]) + w * np.log(self.r[j + 1]))
+        return list(self.names), self.lambda_vac.copy(), r
+
+
 def continuum_band_abs_mags(hbeta_lum, lambda_vac, c_per_aa, trans_wave, trans,
                             redshift=0.0, a_v_host=0.0, a_v_mw=0.0, ext=None,
                             quad_weights=None):
@@ -791,6 +877,16 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
     keep = (lam_vac >= cfg.lambda_min_aa) & (lam_vac <= cfg.lambda_max_aa)
     names = [nm for nm, kp in zip(names, keep) if kp]
     lam_vac, ratio = lam_vac[keep], ratio[keep]
+    if cfg.hi_lines:
+        # high-order H I lines (case B at t_e_k), which the MAPPINGS list omits
+        h_names, h_lam, h_ratio = HILineTable.cached(cfg.hi_line_table).ratios(cfg.t_e_k)
+        h_keep = (h_lam >= cfg.lambda_min_aa) & (h_lam <= cfg.lambda_max_aa)
+        dup = set(names) & {n for n, kp in zip(h_names, h_keep) if kp}
+        if dup:
+            raise ValueError(f'H I lines {sorted(dup)} are also in the MAPPINGS table')
+        names = names + [n for n, kp in zip(h_names, h_keep) if kp]
+        lam_vac = np.concatenate([lam_vac, h_lam[h_keep]])
+        ratio = np.concatenate([ratio, h_ratio[h_keep]])
     info.update(oh=oh, oh_used=float(min(oh, table.axes[0][-1])),
                 oh_extrapolated=bool(oh < table.axes[0][0]),
                 log_u=cfg.log_u, log_p=cfg.log_p, lines=names)

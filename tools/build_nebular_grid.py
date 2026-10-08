@@ -18,6 +18,25 @@ far-UV lines no rendered band can reach are dropped) into
 wavelengths and the provenance in the header. Values are copied, not
 resampled: the float32 grid round-trips exactly.
 
+**Derived companions (2026-10-08).** The NebulaBayes line list carries only the
+strong member of two fixed-ratio doublets: ``OIII5007`` (5006.8 A) without
+[O III] 4959 and ``NII6583`` (6583.5 A) without [N II] 6548. Both members of
+each pair come from the same upper level (1D2), so their ratio is the ratio of
+the transition probabilities times the photon energies -- independent of
+T_e, n_e and the model -- and MAPPINGS V computes both (Sutherland & Dopita
+2017 use the full CHIANTI 8 line list). Thomas et al. (2018, sec. 3.2) keep
+every line above 1 % of Hbeta in some model, which 4959 and 6548 always pass,
+so their absence is a choice of the distributed list, not of the models; the
+paper does not state it. The grid's columns are the single lines: summed
+doublets are named with a suffix (``OII3726_29``, ``SII6716_31``), Linelist.csv
+gives 5006.8 and 6583.5 A, and the pairs the grid does list twice sit exactly at
+their atomic ratios ([O I] 6300/6364 = 3.13, [S III] 9531/9069 = 2.51,
+[Ne III] 3869/3967 = 3.32). This script therefore adds ``OIII4959 =
+OIII5007 / 2.984`` and ``NII6548 = NII6583 / 2.942`` (PyNeb 1.1.32 default
+atomic data: O III Froese Fischer & Tachiev 2004 / Storey & Zeippen 2000,
+N II Froese Fischer & Tachiev 2004; the same at every T_e and n_e), listed in
+the header under ``derived_lines``.
+
 ``--check`` rebuilds the table in memory from the source and compares it to
 the file, writing nothing.
 
@@ -45,6 +64,15 @@ sys.path.insert(0, os.path.join(_ROOT, 'src'))
 from artpop.nebular import MappingsLineTable, default_line_table_path  # noqa: E402
 
 _AXES = {'12 + log O/H': 'oh', 'log U': 'log_u', 'log P/k': 'log_p'}
+
+# the weak member of a fixed-ratio doublet the source list leaves out:
+# name -> (parent column, strong/weak intensity ratio, air wavelength [A], source)
+DERIVED = {
+    'OIII4959': ('OIII5007', 2.984, 4958.911,
+                 '[O III] 1D2: A-values FFT04/SZ00 via PyNeb 1.1.32 (T- and n-independent)'),
+    'NII6548': ('NII6583', 2.942, 6548.050,
+                '[N II] 1D2: A-values FFT04 via PyNeb 1.1.32 (T- and n-independent)'),
+}
 
 
 def _source_dir(arg):
@@ -106,6 +134,17 @@ def build(src, lam_min, lam_max):
         if bad.any():
             n_nan[c] = int(bad.sum())
         out[c] = np.where(bad, np.float32(0.0), v)
+    derived = {}
+    for name, (parent, ratio, lam, why) in DERIVED.items():
+        if name in grid.colnames:
+            raise SystemExit(f'{src}: the grid already has {name}; drop it from DERIVED')
+        if parent not in out.colnames:
+            continue                                   # parent outside the wavelength cut
+        if lam_min <= lam <= lam_max:
+            out[name] = (np.asarray(out[parent], dtype=np.float64) / ratio).astype(np.float32)
+            lam_air[name] = lam
+            lines.append(name)
+            derived[name] = {'parent': parent, 'parent_over_this': ratio, 'source': why}
     out.meta = {
         'description': 'MAPPINGS V HII-region line fluxes relative to Hbeta, '
                        'converted for artpop.nebular',
@@ -122,6 +161,7 @@ def build(src, lam_min, lam_max):
         'below_print_threshold': 'NaN in the source (a line under MAPPINGS\' '
                                  '1e-5 Hbeta print threshold) stored as 0',
         'n_nan_set_to_zero': n_nan,
+        'derived_lines': derived,
     }
     return out
 
