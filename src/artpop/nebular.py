@@ -79,7 +79,10 @@ __all__ = ['NebularConfig', 'MappingsLineTable', 'row_spectra', 'ionizing_rate',
            'stromgren_diameter_pc', 'sphere_kernel', 'stromgren_classes',
            'NebularContinuumTable', 'continuum_band_abs_mags',
            'default_continuum_table_path', 'HILineTable',
-           'default_hi_line_table_path']
+           'default_hi_line_table_path', 'GAS_DENSITY_MODES',
+           'gas_log_p', 'stromgren_radius_pc', 'ionization_parameter',
+           'gas_state', 'q_h_per_msun', 'birth_cloud_a_v_from_gas', 'AV_PER_NH_SOLAR',
+           'dig_band_abs_mags_per_photon']
 
 # its own channel, like `ArtPop Logger.dust`, so pipeline log muting of the
 # parent logger does not hide an O/H extrapolation or clip
@@ -203,6 +206,60 @@ class NebularConfig:
         reproduces the MAPPINGS-only line list.
     hi_line_table : str or None
         Override path of the H I line table.
+    gas_density : str
+        How the gas density behind the three density-dependent pieces -- the
+        Stromgren size, the ionization parameter U and the MAPPINGS pressure
+        P/k -- is set (2026-10-15, user: "make those self-consistent").
+        ``'independent'`` (default, the pre-2026-10-15 model): ``n_e_cm3`` sizes
+        the spheres, ``log_u`` and ``log_p`` are used as given -- three
+        different densities (n_e = 1 for the sizes; P/k = 10^6.2 K cm^-3 is
+        n_H ~ 75 at 10^4 K; and a fixed U, which at any one Q_H is a third).
+        ``'consistent'``: one hydrogen density ``n_h_cm3`` and one volume
+        filling factor ``filling_factor`` set all three. ``log_p`` is then
+        ``log10[2 (1 + he1_h) n_H t_e_k]`` (H+ and He+ ions and their
+        electrons), the Stromgren radius is
+        ``R = (3 Q / (4 pi n_e n_H alpha_B eps))^(1/3)`` with
+        ``n_e = (1 + he1_h) n_H``, and ``log_u`` is ``Q / (4 pi R^2 n_H c)`` at
+        that radius for a source of ``source_q_h`` captured photons per second
+        (the clusters that power the nebulae; ALVISS derives it). The given
+        ``log_u``, ``log_p`` and ``n_e_cm3`` are overwritten (``log_u`` is
+        clipped to the MAPPINGS grid, -4 to -2; ``log_u_unclipped`` keeps the
+        value before the clip).
+    n_h_cm3 : float
+        Hydrogen number density inside the ionized gas (cm^-3) for
+        ``'consistent'``. Default 10.
+    filling_factor : float
+        Volume filling factor eps of the ionized gas inside the Stromgren
+        sphere, ``'consistent'`` only. Default 0.22, the PHANGS-MUSE median
+        (Barnes et al. 2026, A&A 706, A95). eps < 1 widens the sphere
+        (``eps^(-1/3)``) and lowers U (``eps^(2/3)``) at fixed density.
+    source_q_h : float or None
+        Captured ionizing photons per second of the source that powers a
+        typical nebula, ``'consistent'`` only; sets ``log_u``. Required in that
+        mode (no default: it is a property of the young population's
+        clustering, so the caller supplies it).
+    dig_absorbed : float
+        Diffuse ionized gas (2026-10-15, user): of the photons the HII regions
+        do not capture, ``1 - knob``, the fraction absorbed in the galaxy's
+        diffuse gas (``1 - f_esc,gal``). 0 (default) is off and leaves
+        everything bit-identical. The DIG's lines and nebular continuum are an
+        SSP-level smooth light (``integrated_dig_abs_mags``) that a source puts
+        on the galaxy's Sersic profile -- the DIG extends ~10x beyond the HII
+        regions -- behind the host and Milky Way dust only (no birth cloud).
+    dig_log_u, dig_log_p : float
+        The DIG's MAPPINGS gas state: log U -3.7 (diffuse gas sits at log U
+        -4 to -3.5) and log P/k 4.2, the grid's floor (real DIG, n_e ~ 0.1,
+        is ~10^3.3, in the low-density limit where the ratios barely move).
+    lyc_efficiency : float
+        Fraction of each row's ionizing photons that ionize gas (2026-10-15,
+        user: "we are systematically over estimating the amount of Halpha").
+        It multiplies Q_H before anything else, so the HII lines, the DIG, the
+        Stromgren sizes, U and the gas-tied dust all see the same photons.
+        Physically: dust inside the nebula absorbs Lyman-continuum photons
+        (Inoue 2001: ~0.3-0.5 of them in Galactic HII regions), plus the
+        ionizing-output systematics of the stellar models (the > 50 kK
+        blackbody rows of low-metallicity MIST stars). 1 (default) is the
+        pre-feature model.
     """
     knob: float = 0.0
     a_v_max: float = 1.5
@@ -225,6 +282,15 @@ class NebularConfig:
     continuum_table: str = None
     hi_lines: bool = True
     hi_line_table: str = None
+    gas_density: str = 'independent'
+    n_h_cm3: float = 10.0
+    filling_factor: float = 0.22
+    source_q_h: float = None
+    log_u_unclipped: float = None
+    dig_absorbed: float = 0.0
+    dig_log_u: float = -3.7
+    dig_log_p: float = 4.2
+    lyc_efficiency: float = 1.0
 
     def __post_init__(self):
         k = float(self.knob)
@@ -248,6 +314,51 @@ class NebularConfig:
             raise ValueError(f't_e_k must be > 0, got {self.t_e_k}')
         if self.he1_h < 0:
             raise ValueError(f'he1_h must be >= 0, got {self.he1_h}')
+        if self.gas_density not in GAS_DENSITY_MODES:
+            raise ValueError(f'gas_density must be one of {GAS_DENSITY_MODES}, '
+                             f'got {self.gas_density!r}')
+        if not 0.0 < float(self.lyc_efficiency) <= 1.0:
+            raise ValueError(f'lyc_efficiency must be in (0, 1], got {self.lyc_efficiency}')
+        if not 0.0 <= float(self.dig_absorbed) <= 1.0:
+            raise ValueError(f'dig_absorbed must be in [0, 1], got {self.dig_absorbed}')
+        if not LOG_U_GRID[0] <= float(self.dig_log_u) <= LOG_U_GRID[1]:
+            raise ValueError(f'dig_log_u {self.dig_log_u} is off the MAPPINGS grid {LOG_U_GRID}')
+        if not LOG_P_GRID[0] <= float(self.dig_log_p) <= LOG_P_GRID[1]:
+            raise ValueError(f'dig_log_p {self.dig_log_p} is off the MAPPINGS grid {LOG_P_GRID}')
+        if self.gas_density == 'consistent':
+            if not float(self.n_h_cm3) > 0:
+                raise ValueError(f'n_h_cm3 must be > 0, got {self.n_h_cm3}')
+            if not 0.0 < float(self.filling_factor) <= 1.0:
+                raise ValueError(f'filling_factor must be in (0, 1], got {self.filling_factor}')
+            if self.source_q_h is None or not float(self.source_q_h) > 0:
+                raise ValueError("gas_density='consistent' needs source_q_h > 0: the captured "
+                                 "ionizing photons/s of the source that powers a typical nebula "
+                                 "(ALVISS derives it from the young clusters)")
+            # one density -> P/k, U and the sizes; the frozen fields are the record
+            state = gas_state(self.source_q_h, self.n_h_cm3, self.filling_factor,
+                              self.t_e_k, self.he1_h)
+            object.__setattr__(self, 'log_p', state['log_p'])
+            object.__setattr__(self, 'log_u', state['log_u'])
+            object.__setattr__(self, 'log_u_unclipped', state['log_u_unclipped'])
+            object.__setattr__(self, 'n_e_cm3', state['n_e_cm3'])
+
+    @property
+    def consistent(self):
+        """One gas density behind the sizes, U and P/k (``gas_density='consistent'``)."""
+        return self.gas_density == 'consistent'
+
+    def stromgren_diameter_pc(self, q_h):
+        """Stromgren diameter (pc) of a nebula capturing ``q_h`` photons/s, in this
+        config's gas: ``n_e_cm3`` alone (independent) or ``n_h_cm3``, ``he1_h`` and
+        ``filling_factor`` (consistent)."""
+        if self.consistent:
+            return 2.0 * stromgren_radius_pc(q_h, self.n_h_cm3, self.filling_factor, self.he1_h)
+        return stromgren_diameter_pc(q_h, self.n_e_cm3)
+
+    def with_source_q_h(self, q_h):
+        """A copy whose consistent gas state is set by sources of ``q_h`` photons/s."""
+        from dataclasses import replace
+        return replace(self, gas_density='consistent', source_q_h=float(q_h))
 
     @property
     def decoupled(self):
@@ -255,10 +366,16 @@ class NebularConfig:
         return self.birth_cloud_a_v is not None
 
     @property
+    def dig(self):
+        """Diffuse ionized gas on: the uncaptured photons are absorbed in it."""
+        return float(self.dig_absorbed) > 0.0 and float(self.knob) < 1.0
+
+    @property
     def active(self):
-        """True when there are lines (knob > 0) or decoupled birth-cloud dust;
-        nothing is computed otherwise."""
-        return float(self.knob) > 0.0 or (self.decoupled and float(self.birth_cloud_a_v) > 0.0)
+        """True when there are lines (knob > 0), decoupled birth-cloud dust or
+        diffuse ionized gas; nothing is computed otherwise."""
+        return (float(self.knob) > 0.0 or (self.decoupled and float(self.birth_cloud_a_v) > 0.0)
+                or self.dig)
 
     @property
     def a_v_bc(self):
@@ -845,14 +962,16 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
     -------
     new_mags : dict ``{band: array}``, the corrected columns (copies)
     blob_frac : dict ``{band: array}``, per row, 0 outside the OB rows
-    info : dict, per-row ``q_h`` (captured photons / s), ``source``, the mask,
-        the gas state and line list used
+    info : dict, per-row ``q_h`` (captured photons / s) and ``q_h_raw`` (all
+        ionizing photons / s, before the knob), ``source``, the mask, the gas
+        state and line list used; with diffuse ionized gas also ``dig_m1``,
+        per band the absolute magnitude of the DIG light per absorbed photon/s
     """
     rows = young_row_mask(log_age, log_teff, cfg)
     n = rows.size
     new = {b: np.array(mags[b], dtype=float, copy=True) for b in mags}
     blob = {b: np.zeros(n) for b in mags}
-    info = dict(mask=rows, n_rows=int(rows.sum()), q_h=np.zeros(n),
+    info = dict(mask=rows, n_rows=int(rows.sum()), q_h=np.zeros(n), q_h_raw=np.zeros(n),
                 source=np.full(n, -1, dtype=np.int8), a_v_bc=cfg.a_v_bc,
                 knob=float(cfg.knob))
     if not rows.any():
@@ -889,7 +1008,11 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
         ratio = np.concatenate([ratio, h_ratio[h_keep]])
     info.update(oh=oh, oh_used=float(min(oh, table.axes[0][-1])),
                 oh_extrapolated=bool(oh < table.axes[0][0]),
-                log_u=cfg.log_u, log_p=cfg.log_p, lines=names)
+                log_u=cfg.log_u, log_p=cfg.log_p, lines=names,
+                gas_density=cfg.gas_density)
+    if cfg.consistent:
+        info.update(n_h_cm3=float(cfg.n_h_cm3), filling_factor=float(cfg.filling_factor),
+                    source_q_h=float(cfg.source_q_h), log_u_unclipped=cfg.log_u_unclipped)
 
     z = float(redshift)
     # nebular continuum: L_lambda = L(Hbeta) c(lambda), so per band one number
@@ -905,10 +1028,19 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
         info.update(continuum=True, t_e_k=float(cfg.t_e_k), he1_h=float(cfg.he1_h))
     else:
         info.update(continuum=False)
+    if cfg.dig:
+        info.update(dig_absorbed=float(cfg.dig_absorbed), dig_log_u=float(cfg.dig_log_u),
+                    dig_log_p=float(cfg.dig_log_p),
+                    dig_m1=dig_band_abs_mags_per_photon(
+                        cfg, curves, feh, z, a_v_host, a_v_mw, ext))
     for sub, lam, f in groups:
         r = idx_all[sub]
         q = ionizing_photons_per_erg(lam, f)                     # photons / erg
-        q_h = k * q * (10 ** np.asarray(log_l, dtype=float)[r]) * L_SUN * ob[r]
+        q_raw = q * (10 ** np.asarray(log_l, dtype=float)[r]) * L_SUN * ob[r]
+        if cfg.lyc_efficiency != 1.0:
+            q_raw = q_raw * float(cfg.lyc_efficiency)
+        info['q_h_raw'][r] = q_raw
+        q_h = k * q_raw
         info['q_h'][r] = q_h
         line_lum = (HBETA_ERG_PER_ION * q_h)[:, None] * ratio[None, :]
         qw = _trapz_weights(lam)
@@ -939,6 +1071,46 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
             cont_share = (k * ob[r]) if cfg.size_mode == 'fixed' else 0.0
             blob[band][r] = (cont_share * f_star + f_line) / tot
     return new, blob, info
+
+
+def dig_band_abs_mags_per_photon(cfg, curves, feh, redshift=0.0, a_v_host=0.0,
+                                 a_v_mw=0.0, ext=None):
+    """
+    Per band, the absolute AB magnitude of the diffuse ionized gas's light per
+    1 absorbed ionizing photon/s: case-B Hbeta (`HBETA_ERG_PER_ION`) times the
+    MAPPINGS ratios at (O/H, ``dig_log_u``, ``dig_log_p``), the H I lines, and
+    the nebular continuum, behind the host and Milky Way dust (no birth cloud:
+    the DIG lies outside the birth clouds), with the lines at (1+z) lambda.
+    """
+    if ext is None:
+        ext = extinction_curve('F99', 3.1)
+    table = MappingsLineTable.cached(cfg.line_table)
+    names, lam_vac, ratio = table.ratios(cfg.oh_solar + float(feh), cfg.dig_log_u,
+                                         cfg.dig_log_p)
+    keep = (lam_vac >= cfg.lambda_min_aa) & (lam_vac <= cfg.lambda_max_aa)
+    lam_vac, ratio = lam_vac[keep], ratio[keep]
+    if cfg.hi_lines:
+        _, h_lam, h_ratio = HILineTable.cached(cfg.hi_line_table).ratios(cfg.t_e_k)
+        h_keep = (h_lam >= cfg.lambda_min_aa) & (h_lam <= cfg.lambda_max_aa)
+        lam_vac = np.concatenate([lam_vac, h_lam[h_keep]])
+        ratio = np.concatenate([ratio, h_ratio[h_keep]])
+    line_lum = (HBETA_ERG_PER_ION * ratio)[None, :]
+    if cfg.continuum:
+        ctab = NebularContinuumTable.cached(cfg.continuum_table)
+        c_lam, c_val = ctab.spectrum(cfg.t_e_k, cfg.he1_h)
+    out = {}
+    z = float(redshift)
+    for band, (tw, tt) in curves.items():
+        m_line = float(line_band_abs_mags(line_lum, lam_vac, tw, tt, z, float(a_v_host),
+                                          a_v_mw, ext)[0])
+        f = 10 ** (-0.4 * m_line) if np.isfinite(m_line) else 0.0
+        if cfg.continuum:
+            m_c = float(continuum_band_abs_mags(np.ones(1), c_lam, c_val, tw, tt, z,
+                                                float(a_v_host), a_v_mw, ext, ctab._quad)[0])
+            if np.isfinite(m_c):
+                f += HBETA_ERG_PER_ION * 10 ** (-0.4 * m_c)
+        out[band] = -2.5 * np.log10(f) if f > 0 else np.inf
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -984,6 +1156,114 @@ def stromgren_diameter_pc(q_h, n_e_cm3=1.0):
     return 2.0 * r_cm / PC_CM
 
 
+GAS_DENSITY_MODES = ('independent', 'consistent')
+C_CM_S = 2.99792458e10
+# the axes of the MAPPINGS V 5.1 HII grid NebulaBayes ships (MappingsLineTable
+# raises outside them; the consistent gas state clips U to them)
+LOG_U_GRID = (-4.0, -2.0)
+LOG_P_GRID = (4.2, 8.6)
+
+
+def gas_log_p(n_h_cm3, t_e_k=1.0e4, he1_h=0.08):
+    """
+    log10 P/k (K cm^-3) of fully ionized hydrogen with singly ionized helium:
+    ``(n_H+ + n_He+ + n_e) T = 2 (1 + y) n_H T``.
+    """
+    return float(np.log10(2.0 * (1.0 + float(he1_h)) * float(n_h_cm3) * float(t_e_k)))
+
+
+def stromgren_radius_pc(q_h, n_h_cm3, filling_factor=1.0, he1_h=0.0):
+    """
+    Stromgren radius (pc) of an ionization-bounded nebula capturing ``q_h``
+    photons/s, hydrogen density ``n_h_cm3`` in clumps filling ``filling_factor``
+    of the volume, electrons ``n_e = (1 + he1_h) n_H``:
+    ``(3 q / (4 pi n_e n_H alpha_B eps))^(1/3)``. 0 for ``q_h <= 0``.
+    """
+    q = np.clip(np.asarray(q_h, dtype=float), 0.0, None)
+    n_h = float(n_h_cm3)
+    denom = 4.0 * np.pi * (1.0 + float(he1_h)) * n_h * n_h * ALPHA_B * float(filling_factor)
+    return (3.0 * q / denom) ** (1.0 / 3.0) / PC_CM
+
+
+def ionization_parameter(q_h, n_h_cm3, filling_factor=1.0, he1_h=0.0):
+    """
+    Dimensionless ionization parameter at the Stromgren radius,
+    ``U = q / (4 pi R^2 n_H c)``. Scales as ``(q n_H eps^2)^(1/3)``.
+    """
+    q = np.clip(np.asarray(q_h, dtype=float), 0.0, None)
+    r_cm = stromgren_radius_pc(q, n_h_cm3, filling_factor, he1_h) * PC_CM
+    with np.errstate(divide='ignore', invalid='ignore'):
+        u = q / (4.0 * np.pi * r_cm ** 2 * float(n_h_cm3) * C_CM_S)
+    return np.where(q > 0, u, 0.0)
+
+
+def gas_state(q_h, n_h_cm3, filling_factor=1.0, t_e_k=1.0e4, he1_h=0.08):
+    """
+    The one-density gas state for a source of ``q_h`` captured photons/s:
+    ``log_p`` (raises off the MAPPINGS grid), ``log_u`` (clipped to the grid,
+    with a warning) and ``log_u_unclipped``, the Stromgren radius and n_e.
+    """
+    log_p = gas_log_p(n_h_cm3, t_e_k, he1_h)
+    if not LOG_P_GRID[0] <= log_p <= LOG_P_GRID[1]:
+        raise ValueError(f'log P/k = {log_p:.2f} from n_H = {n_h_cm3} cm^-3 is off the '
+                         f'MAPPINGS grid {LOG_P_GRID}')
+    u = float(ionization_parameter(q_h, n_h_cm3, filling_factor, he1_h))
+    log_u_raw = float(np.log10(u)) if u > 0 else -np.inf
+    log_u = float(np.clip(log_u_raw, *LOG_U_GRID))
+    if log_u != log_u_raw:
+        nebular_logger.warning(f'log U = {log_u_raw:.2f} (Q = {float(q_h):.3g}/s, n_H = '
+                               f'{n_h_cm3}, eps = {filling_factor}) clipped to the MAPPINGS '
+                               f'grid edge {log_u:.1f}')
+    return dict(log_p=log_p, log_u=log_u, log_u_unclipped=log_u_raw,
+                r_pc=float(stromgren_radius_pc(q_h, n_h_cm3, filling_factor, he1_h)),
+                n_e_cm3=float((1.0 + float(he1_h)) * float(n_h_cm3)))
+
+
+# A_V per hydrogen column at solar metallicity: N_H / E(B-V) = 5.8e21 cm^-2 mag^-1
+# (Bohlin, Savage & Drake 1978) with R_V = 3.1
+AV_PER_NH_SOLAR = 3.1 / 5.8e21
+
+
+def birth_cloud_a_v_from_gas(q_h, n_h_cm3, filling_factor=1.0, he1_h=0.08, z_rel=1.0,
+                             shell_factor=1.0, z_power=1.0):
+    """
+    Birth-cloud A_V tied to the gas density (2026-10-15, user: "higher density
+    gas should have more dust"): the dust column through a birth cloud whose
+    HII region is the Stromgren sphere of ``q_h`` captured photons/s in gas of
+    ``n_h_cm3`` (`stromgren_radius_pc`),
+
+        A_V = (A_V/N_H)_sun (Z/Z_sun)^z_power x shell_factor x n_H R_S.
+
+    n_H R_S is the hydrogen column from the source to the edge of the ionized
+    gas; ``shell_factor`` scales it to the whole birth cloud (most of its dust
+    sits in the neutral shell around the HII region). At fixed Q the column
+    grows as (n_H eps Q)^(1/3); the dust-to-gas ratio scales as (Z/Z_sun)^z_power.
+    """
+    r_cm = float(stromgren_radius_pc(q_h, n_h_cm3, filling_factor, he1_h)) * PC_CM
+    return (AV_PER_NH_SOLAR * float(z_rel) ** float(z_power) * float(shell_factor)
+            * float(n_h_cm3) * r_cm)
+
+
+def q_h_per_msun(isochrone, imf='kroupa'):
+    """
+    Expected captured ionizing photons/s per solar mass of ``total_mass`` for
+    an SSP built on ``isochrone`` (its ``nebular_info['q_h']`` per row), in
+    the LF sampler's own normalization (number-normalized IMF weights over the
+    rows, the remnant factor), so ``q_h_per_msun * total_mass`` is the
+    expectation of the population's summed ``nebular_q_h`` plus its smooth
+    component's ``integrated_q_h``. 0 without an active nebular knob.
+    """
+    info = getattr(isochrone, 'nebular_info', None) or {}
+    q_row = np.asarray(info.get('q_h', []), dtype=float)
+    if q_row.size == 0 or not np.any(q_row > 0):
+        return 0.0
+    w = isochrone.imf_weights(imf, m_max_norm=isochrone.m_max, norm_type='number')
+    live = float(np.sum(w * np.asarray(isochrone.mact, dtype=float)))
+    m_wo = isochrone.ssp_surviving_mass(imf, add_remnants=False)
+    m_w = isochrone.ssp_surviving_mass(imf, add_remnants=True)
+    return float(np.sum(w * q_row)) * (m_wo / m_w) / live
+
+
 def _pixels_per_pc(distance_angular, pixel_scale):
     from astropy import units as u
     d_pc = (distance_angular.to(u.pc).value if hasattr(distance_angular, 'unit')
@@ -1020,7 +1300,7 @@ def stromgren_classes(q_h, cfg, distance_angular, pixel_scale):
     radius used for class c (the geometric mean of its members).
     """
     q = np.asarray(q_h, dtype=float)
-    r_px = 0.5 * stromgren_diameter_pc(q, cfg.n_e_cm3) * _pixels_per_pc(distance_angular, pixel_scale)
+    r_px = 0.5 * cfg.stromgren_diameter_pc(q) * _pixels_per_pc(distance_angular, pixel_scale)
     idx = np.full(q.size, -1, dtype=int)
     has = r_px > 0
     if not has.any():

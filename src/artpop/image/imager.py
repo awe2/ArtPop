@@ -249,7 +249,31 @@ class Imager(metaclass=abc.ABCMeta):
         sphere (`artpop.nebular.stromgren_classes`): one image and one
         convolution per size class; a class under half a pixel, and stars
         with no captured photons, stay points. Flux-conserving.
+
+        A source with star clusters (`artpop.source.ClusteredSersicSP`) pools
+        its cluster members' blob light into one sphere per cluster, centred on
+        the cluster and sized by the cluster's summed photons (2026-10-15).
         """
+        star_cluster = getattr(source, 'star_cluster', None)
+        if star_cluster is not None and len(getattr(source, 'clusters', [])):
+            blob_signal = np.asarray(blob_signal, dtype=float)
+            member = star_cluster >= 0
+            if mask is not None:
+                member_on = member & np.asarray(mask, dtype=bool)
+            else:
+                member_on = member
+            pooled = np.bincount(star_cluster[member_on], weights=blob_signal[member_on],
+                                 minlength=len(source.clusters))
+            out = source.paint_cluster_gas(
+                np.zeros(tuple(np.asarray(source.xy_dim).astype(int))[::-1]), pooled)
+            rest = np.where(member, 0.0, blob_signal)
+            if rest.any():
+                out = out + self._stromgren_star_blobs(source, rest, d_a, mask)
+            return out
+        return self._stromgren_star_blobs(source, blob_signal, d_a, mask)
+
+    def _stromgren_star_blobs(self, source, blob_signal, d_a, mask=None):
+        """One projected Stromgren sphere per star (see `_stromgren_blobs`)."""
         q = _nebular_star_q(source)
         idx, radii = stromgren_classes(q, source.sp.nebular, d_a, source.pixel_scale)
         out = np.zeros(tuple(np.asarray(source.xy_dim).astype(int))[::-1])
@@ -337,7 +361,13 @@ class IdealImager(Imager):
             The artificial image with the smooth model injected into it. If no
             smooth model exists, the original image will be returned.
         """
-        if hasattr(source, 'smooth_model'):
+        if hasattr(source, 'smooth_image'):
+            # a mixture of components (young clusters): the source paints it
+            if source.smooth_model is not None or getattr(source, 'clusters', None):
+                stars, gas = source.smooth_image(
+                    bandpass, lambda m: 10**(0.4 * (zpt - m)), image.shape)
+                image = image + stars + gas
+        elif hasattr(source, 'smooth_model'):
             if source.smooth_model is None:
                 image = image
             else:
@@ -627,7 +657,14 @@ class ArtImager(Imager):
             The artificial image with the smooth model injected into it. If no
             smooth model exists, the original image will be returned.
         """
-        if hasattr(source, 'smooth_model'):
+        if hasattr(source, 'smooth_image'):
+            # a mixture of components (young clusters): the source paints it
+            if source.smooth_model is not None or getattr(source, 'clusters', None):
+                stars, gas = source.smooth_image(
+                    bandpass, lambda m: self.mag_to_counts(m, bandpass, exptime),
+                    image.shape)
+                image = image + stars + gas
+        elif hasattr(source, 'smooth_model'):
             if source.smooth_model is None:
                 image = image
             else:

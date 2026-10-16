@@ -19,6 +19,7 @@ from .util import check_units, check_xy_dim
 __all__ = [
     'Source',
     'SersicSP',
+    'ClusteredSersicSP',
     'MISTSersicSSP',
     'PlummerSP',
     'MISTPlummerSSP',
@@ -184,26 +185,7 @@ class SersicSP(Source):
         self.distance_angular = _angular_distance(sp, eta, distance_angular)
 
         if self.mag_limit is not None and sp.frac_num_sampled < 1.0:
-            _r_eff = check_units(r_eff, 'kpc').to('Mpc').value
-            _theta = check_units(theta, 'deg').to('radian').value
-            _distance = self.distance_angular.to('Mpc').value
-            _pixel_scale = check_units(pixel_scale, u.arcsec / u.pixel)
-
-            if _r_eff <= 0:
-                raise Exception('Effective radius must be greater than zero.')
-
-            xy_dim = check_xy_dim(xy_dim)
-            x_0, y_0 = xy_dim//2
-            x_0 += dx
-            y_0 += dy
-            self.n = n
-            self.ellip = ellip
-            self.r_sky = np.arctan2(_r_eff, _distance) * u.radian.to('arcsec')
-            self.r_sky *= u.arcsec
-            r_pix = self.r_sky.to('pixel', u.pixel_scale(_pixel_scale)).value
-
-            self.smooth_model = Sersic2D(
-                x_0=x_0, y_0=y_0, n=n, r_eff=r_pix, theta=_theta, ellip=ellip)
+            self._build_smooth_model(r_eff, n, theta, ellip, xy_dim, pixel_scale, dx, dy)
 
         # `distance` here is the ANGULAR-DIAMETER distance, not sp.distance:
         # sersic_xy's only use of it is arctan2(r_eff, distance), i.e. an angle.
@@ -218,10 +200,37 @@ class SersicSP(Source):
                           xy_dim=xy_dim, num_r_eff=num_r_eff, dx=dx, dy=dy,
                           pixel_scale=pixel_scale, random_state=sp.rng)
 
-        _xy = sersic_xy(**self.xy_kw)
+        _xy = self._draw_xy()
 
         super(SersicSP, self).__init__(
             _xy, sp.mag_table, xy_dim, pixel_scale, labels)
+
+    def _build_smooth_model(self, r_eff, n, theta, ellip, xy_dim, pixel_scale, dx, dy):
+        """The Sersic2D smooth model (amplitude set later by the imager)."""
+        _r_eff = check_units(r_eff, 'kpc').to('Mpc').value
+        _theta = check_units(theta, 'deg').to('radian').value
+        _distance = self.distance_angular.to('Mpc').value
+        _pixel_scale = check_units(pixel_scale, u.arcsec / u.pixel)
+
+        if _r_eff <= 0:
+            raise Exception('Effective radius must be greater than zero.')
+
+        xy_dim = check_xy_dim(xy_dim)
+        x_0, y_0 = xy_dim//2
+        x_0 += dx
+        y_0 += dy
+        self.n = n
+        self.ellip = ellip
+        self.r_sky = np.arctan2(_r_eff, _distance) * u.radian.to('arcsec')
+        self.r_sky *= u.arcsec
+        r_pix = self.r_sky.to('pixel', u.pixel_scale(_pixel_scale)).value
+
+        self.smooth_model = Sersic2D(
+            x_0=x_0, y_0=y_0, n=n, r_eff=r_pix, theta=_theta, ellip=ellip)
+
+    def _draw_xy(self):
+        """Star positions (a masked array; off-frame stars masked)."""
+        return sersic_xy(**self.xy_kw)
 
     def mag_to_image_amplitude(self, m_tot, zpt):
         """
@@ -253,6 +262,355 @@ class SersicSP(Source):
         mu_e = m_tot + 2.5 * np.log10(2 * area) + 2.5 * np.log10(f_n)
         amplitude = 10**(0.4 * (zpt - mu_e)) * self.pixel_scale.value**2
         return mu_e, amplitude, param_name
+
+
+class ClusteredSersicSP(SersicSP):
+    """
+    A `SersicSP` whose young SSPs sit in star-forming complexes (2026-10-15).
+
+    Every SSP without a `~artpop.space.clusters.ClusterSpec` is placed exactly
+    as `SersicSP` places it (the Sersic draw for all stars happens first, from
+    the same random state, so those stars land where `SersicSP` puts them).
+    An SSP with a spec is a mixture: a share ``f_diffuse`` keeps its Sersic
+    position, the rest is assigned to the spec's complexes with probability
+    proportional to their weights and placed on that complex's projected
+    Plummer. The SSP's smooth light follows the same mixture (`smooth_image`),
+    so the split between sampled stars and smooth light does not move light
+    between the complexes and the Sersic.
+
+    **Where the complexes go.** The specs are placed youngest first (by
+    ``age_myr``). A complex either starts a new site -- drawn in the galaxy's
+    disk plane from a ring surface density, peak ``r_peak_reff`` r_eff, width
+    ``width_reff`` r_eff, truncated at ``max_reff`` r_eff
+    (`artpop.space.clusters.ring_disk_offsets`) -- or, with probability
+    ``site_reuse``, sits near an earlier (younger) complex chosen in proportion
+    to its mass, offset by a disk-plane Gaussian of
+    ``sqrt(site_s0_pc^2 + (drift_kms t)^2)`` pc: older complexes have drifted
+    further from where the youngest stars form now. Disk-plane offsets are
+    projected with the galaxy's ellipticity and position angle.
+
+    **Diffuse ionized gas.** An SSP whose ``ssp_components`` record carries
+    ``integrated_dig_abs_mags`` (the photons the HII regions did not capture,
+    absorbed in the diffuse gas) adds that light on the galaxy's Sersic profile
+    to the gas image (`smooth_image`), so it is never part of the SBF field.
+
+    With an active nebular knob in ``'stromgren'`` mode the gas light of a
+    cluster -- its member stars' blob share and its share of the smooth
+    component's -- fills **one** projected Stromgren sphere centred on the
+    cluster, sized by the cluster's summed captured photons in the config's gas
+    (`artpop.nebular.NebularConfig.stromgren_diameter_pc`). Stars outside
+    clusters keep their own spheres.
+
+    Parameters
+    ----------
+    clusters : list of `~artpop.space.clusters.ClusterSpec` (or dicts)
+        One per clustered SSP (``label`` = its 1-based ``ssp_labels`` value).
+        May be empty (a source that only needs the diffuse-gas Sersic).
+    r_peak_reff, width_reff, max_reff : float
+        The ring surface density of new sites, in units of r_eff.
+    width_out_reff : float or None
+        The ring's width outside its peak (default: ``width_reff``); smaller
+        keeps the complexes from the outskirts.
+    ssp_reff_scale : dict or None
+        ``{label: s}``: the stars of SSP ``label`` that are not in complexes,
+        and its smooth light, follow a Sersic of the same n, ellipticity and
+        angle but effective radius ``s x r_eff`` (2026-10-15: dwarfs have age
+        gradients, young and intermediate-age stars more concentrated than the
+        old halo). Labels not listed (and the diffuse ionized gas) keep the
+        galaxy's r_eff. The ring of complex centres is in units of the
+        galaxy's r_eff.
+    site_reuse : float
+        Probability that a complex sits near an earlier one (0: independent).
+    site_s0_pc, drift_kms : float
+        The offset from the parent site: sigma = sqrt(s0^2 + (drift t)^2).
+
+    The other parameters are `SersicSP`'s.
+    """
+
+    def __init__(self, sp, r_eff, n, theta, ellip, xy_dim, pixel_scale,
+                 clusters=(), r_peak_reff=0.4, width_reff=0.3, max_reff=2.0,
+                 site_reuse=0.0, site_s0_pc=20.0, drift_kms=5.0, width_out_reff=None,
+                 ssp_reff_scale=None,
+                 num_r_eff=10, dx=0, dy=0, labels=None, eta=1.0,
+                 distance_angular=None):
+        from .space.clusters import ClusterSpec
+        self.cluster_specs = [ClusterSpec.coerce(c) for c in (clusters or [])]
+        seen = [c.label for c in self.cluster_specs]
+        if len(set(seen)) != len(seen):
+            raise ValueError(f'one ClusterSpec per SSP label, got labels {seen}')
+        iso = getattr(sp, 'isochrone', None)
+        n_ssp = len(iso) if isinstance(iso, list) else 1
+        for c in self.cluster_specs:
+            if not 1 <= c.label <= n_ssp:
+                raise ValueError(f'cluster label {c.label} is not an SSP of this '
+                                 f'population (labels 1..{n_ssp})')
+        self.r_peak_reff = float(r_peak_reff)
+        self.width_reff = float(width_reff)
+        self.width_out_reff = None if width_out_reff is None else float(width_out_reff)
+        self.max_reff = float(max_reff)
+        if not (0.0 <= self.r_peak_reff < self.max_reff and self.width_reff > 0
+                and (self.width_out_reff is None or self.width_out_reff > 0)):
+            raise ValueError('need 0 <= r_peak_reff < max_reff and widths > 0')
+        self.site_reuse = float(site_reuse)
+        if not 0.0 <= self.site_reuse <= 1.0:
+            raise ValueError(f'site_reuse must be in [0, 1], got {site_reuse}')
+        self.site_s0_pc = float(site_s0_pc)
+        self.drift_kms = float(drift_kms)
+        self._r_eff_kpc = check_units(r_eff, 'kpc').to('kpc').value
+        self._theta_rad = check_units(theta, 'deg').to('radian').value
+        self._ellip = float(ellip)
+        self.ssp_reff_scale = {int(k): float(v) for k, v in (ssp_reff_scale or {}).items()
+                               if float(v) != 1.0}
+        if any(not v > 0 for v in self.ssp_reff_scale.values()):
+            raise ValueError(f'ssp_reff_scale values must be > 0, got {ssp_reff_scale}')
+        self._cache = {}
+        super(ClusteredSersicSP, self).__init__(
+            sp, r_eff, n, theta, ellip, xy_dim, pixel_scale,
+            num_r_eff=num_r_eff, dx=dx, dy=dy, labels=labels, eta=eta,
+            distance_angular=distance_angular)
+        if self.smooth_model is None:
+            # the diffuse gas needs the Sersic even when every star is sampled
+            self._build_smooth_model(r_eff, n, theta, ellip, xy_dim, pixel_scale, dx, dy)
+        keep = self.star_mask
+        self.star_cluster = self._star_cluster_full[keep]
+        self.star_component = self._star_component_full[keep]
+
+    # geometry ------------------------------------------------------------
+    @property
+    def px_per_pc(self):
+        """Pixels per physical pc at the source's angular-diameter distance."""
+        d_pc = self.distance_angular.to('pc').value
+        ps = check_units(self.xy_kw['pixel_scale'], u.arcsec / u.pixel).value
+        return np.degrees(1.0 / d_pc) * 3600.0 / ps
+
+    def _centre_px(self):
+        xy_dim = check_xy_dim(self.xy_kw['xy_dim'])
+        return (xy_dim[0] // 2 + self.xy_kw['dx'], xy_dim[1] // 2 + self.xy_kw['dy'])
+
+    def _draw_xy(self):
+        from .space.clusters import (ring_disk_offsets, disk_to_sky, plummer_offsets,
+                                     KMS_PC_PER_MYR)
+        xy = super(ClusteredSersicSP, self)._draw_xy()
+        sp, rng = self.sp, self.xy_kw['random_state']
+        pos = np.array(np.ma.getdata(xy), dtype=float, copy=True)
+        n_star = len(pos)
+        ssp_labels = np.asarray(getattr(sp, 'ssp_labels', np.ones(n_star, int)))
+        if ssp_labels.size != n_star:
+            raise ValueError(f'ssp_labels ({ssp_labels.size}) do not match the '
+                             f'{n_star} stars')
+        x0, y0 = self._centre_px()
+        ppc = self.px_per_pc
+        r_eff_px = self._r_eff_kpc * 1e3 * ppc
+        q_star = np.asarray(getattr(sp, 'nebular_q_h', np.zeros(n_star)), dtype=float)
+        if q_star.size != n_star:
+            q_star = np.zeros(n_star)
+        comps = getattr(sp, 'ssp_components', None) or [sp._ssp_component_record()]
+
+        # per-SSP sizes (age gradients): redraw those SSPs' stars from a Sersic of
+        # s x r_eff; complex members are moved onto their complexes below anyway
+        for label, s in sorted(self.ssp_reff_scale.items()):
+            idx = np.flatnonzero(ssp_labels == label)
+            if idx.size:
+                kw = dict(self.xy_kw, num_stars=int(idx.size), r_eff=self.xy_kw['r_eff'] * s)
+                pos[idx] = np.array(np.ma.getdata(sersic_xy(**kw)), dtype=float)
+
+        self._star_cluster_full = np.full(n_star, -1, dtype=int)
+        self._star_component_full = np.full(n_star, -1, dtype=int)
+        self.clusters = []
+        specs = self.cluster_specs
+        order = sorted(range(len(specs)), key=lambda i: (
+            specs[i].age_myr is None, specs[i].age_myr or 0.0, i))
+        site_disk, site_mass = np.zeros((0, 2)), np.zeros(0)
+        site_ids = np.zeros(0, dtype=int)
+        for si in order:
+            spec = specs[si]
+            n_c = spec.n_clusters
+            age = float(spec.age_myr or 0.0)
+            mass = spec.masses if spec.masses is not None else spec.weights
+            # sites: a fresh ring draw for every complex, replaced by an offset
+            # from an earlier (younger) complex with probability site_reuse
+            disk = ring_disk_offsets(n_c, r_eff_px, rng, self.r_peak_reff,
+                                     self.width_reff, self.max_reff, self.width_out_reff)
+            parent = np.full(n_c, -1, dtype=int)
+            if site_mass.size and self.site_reuse > 0:
+                linked = rng.uniform(size=n_c) < self.site_reuse
+                if linked.any():
+                    p = site_mass / site_mass.sum()
+                    parent[linked] = rng.choice(site_mass.size, size=int(linked.sum()), p=p)
+                    sig_px = np.hypot(self.site_s0_pc,
+                                      self.drift_kms * KMS_PC_PER_MYR * age) * ppc
+                    disk[linked] = (site_disk[parent[linked]]
+                                    + rng.normal(0.0, sig_px, size=(int(linked.sum()), 2)))
+            centres = disk_to_sky(disk, self._theta_rad, self._ellip)
+            if spec.a_sigma_dex > 0:
+                a_pc = spec.a_pc * 10 ** (spec.a_sigma_dex * rng.normal(size=n_c))
+            else:
+                a_pc = np.array(spec.a_pc, dtype=float)
+            first_id = len(self.clusters)
+            idx = np.flatnonzero(ssp_labels == spec.label)
+            comp = (rng.choice(spec.n_clusters + 1, size=idx.size, p=spec.component_probs())
+                    if idx.size else np.zeros(0, dtype=int))
+            self._star_component_full[idx] = comp
+            rec = comps[spec.label - 1] if spec.label - 1 < len(comps) else None
+            q_smooth = float((rec or {}).get('integrated_q_h', 0.0) or 0.0)
+            for c in range(spec.n_clusters):
+                gid = len(self.clusters)
+                members = idx[comp == c + 1]
+                a_px = a_pc[c] * ppc
+                pos[members] = (np.array([x0, y0]) + centres[c]
+                                + plummer_offsets(members.size, a_px, rng))
+                self._star_cluster_full[members] = gid
+                w_smooth = (1.0 - spec.f_diffuse) * spec.weights[c]
+                self.clusters.append(dict(
+                    id=gid, label=spec.label, name=spec.name, index=c,
+                    x=float(x0 + centres[c, 0]), y=float(y0 + centres[c, 1]),
+                    r_pc=float(np.hypot(*centres[c]) / ppc),
+                    r_disk_pc=float(np.hypot(*disk[c]) / ppc),
+                    disk_pc=(float(disk[c, 0] / ppc), float(disk[c, 1] / ppc)),
+                    a_pc=float(a_pc[c]), a_px=float(a_px),
+                    weight=float(spec.weights[c]), smooth_weight=float(w_smooth),
+                    mass=None if spec.masses is None else float(spec.masses[c]),
+                    age_myr=spec.age_myr,
+                    site=int(parent[c]) if parent[c] < 0 else int(site_ids[parent[c]]),
+                    n_stars=int(members.size),
+                    q_h=float(q_star[members].sum() + w_smooth * q_smooth)))
+            # this bin's complexes become sites for the older bins
+            site_disk = np.vstack([site_disk, disk])
+            site_mass = np.concatenate([site_mass, np.asarray(mass, dtype=float)])
+            site_ids = np.concatenate([site_ids, np.arange(first_id, first_id + n_c)])
+
+        xy_dim = check_xy_dim(self.xy_kw['xy_dim'])
+        outside = ((pos[:, 0] < 0) | (pos[:, 0] > xy_dim[0] - 1) |
+                   (pos[:, 1] < 0) | (pos[:, 1] > xy_dim[1] - 1))
+        return np.ma.masked_array(pos, mask=np.column_stack((outside, outside)))
+
+    # nebulae -------------------------------------------------------------
+    def stromgren_clusters(self):
+        """True when cluster gas goes into one sphere per cluster."""
+        from .nebular import is_active
+        cfg = getattr(self.sp, 'nebular', None)
+        return is_active(cfg) and getattr(cfg, 'size_mode', 'fixed') == 'stromgren'
+
+    def cluster_gas_radius_px(self, cluster):
+        """Projected Stromgren radius (pixels) of one cluster's nebula."""
+        q = float(cluster['q_h'])
+        if q <= 0:
+            return 0.0
+        return 0.5 * float(self.sp.nebular.stromgren_diameter_pc(q)) * self.px_per_pc
+
+    def paint_cluster_gas(self, image, signal):
+        """Add each cluster's gas ``signal[id]`` to ``image`` as its projected
+        Stromgren sphere centred on the cluster (flux-conserving in-frame).
+        The kernels are band-independent and cached per cluster."""
+        from .nebular import sphere_kernel
+        from .space.clusters import paint_stamp
+        for cl in self.clusters:
+            s = float(signal[cl['id']])
+            if s == 0.0:
+                continue
+            key = ('sphere', cl['id'])
+            if key not in self._cache:
+                self._cache[key] = sphere_kernel(self.cluster_gas_radius_px(cl))
+            kern = self._cache[key]
+            paint_stamp(image, kern, kern.shape[0] // 2, cl['x'], cl['y'], s)
+        return image
+
+    def _cluster_unit_image(self, label, shape):
+        """Sum over the complexes of SSP ``label`` of smooth_weight x its
+        Plummer stamp: band-independent, so built once per source and shape."""
+        from .space.clusters import plummer_stamp, paint_stamp
+        key = ('unit', int(label), tuple(shape))
+        if key not in self._cache:
+            img = np.zeros(shape)
+            for cl in self.clusters:
+                if cl['label'] != label or not cl['smooth_weight'] > 0:
+                    continue
+                ix, iy = np.floor(cl['x'] + 0.5), np.floor(cl['y'] + 0.5)
+                stamp, half = plummer_stamp(cl['a_px'], cl['x'] - ix, cl['y'] - iy,
+                                            max_half=max(shape))
+                paint_stamp(img, stamp, half, cl['x'], cl['y'], cl['smooth_weight'])
+            self._cache[key] = img
+        return self._cache[key]
+
+    def _sersic_unit_image(self, shape, scale=1.0):
+        """The Sersic model at unit total flux (zero point 0, magnitude 0), with
+        its effective radius times ``scale`` (the amplitude goes as 1/scale^2)."""
+        key = ('sersic', tuple(shape), float(scale))
+        if key not in self._cache:
+            _, amp, name = self.mag_to_image_amplitude(0.0, 0.0)
+            model = self.smooth_model.copy()
+            setattr(model, name, amp / float(scale) ** 2)
+            model.r_eff = self.smooth_model.r_eff * float(scale)
+            yy, xx = np.mgrid[:shape[0], :shape[1]]
+            self._cache[key] = model(xx, yy)
+        return self._cache[key]
+
+    # smooth light --------------------------------------------------------
+    def smooth_image(self, bandpass, mag_to_flux, shape):
+        """
+        The smooth component as two images, ``(stars, gas)``.
+
+        Each SSP's integrated light (``sp.ssp_components``) is split like its
+        stars: unclustered SSPs and the ``f_diffuse`` share onto the Sersic
+        model; each cluster's share onto its projected Plummer -- except, with
+        ``'stromgren'`` nebulae, the share ``integrated_blob_frac`` that is gas
+        light, which goes into the cluster's sphere (``gas``). Diffuse ionized
+        gas (``integrated_dig_abs_mags``) goes onto the Sersic in ``gas``.
+        ``mag_to_flux`` converts an apparent magnitude to the image's flux units.
+        """
+        sp = self.sp
+        stars = np.zeros(shape)
+        gas = np.zeros(shape)
+        comps = getattr(sp, 'ssp_components', None) or [sp._ssp_component_record()]
+        specs = {c.label: c for c in self.cluster_specs}
+        offset = sp.dist_mod + sp.a_lam[bandpass]
+        to_gas = self.stromgren_clusters()
+        sersic_flux = 0.0
+        scaled = {}                       # per-SSP sizes: {scale: flux}
+        dig_flux = 0.0
+        gas_signal = np.zeros(len(self.clusters))
+        for label, rec in enumerate(comps, start=1):
+            rec = rec or {}
+            dig = rec.get('integrated_dig_abs_mags')
+            if dig:
+                f_dig = float(mag_to_flux(dig[bandpass] + offset))
+                if np.isfinite(f_dig) and f_dig > 0:
+                    dig_flux += f_dig
+            mags = rec.get('integrated_abs_mags')
+            if not mags:
+                continue
+            flux = float(mag_to_flux(mags[bandpass] + offset))
+            if not np.isfinite(flux) or flux <= 0:
+                continue
+            spec = specs.get(label)
+            s_lab = self.ssp_reff_scale.get(label, 1.0)
+            share = flux if spec is None else spec.f_diffuse * flux
+            if s_lab == 1.0:
+                sersic_flux += share
+            else:
+                scaled[s_lab] = scaled.get(s_lab, 0.0) + share
+            if spec is None:
+                continue
+            blob = float(rec.get('integrated_blob_frac', {}).get(bandpass, 0.0)) if to_gas else 0.0
+            for cl in self.clusters:
+                if cl['label'] == label:
+                    gas_signal[cl['id']] += cl['smooth_weight'] * flux * blob
+            stars += flux * (1.0 - blob) * self._cluster_unit_image(label, shape)
+        if (sersic_flux > 0 or dig_flux > 0) and self.smooth_model is not None:
+            unit = self._sersic_unit_image(shape)
+            if sersic_flux > 0:
+                _, amp, name = self.mag_to_image_amplitude(-2.5 * np.log10(sersic_flux), 0.0)
+                setattr(self.smooth_model, name, amp)     # ArtPop's own side effect
+                stars = stars + sersic_flux * unit
+            if dig_flux > 0:
+                gas = gas + dig_flux * unit
+        if self.smooth_model is not None:
+            for s_lab, f_s in sorted(scaled.items()):
+                if f_s > 0:
+                    stars = stars + f_s * self._sersic_unit_image(shape, s_lab)
+        if gas_signal.any():
+            self.paint_cluster_gas(gas, gas_signal)
+        return stars, gas
 
 
 def _angular_distance(sp, eta=1.0, distance_angular=None):

@@ -664,6 +664,11 @@ class SSP(StellarPopulation):
                 ff += np.sum(10**(-0.8 * evolved_mags[filt]))
                 log_dddd = 4 * np.log10((10 * u.pc).to('cm').value)
                 self._integrated_log_lumlum[filt] = np.log10(ff) + log_dddd
+            # the nebular share of the smooth light from the rows below the
+            # limit (the evolved faint stars folded in above carry no lines)
+            _c = np.zeros(len(w))
+            _c[:arg] = num_stars * w[:arg]
+            self._attach_integrated_nebular(_c)
         else:
             # calculate total_mass with stellar remnants
             self.total_mass = self.sampled_mass / remnants_factor
@@ -710,6 +715,66 @@ class SSP(StellarPopulation):
         info = getattr(self.isochrone, 'nebular_info', None) or {}
         q_row = np.asarray(info.get('q_h', np.zeros(mini.size)), dtype=float)
         self.nebular_q_h = np.clip(interp1d(mini, q_row)(self.initial_masses), 0.0, None)
+        self._attach_dig(info, interp1d(mini, np.asarray(
+            info.get('q_h_raw', np.zeros(mini.size)), dtype=float))(self.initial_masses))
+
+    def _attach_dig(self, info, q_raw_stars):
+        """
+        Diffuse ionized gas (2026-10-15): the photons the HII regions did not
+        capture, ``(1 - k)``, of which ``dig_absorbed`` are absorbed in the
+        diffuse gas, from the sampled stars and the smooth component's rows
+        (``integrated_q_h_raw``). Sets ``dig_q_h`` and, per band,
+        ``integrated_dig_abs_mags`` (None when there are no such photons).
+        """
+        self.dig_q_h = 0.0
+        self.integrated_dig_abs_mags = None
+        m1 = info.get('dig_m1')
+        if not m1:
+            return
+        q_tot = (float(np.sum(np.clip(q_raw_stars, 0.0, None)))
+                 + float(getattr(self, 'integrated_q_h_raw', 0.0) or 0.0))
+        self.dig_q_h = (1.0 - float(info.get('knob', 0.0))) * float(info['dig_absorbed']) * q_tot
+        if self.dig_q_h > 0:
+            self.integrated_dig_abs_mags = {
+                b: float(m) - 2.5 * np.log10(self.dig_q_h) for b, m in m1.items()}
+
+    def _attach_integrated_nebular(self, row_counts):
+        """
+        The smooth component's nebular bookkeeping, from the expected number of
+        stars per isochrone row in it (``row_counts``): per band the share of
+        its light that is nebular blob light (``integrated_blob_frac``) and its
+        captured ionizing photons (``integrated_q_h``). Lets a source put the
+        smooth component's gas light where its stars' gas goes (young clusters,
+        2026-10-15). Set only when the isochrone's nebular knob is active.
+        """
+        blob = getattr(self.isochrone, 'nebular_blob_frac', None)
+        if blob is None:
+            return
+        c = np.asarray(row_counts, dtype=float)
+        self.integrated_blob_frac = {}
+        for filt, frac in blob.items():
+            f_row = c * 10**(-0.4 * np.asarray(self.isochrone.mag_table[filt], dtype=float))
+            tot = float(np.sum(f_row))
+            self.integrated_blob_frac[filt] = (
+                float(np.sum(f_row * np.asarray(frac, dtype=float))) / tot if tot > 0 else 0.0)
+        info = getattr(self.isochrone, 'nebular_info', None) or {}
+        q_row = np.asarray(info.get('q_h', np.zeros(c.size)), dtype=float)
+        self.integrated_q_h = float(np.sum(c * q_row))
+        q_raw = np.asarray(info.get('q_h_raw', np.zeros(c.size)), dtype=float)
+        self.integrated_q_h_raw = float(np.sum(c * q_raw))
+
+    def _ssp_component_record(self):
+        """Per-SSP smooth-component record a composite keeps in ``ssp_components``."""
+        has = bool(getattr(self, 'has_integrated_component', False)
+                   and hasattr(self, 'integrated_abs_mags'))
+        dig = getattr(self, 'integrated_dig_abs_mags', None)
+        return dict(
+            integrated_abs_mags=dict(self.integrated_abs_mags) if has else None,
+            integrated_blob_frac=dict(getattr(self, 'integrated_blob_frac', {}) or {}) if has else {},
+            integrated_q_h=float(getattr(self, 'integrated_q_h', 0.0) or 0.0) if has else 0.0,
+            # the diffuse ionized gas exists with or without a smooth stellar part
+            integrated_dig_abs_mags=dict(dig) if dig else None,
+            dig_q_h=float(getattr(self, 'dig_q_h', 0.0) or 0.0))
 
     def _lf_row_split(self):
         """
@@ -839,6 +904,7 @@ class SSP(StellarPopulation):
                 self.integrated_abs_mags[filt] = -2.5 * np.log10(flux)
                 ff = n_total * float(np.sum(w[faint] * f_row[faint]**2))
                 self._integrated_log_lumlum[filt] = np.log10(ff) + log_dddd
+            self._attach_integrated_nebular(n_total * np.where(faint, w, 0.0))
         else:
             self.total_mass = self.sampled_mass / remnants_factor
 
@@ -1001,6 +1067,14 @@ class SSP(StellarPopulation):
             new.nebular_q_h = np.concatenate([
                 q_new if q_new is not None else np.zeros(n_new),
                 q_ssp if q_ssp is not None else np.zeros(n_ssp)])
+
+        # per-SSP smooth components (integrated magnitudes, nebular share and
+        # captured Q_H), in label order, for sources that place each SSP's
+        # smooth light separately (young clusters, 2026-10-15)
+        if not hasattr(new, 'ssp_components'):
+            new.ssp_components = [self._ssp_component_record()]
+        new.ssp_components = list(new.ssp_components) + list(
+            getattr(ssp, 'ssp_components', None) or [ssp._ssp_component_record()])
 
         new_label = np.ones(len(ssp.star_masses), dtype=int)
         new_label *= len(new.isochrone)
