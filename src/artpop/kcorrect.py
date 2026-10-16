@@ -34,7 +34,8 @@ __all__ = ['SpectralLibrary', 'C3KLibrary', 'TremblayWDLibrary', 'MARCSLibrary',
            'DEFAULT_BOLOMETRIC',
            'DEFAULT_Z_GRID', 'DEFAULT_AV_HOST_GRID', 'DEFAULT_AV_MW_GRID',
            'SOURCE_NAMES', 'SOURCE_C3K',
-           'SOURCE_WD', 'SOURCE_BB']
+           'SOURCE_WD', 'SOURCE_BB', 'SOURCE_TLUSTY', 'TlustyLibrary', 'TLUSTY_HULL',
+           'tlusty_path', 'hot_stars_mode']
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +75,24 @@ def kcorr_cache_dir():
         if os.environ.get(var):
             return os.environ[var]
     return os.path.join(ARTPOP_HOME, 'tables')
+
+
+def tlusty_path():
+    """Where `tools/stage_tlusty.py` wrote the TLUSTY 2025 blocks:
+    ``$ARTPOP_TLUSTY_PATH``, else ``<ARTPOP_HOME>/tlusty2025/blocks``."""
+    return os.environ.get('ARTPOP_TLUSTY_PATH') or os.path.join(ARTPOP_HOME, 'tlusty2025', 'blocks')
+
+
+def hot_stars_mode():
+    """The hot-star library: ``'tlusty'`` when ``$ARTPOP_HOT_STARS`` says so,
+    else None (C3K, blackbody-filled, and blackbodies above 50 kK; the
+    production behaviour). An evaluation switch (2026-10-16), not a config key."""
+    v = (os.environ.get('ARTPOP_HOT_STARS') or '').strip().lower()
+    if v in ('', 'none', 'c3k'):
+        return None
+    if v != 'tlusty':
+        raise ValueError(f"ARTPOP_HOT_STARS must be 'tlusty' or empty, got {v!r}")
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +221,16 @@ _N_LAM = {'c3k_hr': 10992, 'c3k_lr': 1936}
 
 # Source of the K value at a node, recorded alongside every interpolation so a
 # fallback is never silent (test B5).
-SOURCE_C3K, SOURCE_WD, SOURCE_BB, SOURCE_MARCS = 0, 1, 2, 3
+SOURCE_C3K, SOURCE_WD, SOURCE_BB, SOURCE_MARCS, SOURCE_TLUSTY = 0, 1, 2, 3, 4
 SOURCE_NAMES = {SOURCE_C3K: 'C3K', SOURCE_WD: 'Tremblay', SOURCE_BB: 'blackbody',
-                SOURCE_MARCS: 'MARCS'}
+                SOURCE_MARCS: 'MARCS', SOURCE_TLUSTY: 'TLUSTY'}
+
+# TLUSTY 2025 (Hubeny et al. 2025): BSTAR 15-30 kK (log g 1.75-4.75), OSTAR
+# 27.5-55 kK (log g 3.0-4.75), Z/Z_sun 0.01-2. NLTE, line-blanketed. Inside
+# this hull and where every corner of a row's cell has a model, a NAIVE swap
+# (2026-10-16 evaluation): TLUSTY replaces C3K / blackbody outright, linear in
+# [Z/H], log g, log Teff, with no taper at the 15 kK seam.
+TLUSTY_HULL = dict(teff=(15000.0, 55000.0), logg=(1.75, 4.75))
 
 # The cool-giant patch (2026-10-07): MARCS spherical models replace C3K for M
 # giants. Full MARCS at Teff <= MARCS_BLEND_TEFF[0] and log g <= MARCS_BLEND_LOGG[0];
@@ -799,6 +825,68 @@ class MARCSLibrary(SpectralLibrary):
     def missing(self, feh):
         """``(n_g, n_t)`` True where MARCS has no model at this [Fe/H]."""
         return ~np.isfinite(self.grid(feh)[2][..., 0])
+
+
+class TlustyLibrary(SpectralLibrary):
+    """
+    TLUSTY 2025 NLTE O/B-star spectra (Hubeny, Bohlin, Gordon & Fitzpatrick
+    2025, AJ 169, 178), as staged by ``tools/stage_tlusty.py``: the SURFACE
+    flux 4 pi H_lambda (erg/s/cm^2/A, so ``surface_scale = 1``) rebinned at
+    R = 2000 on 200 A - 32 micron, on one (log g, log Teff) mesh per [Z/H]
+    node, NaN where the grid has no model. [Z/H] = log10 Z/Z_sun stands in for
+    MIST's [Fe/H] (scaled-solar in both).
+    """
+
+    name = 'TLUSTY'
+    flux_unit = 'f_lam'
+    surface_scale = 1.0
+    hull = TLUSTY_HULL
+
+    def __init__(self, path=None):
+        self.root = path or tlusty_path()
+        self._blocks = None
+
+    @property
+    def available(self):
+        return os.path.isfile(os.path.join(self.root, 'manifest.json'))
+
+    def _load(self):
+        if self._blocks is None:
+            import glob
+            files = sorted(glob.glob(os.path.join(self.root, 'tlusty_zh*.npz')))
+            if not files:
+                raise FileNotFoundError(f'TLUSTY is not staged under {self.root}; '
+                                        'run tools/stage_tlusty.py')
+            self._blocks = {}
+            for f in files:
+                with np.load(f) as z:
+                    self._axes = (z['logg'], z['logt'])
+                    self._blocks[float(os.path.basename(f)[9:14])] = z['flux']
+            self._feh = np.array(sorted(self._blocks))
+            self._wave = np.load(os.path.join(self.root, 'tlusty_wave_vac.npy'))
+        return self._blocks
+
+    @property
+    def feh_grid(self):
+        self._load()
+        return self._feh
+
+    @property
+    def wave(self):
+        self._load()
+        return self._wave
+
+    def grid(self, feh=None):
+        blocks = self._load()
+        key = float(np.round(feh, 2))
+        if key not in blocks:
+            raise ValueError(f'[Z/H] = {feh} is not a staged TLUSTY node {self.feh_grid.tolist()}')
+        return self._axes[0], self._axes[1], blocks[key]
+
+    def manifest_sha(self):
+        import hashlib
+        with open(os.path.join(self.root, 'manifest.json'), 'rb') as fh:
+            return hashlib.sha1(fh.read()).hexdigest()
 
 
 class BlackbodyLibrary(SpectralLibrary):
@@ -1396,6 +1484,9 @@ class KCorrectionGrid:
         hit = cls._MEMO.get(path)
         if hit is not None and not rebuild and hit[0] == mtime:
             cls._MEMO.move_to_end(path)
+            if hot_stars_mode() == 'tlusty' and hit[1].tlusty is None:
+                hit[1].attach_tlusty(phot_system, cache_dir=cache_dir, persist=persist,
+                                     main_key=key, **kwargs)
             return hit[1]
         grid = None
         if mtime is not None and not rebuild:
@@ -1419,7 +1510,73 @@ class KCorrectionGrid:
         cls._MEMO.move_to_end(path)
         while len(cls._MEMO) > cls._MEMO_MAX:
             cls._MEMO.popitem(last=False)
+        if hot_stars_mode() == 'tlusty' and grid.tlusty is None:
+            grid.attach_tlusty(phot_system, cache_dir=cache_dir, persist=persist,
+                               main_key=key, **kwargs)
         return grid
+
+    # -- the TLUSTY hot-star companion (evaluation, 2026-10-16) -------------
+    tlusty = None
+    tlusty_rest = None
+    tlusty_feh = tlusty_logg = tlusty_logt = None
+
+    def attach_tlusty(self, phot_system, cache_dir=None, persist=True, main_key='',
+                      bands=None, z_grid=None, a_v_host=0.0, a_v_mw=0.0,
+                      extinction_law='F99', r_v=3.1, curve_dir=None, a_v_host_grid=None,
+                      a_v_mw_grid=None, bolometric=DEFAULT_BOLOMETRIC, **_unused):
+        """
+        Build (or load) the TLUSTY table on the SAME bands, z grid, dust axes,
+        curves and bolometric convention as this table, and attach it, so
+        `interpolate` serves hot stars inside `TLUSTY_HULL` from it. Cached
+        beside the main table as ``tlusty1_<main key minus .npz>_<manifest>.npz``.
+        """
+        lib = TlustyLibrary()
+        if not lib.available:
+            raise FileNotFoundError(f'ARTPOP_HOT_STARS=tlusty but TLUSTY is not staged under '
+                                    f'{lib.root} (tools/stage_tlusty.py)')
+        path = os.path.join(cache_dir or kcorr_cache_dir(),
+                            f'tlusty1_{main_key[:-4]}_{lib.manifest_sha()[:8]}.npz')
+        if os.path.isfile(path):
+            with np.load(path) as z:
+                arr = {k: z[k] for k in z.files}
+        else:
+            axes = self._dust_axes(a_v_host_grid, a_v_mw_grid)
+            pairs = ([(float(h), float(m)) for h in axes[0] for m in axes[1]]
+                     if axes is not None else [(a_v_host, a_v_mw)])
+            z_grid = DEFAULT_Z_GRID if z_grid is None else np.asarray(z_grid, float)
+            curve_dir = photometry_curve_dir(phot_system, curve_dir)
+            fs = load_filter_system(phot_system, bands=bands, curve_dir=curve_dir)
+            bnames = list(fs.filter_names)
+            if bnames != self.bands:
+                raise ValueError(f'TLUSTY bands {bnames} differ from the table bands {self.bands}')
+            curves = {b: fs.get_trans(b) for b in bnames}
+            ext = extinction_curve(extinction_law, r_v)
+            blocks, rests = [], []
+            for feh in lib.feh_grid:
+                outs = [_grid_absolute(lib, feh, curves, bnames, z_grid, h, m, ext, bolometric)
+                        for h, m in pairs]
+                lg_, lt_ = outs[0][0], outs[0][1]
+                rest = _grid_absolute(lib, feh, curves, bnames, [0.0], 0.0, 0.0, ext,
+                                      bolometric)[2][..., 0, :]
+                if axes is None:
+                    blocks.append(outs[0][2])
+                else:
+                    a = np.stack([o[2] for o in outs], axis=-2)
+                    blocks.append(a.reshape(a.shape[:-2] + (axes[0].size, axes[1].size, a.shape[-1])))
+                rests.append(rest)
+            arr = dict(feh=np.asarray(lib.feh_grid, float), logg=lg_, logt=lt_,
+                       table=np.stack(blocks), rest=np.stack(rests))
+            if persist:
+                os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+                tmp = f'{path}.{os.getpid()}.part'
+                with open(tmp, 'wb') as fh:
+                    np.savez(fh, **arr)
+                os.replace(tmp, path)
+        self.tlusty_feh, self.tlusty_logg, self.tlusty_logt = arr['feh'], arr['logg'], arr['logt']
+        self.tlusty, self.tlusty_rest = arr['table'], arr['rest']
+        self.meta = dict(self.meta, hot_stars=f'TLUSTY 2025 (naive swap inside {TLUSTY_HULL}; '
+                                              f'{path})')
+        return self
 
     @classmethod
     def for_dust(cls, phot_system, a_v_host=0.0, a_v_mw=0.0,
@@ -1474,6 +1631,9 @@ class KCorrectionGrid:
         if which == 'marcs':
             return ((self.marcs_rest if rest else self.marcs),
                     (self.marcs_feh, self.marcs_logg, self.marcs_logt))
+        if which == 'tlusty':
+            return ((self.tlusty_rest if rest else self.tlusty),
+                    (self.tlusty_feh, self.tlusty_logg, self.tlusty_logt))
         return (self.bb_rest if rest else self.bb), (self.bb_logt,)
 
     @property
@@ -1667,6 +1827,19 @@ class KCorrectionGrid:
                 linear[sel] |= lin_m & ok
                 hole[sel] = ~ok
                 src[np.flatnonzero(sel)[w == 1.0]] = SOURCE_MARCS
+            # the TLUSTY hot-star swap: every row inside its hull whose linear
+            # cell has a model at all corners; the rest keep their backend
+            if self.tlusty is not None and hot_stars_mode() == 'tlusty':
+                sel = ((lt >= self.tlusty_logt[0] - 1e-12) & (lt <= self.tlusty_logt[-1] + 1e-12)
+                       & (lg >= self.tlusty_logg[0]) & (lg <= self.tlusty_logg[-1]) & ~in_wd)
+                if sel.any():
+                    fe_t = np.clip(fe[sel], self.tlusty_feh[0], self.tlusty_feh[-1])
+                    vt, _ = self._eval('tlusty', (fe_t, lg[sel], lt[sel]), zz, dd, 'linear', ref)
+                    ok = np.isfinite(vt).all(axis=1)
+                    ii = np.flatnonzero(sel)[ok]
+                    out[ii] = vt[ok]
+                    linear[ii] = True
+                    src[ii] = SOURCE_TLUSTY
             return out, linear, src
 
         if quantity == 'rest':
@@ -1705,6 +1878,7 @@ class KCorrectionGrid:
                     method=method,
                     n_c3k=int((source == SOURCE_C3K).sum()),
                     n_wd=int((source == SOURCE_WD).sum()),
+                    n_tlusty=int((source == SOURCE_TLUSTY).sum()),
                     n_fallback=int((source == SOURCE_BB).sum()),
                     n_feh_clipped=int(feh_clipped.sum()),
                     redshift=z, bands=list(self.bands),
