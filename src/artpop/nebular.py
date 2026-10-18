@@ -233,6 +233,11 @@ class NebularConfig:
         sphere, ``'consistent'`` only. Default 0.22, the PHANGS-MUSE median
         (Barnes et al. 2026, A&A 706, A95). eps < 1 widens the sphere
         (``eps^(-1/3)``) and lowers U (``eps^(2/3)``) at fixed density.
+    log_u_offset : float
+        Dex added to the derived ``log_u`` (``'consistent'`` only; then clipped to
+        the grid). 0 (default) leaves everything bit-identical. A declared shift
+        for galaxies whose HII regions are more highly ionized than the
+        one-density Stromgren estimate gives (low-Z dwarfs: log U ~ -2.5 to -2).
     source_q_h : float or None
         Captured ionizing photons per second of the source that powers a
         typical nebula, ``'consistent'`` only; sets ``log_u``. Required in that
@@ -287,6 +292,7 @@ class NebularConfig:
     filling_factor: float = 0.22
     source_q_h: float = None
     log_u_unclipped: float = None
+    log_u_offset: float = 0.0
     dig_absorbed: float = 0.0
     dig_log_u: float = -3.7
     dig_log_p: float = 4.2
@@ -338,7 +344,12 @@ class NebularConfig:
             state = gas_state(self.source_q_h, self.n_h_cm3, self.filling_factor,
                               self.t_e_k, self.he1_h)
             object.__setattr__(self, 'log_p', state['log_p'])
-            object.__setattr__(self, 'log_u', state['log_u'])
+            log_u = state['log_u']
+            if float(self.log_u_offset):
+                # declared shift of the one-density log U (2026-10-18, ALVISS P-39):
+                # low-Z dwarf HII regions are [OIII]-strong, log U ~ -2.5 to -2
+                log_u = float(np.clip(state['log_u_unclipped'] + float(self.log_u_offset), *LOG_U_GRID))
+            object.__setattr__(self, 'log_u', log_u)
             object.__setattr__(self, 'log_u_unclipped', state['log_u_unclipped'])
             object.__setattr__(self, 'n_e_cm3', state['n_e_cm3'])
 
