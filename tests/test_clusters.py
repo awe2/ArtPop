@@ -461,6 +461,63 @@ class TestClusteredSource(TestCase):
         u1 = s1._sersic_unit_image((1201, 1201), 0.5)
         self.assertAlmostEqual(u1.sum(), s1._sersic_unit_image((1201, 1201)).sum(), delta=0.02)
 
+    def test_q9_locus_centres(self):
+        """Q9 (2026-10-20, P-52): centre_mode 'locus' puts every new site in a
+        Gaussian of spread x r_eff around one point offset x r_eff from the
+        centre (disk plane); the old SSP's stars do not move; bad modes are refused."""
+        from artpop.source import ClusteredSersicSP
+        n = 300
+        specs = [ClusterSpec(2, np.full(n, 1.0 / n), 20.0, age_myr=5.0)]
+        self.pop.rng = np.random.RandomState(31)
+        src = ClusteredSersicSP(self.pop, clusters=specs, centre_mode='locus',
+                                locus_offset_reff=0.8, locus_spread_reff=0.2, **_SRC_KW)
+        r_eff_pc = _SRC_KW['r_eff'] * 1e3
+        c = 0.8 * r_eff_pc * np.array([np.cos(src.locus_phi), np.sin(src.locus_phi)])
+        d = np.array([np.subtract(cl['disk_pc'], c) for cl in src.clusters]) / r_eff_pc
+        self.assertAlmostEqual(np.std(d[:, 0]), 0.2, delta=0.03)
+        self.assertAlmostEqual(np.std(d[:, 1]), 0.2, delta=0.03)
+        self.assertLess(np.hypot(*d.mean(axis=0)), 0.04)
+        self.pop.rng = np.random.RandomState(31)
+        ring = ClusteredSersicSP(self.pop, clusters=specs, **_SRC_KW)
+        k = ring.star_mask[:self.old.num_stars].sum()
+        np.testing.assert_array_equal(ring.xy[:k], src.xy[:k])
+        with self.assertRaises(ValueError):
+            ClusteredSersicSP(self.pop, clusters=specs, centre_mode='lopsided', **_SRC_KW)
+        with self.assertRaises(ValueError):
+            ClusteredSersicSP(self.pop, clusters=specs, diffuse_mode='ring', **_SRC_KW)
+
+    def test_q10_diffuse_on_the_complexes(self):
+        """Q10 (2026-10-20, P-52): diffuse_mode 'complexes' moves the f_diffuse
+        stars onto the complexes (within Plummer + smoothing of one) and their
+        smooth light onto the smoothed layout, conserving the smooth flux; the
+        default 'sersic' leaves the diffuse stars where they were."""
+        from artpop.source import ClusteredSersicSP
+        kw = dict(clusters=self.specs, r_peak_reff=0.6, width_reff=0.1, **_SRC_KW)
+        self.pop.rng = np.random.RandomState(11)
+        a = ClusteredSersicSP(self.pop, **kw)
+        self.pop.rng = np.random.RandomState(11)
+        b = ClusteredSersicSP(self.pop, diffuse_mode='complexes', diffuse_smooth_reff=0.05, **kw)
+        lab = self.pop.ssp_labels[b.star_mask]
+        diff = (lab == 3) & (b.star_component == 0)
+        self.assertGreater(diff.sum(), 20)
+        cx = np.array([[c['x'], c['y']] for c in b.clusters if c['label'] == 3])
+        a_px = max(c['a_px'] for c in b.clusters if c['label'] == 3)
+        sig = 0.05 * _SRC_KW['r_eff'] * 1e3 * b.px_per_pc
+        dist = np.min(np.hypot(b.xy[diff, None, 0] - cx[None, :, 0],
+                               b.xy[diff, None, 1] - cx[None, :, 1]), axis=1)
+        self.assertLess(np.median(dist), 2.0 * np.hypot(a_px, sig))
+        np.testing.assert_array_equal(a.xy[lab != 3], b.xy[lab != 3]) if (
+            a.star_mask.sum() == b.star_mask.sum()) else None
+        f = lambda m: 10 ** (0.4 * (27.0 - m))
+        for band in ('LSST_g', 'LSST_r'):
+            sa, _ = a.smooth_image(band, f, (901, 901))
+            sb, _ = b.smooth_image(band, f, (901, 901))
+            self.assertAlmostEqual(sb.sum() / sa.sum(), 1.0, delta=0.005)
+            yy, xx = np.mgrid[:901, :901]
+            r_px = _SRC_KW['r_eff'] * 1e3 * a.px_per_pc
+            inner = np.hypot(xx - 450, yy - 450) < 0.15 * r_px
+            self.assertLess(sb[inner].sum(), sa[inner].sum())
+
     def test_q7_bad_label(self):
         """Q7: a spec for a label the population does not have is refused."""
         from artpop.source import ClusteredSersicSP

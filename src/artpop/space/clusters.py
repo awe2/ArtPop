@@ -190,6 +190,31 @@ def ring_disk_offsets(n, r_eff_px, rng, r_peak_reff=0.4, width_reff=0.3,
     return np.column_stack([r * np.cos(phi), r * np.sin(phi)])
 
 
+def locus_disk_offsets(n, r_eff_px, rng, phi0, offset_reff=0.75, spread_reff=0.25,
+                       max_reff=2.0):
+    """
+    ``n`` centres as disk-plane offsets (pixels) clustered on one off-centre
+    locus (2026-10-20, P-52 "displaced locus" variant): an isotropic Gaussian of
+    ``spread_reff`` r_eff around the point ``offset_reff`` r_eff from the centre
+    at angle ``phi0`` (the caller draws it once per galaxy), truncated at
+    ``max_reff`` r_eff from the galaxy centre by rejection.
+    """
+    n = int(n)
+    if n == 0:
+        return np.zeros((0, 2))
+    r_eff_px = float(r_eff_px)
+    c = float(offset_reff) * r_eff_px * np.array([np.cos(phi0), np.sin(phi0)])
+    s = float(spread_reff) * r_eff_px
+    r_max = float(max_reff) * r_eff_px
+    if not (s > 0 and r_max > np.hypot(*c)):
+        return np.tile(c, (n, 1))
+    out = np.zeros((0, 2))
+    while len(out) < n:
+        cand = c + rng.normal(0.0, s, size=(2 * (n - len(out)) + 8, 2))
+        out = np.vstack([out, cand[np.hypot(cand[:, 0], cand[:, 1]) <= r_max]])
+    return out[:n]
+
+
 def disk_to_sky(xy_disk, theta_rad, ellip):
     """Disk-plane offsets -> sky offsets (y squashed by 1 - ellip, rotated by theta)."""
     xy = np.atleast_2d(np.asarray(xy_disk, dtype=float))

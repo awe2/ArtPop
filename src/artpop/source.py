@@ -323,6 +323,28 @@ class ClusteredSersicSP(SersicSP):
         Probability that a complex sits near an earlier one (0: independent).
     site_s0_pc, drift_kms : float
         The offset from the parent site: sigma = sqrt(s0^2 + (drift t)^2).
+    centre_mode : {'ring', 'locus'}
+        ``'ring'`` (default): new sites from the ring above. ``'locus'``
+        (2026-10-20, P-52 variant): every new site from an isotropic Gaussian of
+        ``locus_spread_reff`` r_eff around one point ``locus_offset_reff`` r_eff
+        from the centre, at an angle drawn once per galaxy
+        (`artpop.space.clusters.locus_disk_offsets`; ``max_reff`` still cuts).
+    locus_offset_reff, locus_spread_reff : float
+        The locus's distance from the centre and its spread, in r_eff.
+    diffuse_mode : {'sersic', 'complexes'}
+        Where the clustered SSPs' ``f_diffuse`` share (its stars and smooth
+        light) and the diffuse ionized gas go. ``'sersic'`` (default): on the
+        galaxy's Sersic (the SSP's ``ssp_reff_scale`` one for the stars).
+        ``'complexes'`` (2026-10-20, P-52 variant; real Halpha has no Sersic-like
+        central rise outside compact starbursts): on a smoothed copy of the
+        complexes' layout -- each diffuse star joins a complex drawn by weight,
+        offset by its Plummer plus a Gaussian of ``diffuse_smooth_reff`` r_eff;
+        the smooth share likewise; the DIG on the complexes of every SSP
+        weighted by their captured photons ``q_h``, smoothed the same way. A
+        source without complexes (or without ``q_h`` for the DIG) keeps the
+        Sersic.
+    diffuse_smooth_reff : float
+        The smoothing Gaussian's sigma, in r_eff.
 
     The other parameters are `SersicSP`'s.
     """
@@ -330,7 +352,8 @@ class ClusteredSersicSP(SersicSP):
     def __init__(self, sp, r_eff, n, theta, ellip, xy_dim, pixel_scale,
                  clusters=(), r_peak_reff=0.4, width_reff=0.3, max_reff=2.0,
                  site_reuse=0.0, site_s0_pc=20.0, drift_kms=5.0, width_out_reff=None,
-                 ssp_reff_scale=None,
+                 ssp_reff_scale=None, centre_mode='ring', locus_offset_reff=0.75,
+                 locus_spread_reff=0.25, diffuse_mode='sersic', diffuse_smooth_reff=0.25,
                  num_r_eff=10, dx=0, dy=0, labels=None, eta=1.0,
                  distance_angular=None):
         from .space.clusters import ClusterSpec
@@ -356,6 +379,20 @@ class ClusteredSersicSP(SersicSP):
             raise ValueError(f'site_reuse must be in [0, 1], got {site_reuse}')
         self.site_s0_pc = float(site_s0_pc)
         self.drift_kms = float(drift_kms)
+        if centre_mode not in ('ring', 'locus'):
+            raise ValueError(f"centre_mode must be 'ring' or 'locus', got {centre_mode!r}")
+        if diffuse_mode not in ('sersic', 'complexes'):
+            raise ValueError(f"diffuse_mode must be 'sersic' or 'complexes', got {diffuse_mode!r}")
+        self.centre_mode = centre_mode
+        self.locus_offset_reff = float(locus_offset_reff)
+        self.locus_spread_reff = float(locus_spread_reff)
+        self.diffuse_mode = diffuse_mode
+        self.diffuse_smooth_reff = float(diffuse_smooth_reff)
+        if not (0.0 <= self.locus_offset_reff < self.max_reff and self.locus_spread_reff > 0
+                and self.diffuse_smooth_reff > 0):
+            raise ValueError('need 0 <= locus_offset_reff < max_reff, locus_spread_reff > 0 '
+                             'and diffuse_smooth_reff > 0')
+        self.locus_phi = None
         self._r_eff_kpc = check_units(r_eff, 'kpc').to('kpc').value
         self._theta_rad = check_units(theta, 'deg').to('radian').value
         self._ellip = float(ellip)
@@ -388,8 +425,8 @@ class ClusteredSersicSP(SersicSP):
         return (xy_dim[0] // 2 + self.xy_kw['dx'], xy_dim[1] // 2 + self.xy_kw['dy'])
 
     def _draw_xy(self):
-        from .space.clusters import (ring_disk_offsets, disk_to_sky, plummer_offsets,
-                                     KMS_PC_PER_MYR)
+        from .space.clusters import (ring_disk_offsets, locus_disk_offsets, disk_to_sky,
+                                     plummer_offsets, KMS_PC_PER_MYR)
         xy = super(ClusteredSersicSP, self)._draw_xy()
         sp, rng = self.sp, self.xy_kw['random_state']
         pos = np.array(np.ma.getdata(xy), dtype=float, copy=True)
@@ -422,6 +459,11 @@ class ClusteredSersicSP(SersicSP):
             specs[i].age_myr is None, specs[i].age_myr or 0.0, i))
         site_disk, site_mass = np.zeros((0, 2)), np.zeros(0)
         site_ids = np.zeros(0, dtype=int)
+        # the locus angle: one draw per galaxy, only in that mode (the ring's
+        # random stream is untouched)
+        if self.centre_mode == 'locus':
+            self.locus_phi = float(rng.uniform(0.0, 2.0 * np.pi))
+        sig_diff_px = self.diffuse_smooth_reff * r_eff_px
         for si in order:
             spec = specs[si]
             n_c = spec.n_clusters
@@ -429,8 +471,13 @@ class ClusteredSersicSP(SersicSP):
             mass = spec.masses if spec.masses is not None else spec.weights
             # sites: a fresh ring draw for every complex, replaced by an offset
             # from an earlier (younger) complex with probability site_reuse
-            disk = ring_disk_offsets(n_c, r_eff_px, rng, self.r_peak_reff,
-                                     self.width_reff, self.max_reff, self.width_out_reff)
+            if self.centre_mode == 'locus':
+                disk = locus_disk_offsets(n_c, r_eff_px, rng, self.locus_phi,
+                                          self.locus_offset_reff, self.locus_spread_reff,
+                                          self.max_reff)
+            else:
+                disk = ring_disk_offsets(n_c, r_eff_px, rng, self.r_peak_reff,
+                                         self.width_reff, self.max_reff, self.width_out_reff)
             parent = np.full(n_c, -1, dtype=int)
             if site_mass.size and self.site_reuse > 0:
                 linked = rng.uniform(size=n_c) < self.site_reuse
@@ -474,6 +521,16 @@ class ClusteredSersicSP(SersicSP):
                     site=int(parent[c]) if parent[c] < 0 else int(site_ids[parent[c]]),
                     n_stars=int(members.size),
                     q_h=float(q_star[members].sum() + w_smooth * q_smooth)))
+            # diffuse stars on the smoothed layout of this bin's complexes
+            diffuse = idx[comp == 0]
+            if self.diffuse_mode == 'complexes' and n_c > 0 and diffuse.size:
+                w = np.asarray(spec.weights, dtype=float)
+                host = rng.choice(n_c, size=diffuse.size, p=w / w.sum())
+                for c in np.unique(host):
+                    sel = diffuse[host == c]
+                    pos[sel] = (np.array([x0, y0]) + centres[c]
+                                + plummer_offsets(sel.size, a_pc[c] * ppc, rng)
+                                + rng.normal(0.0, sig_diff_px, size=(sel.size, 2)))
             # this bin's complexes become sites for the older bins
             site_disk = np.vstack([site_disk, disk])
             site_mass = np.concatenate([site_mass, np.asarray(mass, dtype=float)])
@@ -532,6 +589,34 @@ class ClusteredSersicSP(SersicSP):
             self._cache[key] = img
         return self._cache[key]
 
+    def _layout_unit_image(self, shape, label=None):
+        """The smoothed layout of the complexes at unit total weight
+        (``diffuse_mode='complexes'``): for ``label``, its complexes weighted by
+        their ``weight``; for None (the DIG), every complex weighted by its
+        captured photons ``q_h``. Plummer stamps convolved with a Gaussian of
+        ``diffuse_smooth_reff`` r_eff; light beyond the frame is lost, as the
+        Sersic's is. None when there is nothing to weight."""
+        from scipy.ndimage import gaussian_filter
+        from .space.clusters import plummer_stamp, paint_stamp
+        key = ('layout', label, tuple(shape))
+        if key not in self._cache:
+            cls = [c for c in self.clusters if (c['label'] == label if label is not None else True)]
+            w = np.array([c['weight'] if label is not None else c['q_h'] for c in cls], dtype=float)
+            if not cls or not np.sum(w) > 0:
+                self._cache[key] = None
+            else:
+                img = np.zeros(shape)
+                for cl, wc in zip(cls, w / w.sum()):
+                    if not wc > 0:
+                        continue
+                    ix, iy = np.floor(cl['x'] + 0.5), np.floor(cl['y'] + 0.5)
+                    stamp, half = plummer_stamp(cl['a_px'], cl['x'] - ix, cl['y'] - iy,
+                                                max_half=max(shape))
+                    paint_stamp(img, stamp, half, cl['x'], cl['y'], wc)
+                sig = self.diffuse_smooth_reff * self._r_eff_kpc * 1e3 * self.px_per_pc
+                self._cache[key] = gaussian_filter(img, sig, mode='constant')
+        return self._cache[key]
+
     def _sersic_unit_image(self, shape, scale=1.0):
         """The Sersic model at unit total flux (zero point 0, magnitude 0), with
         its effective radius times ``scale`` (the amplitude goes as 1/scale^2)."""
@@ -585,7 +670,11 @@ class ClusteredSersicSP(SersicSP):
             spec = specs.get(label)
             s_lab = self.ssp_reff_scale.get(label, 1.0)
             share = flux if spec is None else spec.f_diffuse * flux
-            if s_lab == 1.0:
+            layout = (self._layout_unit_image(shape, label)
+                      if spec is not None and self.diffuse_mode == 'complexes' else None)
+            if layout is not None:
+                stars = stars + share * layout
+            elif s_lab == 1.0:
                 sersic_flux += share
             else:
                 scaled[s_lab] = scaled.get(s_lab, 0.0) + share
@@ -603,7 +692,9 @@ class ClusteredSersicSP(SersicSP):
                 setattr(self.smooth_model, name, amp)     # ArtPop's own side effect
                 stars = stars + sersic_flux * unit
             if dig_flux > 0:
-                gas = gas + dig_flux * unit
+                layout = (self._layout_unit_image(shape)
+                          if self.diffuse_mode == 'complexes' else None)
+                gas = gas + dig_flux * (unit if layout is None else layout)
         if self.smooth_model is not None:
             for s_lab, f_s in sorted(scaled.items()):
                 if f_s > 0:
