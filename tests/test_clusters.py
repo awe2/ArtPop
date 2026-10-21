@@ -518,6 +518,40 @@ class TestClusteredSource(TestCase):
             inner = np.hypot(xx - 450, yy - 450) < 0.15 * r_px
             self.assertLess(sb[inner].sum(), sa[inner].sum())
 
+    def test_q11_tabulated_profile(self):
+        """Q11 (2026-10-21, total-light age structure): an ``ssp_profile`` equal to the
+        Sersic of s x r_eff reproduces the ``ssp_reff_scale`` path -- the smooth image to
+        < 1 % of the flux and the sampler's half-number radius to < 2 % -- while the
+        other SSPs' stars are untouched; bad profiles are refused."""
+        from artpop.source import ClusteredSersicSP
+        from scipy.special import gammaincinv
+        n, s = _SRC_KW['n'], 0.5
+        b = gammaincinv(2 * n, 0.5)
+        x = np.concatenate([[0.0], np.logspace(-4, np.log10(12.0), 3000)])
+        sig = np.exp(-b * ((x / s) ** (1.0 / n) - 1.0))
+        self.pop.rng = np.random.RandomState(5)
+        a = ClusteredSersicSP(self.pop, ssp_reff_scale={1: s}, **_SRC_KW)
+        self.pop.rng = np.random.RandomState(5)
+        c = ClusteredSersicSP(self.pop, ssp_profile={1: (x, sig)}, **_SRC_KW)
+        f = lambda m: 10 ** (0.4 * (27.0 - m))
+        ia, _ = a.smooth_image('LSST_g', f, (901, 901))
+        ic, _ = c.smooth_image('LSST_g', f, (901, 901))
+        self.assertLess(np.abs(ia - ic).sum() / ia.sum(), 0.01)
+        lab_a, lab_c = self.pop.ssp_labels[a.star_mask], self.pop.ssp_labels[c.star_mask]
+        # the sampler itself, with many draws: the half-number elliptical radius of a
+        # Sersic of s r_eff is s r_eff
+        xy = c._profile_xy((x, sig), 20000, np.random.RandomState(9))
+        th, e = np.radians(_SRC_KW['theta']), _SRC_KW['ellip']
+        dx, dy = xy[:, 0] - 450, xy[:, 1] - 450
+        xm, xn = dx * np.cos(th) + dy * np.sin(th), -dx * np.sin(th) + dy * np.cos(th)
+        self.assertAlmostEqual(np.median(np.hypot(xm, xn / (1 - e))) / (s * c._galaxy_r_eff_px()), 1.0,
+                               delta=0.02)
+        if a.star_mask.sum() == c.star_mask.sum():
+            np.testing.assert_array_equal(a.xy[lab_a != 1], c.xy[lab_c != 1])
+        for bad in ((x[1:], sig[1:]), (x, -sig), (x[::-1], sig)):
+            with self.assertRaises(ValueError):
+                ClusteredSersicSP(self.pop, ssp_profile={1: bad}, **_SRC_KW)
+
     def test_q7_bad_label(self):
         """Q7: a spec for a label the population does not have is refused."""
         from artpop.source import ClusteredSersicSP

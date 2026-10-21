@@ -345,6 +345,15 @@ class ClusteredSersicSP(SersicSP):
         Sersic.
     diffuse_smooth_reff : float
         The smoothing Gaussian's sigma, in r_eff.
+    ssp_profile : dict or None
+        ``{label: (x, sigma)}`` (2026-10-21, total-light age structure): the
+        stars of SSP ``label`` that are not in complexes, and its Sersic share of
+        smooth light, follow the tabulated radial surface density ``sigma(x)``
+        (any normalisation) of the elliptical radius ``x`` in units of the
+        galaxy's r_eff, with the galaxy's ellipticity and angle, instead of a
+        Sersic. A label listed here ignores ``ssp_reff_scale``. ``x`` must be
+        increasing from 0 and reach at least ``num_r_eff``. None (default): the
+        Sersic path, unchanged.
 
     The other parameters are `SersicSP`'s.
     """
@@ -354,7 +363,7 @@ class ClusteredSersicSP(SersicSP):
                  site_reuse=0.0, site_s0_pc=20.0, drift_kms=5.0, width_out_reff=None,
                  ssp_reff_scale=None, centre_mode='ring', locus_offset_reff=0.75,
                  locus_spread_reff=0.25, diffuse_mode='sersic', diffuse_smooth_reff=0.25,
-                 num_r_eff=10, dx=0, dy=0, labels=None, eta=1.0,
+                 ssp_profile=None, num_r_eff=10, dx=0, dy=0, labels=None, eta=1.0,
                  distance_angular=None):
         from .space.clusters import ClusterSpec
         self.cluster_specs = [ClusterSpec.coerce(c) for c in (clusters or [])]
@@ -400,6 +409,14 @@ class ClusteredSersicSP(SersicSP):
                                if float(v) != 1.0}
         if any(not v > 0 for v in self.ssp_reff_scale.values()):
             raise ValueError(f'ssp_reff_scale values must be > 0, got {ssp_reff_scale}')
+        self.ssp_profile = {}
+        for k, (x, sig) in (ssp_profile or {}).items():
+            x, sig = np.asarray(x, dtype=float), np.asarray(sig, dtype=float)
+            if (x.ndim != 1 or x.shape != sig.shape or x[0] != 0 or np.any(np.diff(x) <= 0)
+                    or np.any(sig < 0) or not np.any(sig > 0)):
+                raise ValueError(f'ssp_profile[{k}] must be (x, sigma) with x increasing from 0 '
+                                 f'and sigma >= 0, not all zero')
+            self.ssp_profile[int(k)] = (x, sig)
         self._cache = {}
         super(ClusteredSersicSP, self).__init__(
             sp, r_eff, n, theta, ellip, xy_dim, pixel_scale,
@@ -446,10 +463,17 @@ class ClusteredSersicSP(SersicSP):
         # per-SSP sizes (age gradients): redraw those SSPs' stars from a Sersic of
         # s x r_eff; complex members are moved onto their complexes below anyway
         for label, s in sorted(self.ssp_reff_scale.items()):
+            if label in self.ssp_profile:
+                continue
             idx = np.flatnonzero(ssp_labels == label)
             if idx.size:
                 kw = dict(self.xy_kw, num_stars=int(idx.size), r_eff=self.xy_kw['r_eff'] * s)
                 pos[idx] = np.array(np.ma.getdata(sersic_xy(**kw)), dtype=float)
+        # tabulated per-SSP profiles (total-light age structure)
+        for label, prof in sorted(self.ssp_profile.items()):
+            idx = np.flatnonzero(ssp_labels == label)
+            if idx.size:
+                pos[idx] = self._profile_xy(prof, int(idx.size), rng)
 
         self._star_cluster_full = np.full(n_star, -1, dtype=int)
         self._star_component_full = np.full(n_star, -1, dtype=int)
@@ -617,6 +641,53 @@ class ClusteredSersicSP(SersicSP):
                 self._cache[key] = gaussian_filter(img, sig, mode='constant')
         return self._cache[key]
 
+    def _galaxy_r_eff_px(self):
+        """The galaxy's r_eff in position (xy_dim) pixels, as sersic_xy computes it."""
+        d = check_units(self.xy_kw['distance'], 'Mpc').to('Mpc').value
+        r = check_units(self.xy_kw['r_eff'], 'kpc').to('Mpc').value
+        ps = check_units(self.xy_kw['pixel_scale'], u.arcsec / u.pixel)
+        r_as = np.arctan2(r, d) * u.radian.to('arcsec') * u.arcsec
+        return r_as.to('pixel', u.pixel_scale(ps)).value
+
+    def _profile_xy(self, prof, num, rng):
+        """Positions from a tabulated radial profile (x in r_eff, sigma), with the
+        galaxy's ellipticity, angle and centre (the geometry of sersic_xy)."""
+        x, sig = prof
+        xmax = float(self.xy_kw.get('num_r_eff', 10))
+        m = x <= xmax
+        xs, ss = x[m], sig[m]
+        pdf = ss * xs
+        cdf = np.concatenate([[0.0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(xs))])
+        cdf /= cdf[-1]
+        keep = np.concatenate([[True], np.diff(cdf) > 0])
+        radii = np.interp(rng.uniform(size=num), cdf[keep], xs[keep]) * self._galaxy_r_eff_px()
+        ang = rng.uniform(0.0, 2.0 * np.pi, size=num)
+        ell = float(self.xy_kw['ellip'])
+        th = check_units(self.xy_kw['theta'], 'deg').to('radian').value
+        xx, yy = radii * np.cos(ang), radii * np.sin(ang) * (1.0 - ell)
+        xy_dim = check_xy_dim(self.xy_kw['xy_dim'])
+        ct, st = np.cos(th), np.sin(th)
+        return np.column_stack([ct * xx - st * yy + (xy_dim[0] // 2 + self.xy_kw['dx']),
+                                st * xx + ct * yy + (xy_dim[1] // 2 + self.xy_kw['dy'])])
+
+    def _profile_unit_image(self, shape, label):
+        """SSP ``label``'s tabulated profile on the smooth model's grid, unit sum."""
+        key = ('profile', int(label), tuple(shape))
+        if key not in self._cache:
+            x, sig = self.ssp_profile[label]
+            mdl = self.smooth_model
+            th, ell = float(mdl.theta.value), float(mdl.ellip.value)
+            x0, y0 = float(mdl.x_0.value), float(mdl.y_0.value)
+            yy, xx = np.mgrid[:shape[0], :shape[1]]
+            ct, st = np.cos(th), np.sin(th)
+            xm = (xx - x0) * ct + (yy - y0) * st
+            xn = -(xx - x0) * st + (yy - y0) * ct
+            z = np.hypot(xm, xn / (1.0 - ell)) / float(mdl.r_eff.value)
+            img = np.interp(z, x, sig, right=0.0)
+            tot = img.sum()
+            self._cache[key] = img / tot if tot > 0 else img
+        return self._cache[key]
+
     def _sersic_unit_image(self, shape, scale=1.0):
         """The Sersic model at unit total flux (zero point 0, magnitude 0), with
         its effective radius times ``scale`` (the amplitude goes as 1/scale^2)."""
@@ -674,6 +745,8 @@ class ClusteredSersicSP(SersicSP):
                       if spec is not None and self.diffuse_mode == 'complexes' else None)
             if layout is not None:
                 stars = stars + share * layout
+            elif label in self.ssp_profile:
+                stars = stars + share * self._profile_unit_image(shape, label)
             elif s_lab == 1.0:
                 sersic_flux += share
             else:
