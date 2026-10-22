@@ -319,9 +319,22 @@ def extinction_curve(law='F99', r_v=3.1):
         return lambda lam: np.ones_like(np.asarray(lam, dtype=float))
     if law == 'CCM89':
         return lambda lam: _ccm89(1e4 / np.asarray(lam, dtype=float), r_v)
+    if law == 'SMC':
+        # 2026-10-22 (ALVISS conditional check): the SMC bar average (Gordon et al. 2003; R_V 2.74 is the
+        # law's own, so r_v is ignored) -- no 2175 A bump, a steep far-UV rise -- for dust INSIDE dwarfs
+        # (host and birth clouds). Clipped to its validity range (0.1-3.3 um) like F99, so W1/W2 take the
+        # 3.3 um value.
+        from dust_extinction.averages import G03_SMCBar
+        smc = G03_SMCBar()
+        lo, hi = smc.x_range
+
+        def _smc(lam):
+            x = 1e4 / np.asarray(lam, dtype=float)
+            return np.asarray(smc(np.clip(x, lo * 1.000001, hi * 0.999999)))
+        return _smc
     if law != 'F99':
         raise ValueError(f"unknown extinction law {law!r}; "
-                         "expected 'F99', 'CCM89' or 'grey'")
+                         "expected 'F99', 'SMC', 'CCM89' or 'grey'")
     try:
         from dust_extinction.parameter_averages import F99
         model = F99(Rv=float(r_v))
