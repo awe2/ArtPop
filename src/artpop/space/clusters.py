@@ -33,7 +33,7 @@ import numpy as np
 
 __all__ = ['cluster_weights', 'sample_cmf_to_budget', 'cmf_mass_fraction',
            'complex_scale_pc', 'ring_surface_density', 'ring_disk_offsets',
-           'disk_to_sky', 'cluster_centres', 'plummer_offsets', 'plummer_stamp',
+           'sersic_disk_offsets', 'disk_to_sky', 'cluster_centres', 'plummer_offsets', 'plummer_stamp',
            'paint_stamp', 'ClusterSpec', 'KMS_PC_PER_MYR']
 
 # 1 km/s in pc/Myr
@@ -214,6 +214,27 @@ def locus_disk_offsets(n, r_eff_px, rng, phi0, offset_reff=0.75, spread_reff=0.2
         out = np.vstack([out, cand[np.hypot(cand[:, 0], cand[:, 1]) <= r_max]])
     return out[:n]
 
+
+
+def sersic_disk_offsets(n, r_eff_px, rng, sersic_n=1.0, max_reff=4.0):
+    """
+    ``n`` centres as disk-plane offsets (pixels) whose surface density is a
+    Sersic of index ``sersic_n`` and effective radius ``r_eff_px`` (2026-10-23,
+    user: the young disc and the halo complexes of the 'disk' layout follow the
+    old light's Sersic): radius by inverting the enclosed light, truncated at
+    ``max_reff`` r_eff; angle uniform.
+    """
+    from scipy.special import gammainc, gammaincinv
+    n = int(n)
+    if n == 0:
+        return np.zeros((0, 2))
+    k = 2.0 * float(sersic_n)
+    b_n = gammaincinv(k, 0.5)
+    u_max = gammainc(k, b_n * float(max_reff) ** (1.0 / float(sersic_n)))
+    u = rng.uniform(0.0, u_max, size=n)
+    r = float(r_eff_px) * (gammaincinv(k, u) / b_n) ** float(sersic_n)
+    phi = rng.uniform(0.0, 2.0 * np.pi, size=n)
+    return np.column_stack([r * np.cos(phi), r * np.sin(phi)])
 
 def disk_to_sky(xy_disk, theta_rad, ellip):
     """Disk-plane offsets -> sky offsets (y squashed by 1 - ellip, rotated by theta)."""

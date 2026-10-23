@@ -331,6 +331,18 @@ class ClusteredSersicSP(SersicSP):
         (`artpop.space.clusters.locus_disk_offsets`; ``max_reff`` still cuts).
     locus_offset_reff, locus_spread_reff : float
         The locus's distance from the centre and its spread, in r_eff.
+        ``'disk'`` (2026-10-23, user; LITTLE THINGS): a new site is, with
+        probability ``disk_halo_fraction``, a halo site on the galaxy's own
+        Sersic (n, r_eff, ellipticity, angle; centred), else a site on the
+        young disc -- the same Sersic in its own plane, projected with the
+        galaxy's angle and axis ratio ``disk_q_factor`` x (1 - ellip), its
+        centre displaced by ``disk_offset_pc`` at angle ``disk_phi`` (radians,
+        from the major axis). Both are truncated at ``disk_max_reff`` r_eff
+        (`artpop.space.clusters.sersic_disk_offsets`). A reused site keeps its
+        parent's kind.
+    disk_halo_fraction, disk_offset_pc, disk_phi, disk_q_factor, disk_max_reff : float
+        The 'disk' layout's parameters (the caller draws the offset, angle and
+        q factor per galaxy).
     diffuse_mode : {'sersic', 'complexes'}
         Where the clustered SSPs' ``f_diffuse`` share (its stars and smooth
         light) and the diffuse ionized gas go. ``'sersic'`` (default): on the
@@ -363,7 +375,8 @@ class ClusteredSersicSP(SersicSP):
                  site_reuse=0.0, site_s0_pc=20.0, drift_kms=5.0, width_out_reff=None,
                  ssp_reff_scale=None, centre_mode='ring', locus_offset_reff=0.75,
                  locus_spread_reff=0.25, diffuse_mode='sersic', diffuse_smooth_reff=0.25,
-                 ssp_profile=None, num_r_eff=10, dx=0, dy=0, labels=None, eta=1.0,
+                 disk_halo_fraction=0.1, disk_offset_pc=0.0, disk_phi=0.0, disk_q_factor=1.0,
+                 disk_max_reff=4.0, ssp_profile=None, num_r_eff=10, dx=0, dy=0, labels=None, eta=1.0,
                  distance_angular=None):
         from .space.clusters import ClusterSpec
         self.cluster_specs = [ClusterSpec.coerce(c) for c in (clusters or [])]
@@ -388,8 +401,8 @@ class ClusteredSersicSP(SersicSP):
             raise ValueError(f'site_reuse must be in [0, 1], got {site_reuse}')
         self.site_s0_pc = float(site_s0_pc)
         self.drift_kms = float(drift_kms)
-        if centre_mode not in ('ring', 'locus'):
-            raise ValueError(f"centre_mode must be 'ring' or 'locus', got {centre_mode!r}")
+        if centre_mode not in ('ring', 'locus', 'disk'):
+            raise ValueError(f"centre_mode must be 'ring', 'locus' or 'disk', got {centre_mode!r}")
         if diffuse_mode not in ('sersic', 'complexes'):
             raise ValueError(f"diffuse_mode must be 'sersic' or 'complexes', got {diffuse_mode!r}")
         self.centre_mode = centre_mode
@@ -402,6 +415,15 @@ class ClusteredSersicSP(SersicSP):
             raise ValueError('need 0 <= locus_offset_reff < max_reff, locus_spread_reff > 0 '
                              'and diffuse_smooth_reff > 0')
         self.locus_phi = None
+        self.disk_halo_fraction = float(disk_halo_fraction)
+        self.disk_offset_pc = float(disk_offset_pc)
+        self.disk_phi = float(disk_phi)
+        self.disk_q_factor = float(disk_q_factor)
+        self.disk_max_reff = float(disk_max_reff)
+        if not (0.0 <= self.disk_halo_fraction <= 1.0 and self.disk_offset_pc >= 0
+                and 0.0 < self.disk_q_factor <= 1.0 and self.disk_max_reff > 0):
+            raise ValueError('need disk_halo_fraction in [0, 1], disk_offset_pc >= 0, '
+                             'disk_q_factor in (0, 1] and disk_max_reff > 0')
         self._r_eff_kpc = check_units(r_eff, 'kpc').to('kpc').value
         self._theta_rad = check_units(theta, 'deg').to('radian').value
         self._ellip = float(ellip)
@@ -442,8 +464,8 @@ class ClusteredSersicSP(SersicSP):
         return (xy_dim[0] // 2 + self.xy_kw['dx'], xy_dim[1] // 2 + self.xy_kw['dy'])
 
     def _draw_xy(self):
-        from .space.clusters import (ring_disk_offsets, locus_disk_offsets, disk_to_sky,
-                                     plummer_offsets, KMS_PC_PER_MYR)
+        from .space.clusters import (ring_disk_offsets, locus_disk_offsets, sersic_disk_offsets,
+                                     disk_to_sky, plummer_offsets, KMS_PC_PER_MYR)
         xy = super(ClusteredSersicSP, self)._draw_xy()
         sp, rng = self.sp, self.xy_kw['random_state']
         pos = np.array(np.ma.getdata(xy), dtype=float, copy=True)
@@ -483,6 +505,13 @@ class ClusteredSersicSP(SersicSP):
             specs[i].age_myr is None, specs[i].age_myr or 0.0, i))
         site_disk, site_mass = np.zeros((0, 2)), np.zeros(0)
         site_ids = np.zeros(0, dtype=int)
+        site_halo = np.zeros(0, dtype=bool)
+        # the 'disk' layout: the young disc's sky offset from the galaxy centre (drawn by the
+        # caller, in the major-axis frame) and its ellipticity, q_disk = disk_q_factor x q
+        off_sky = disk_to_sky(self.disk_offset_pc * ppc * np.array([[np.cos(self.disk_phi),
+                                                                      np.sin(self.disk_phi)]]),
+                              self._theta_rad, 0.0)[0]
+        ellip_disk = 1.0 - self.disk_q_factor * (1.0 - self._ellip)
         # the locus angle: one draw per galaxy, only in that mode (the ring's
         # random stream is untouched)
         if self.centre_mode == 'locus':
@@ -495,7 +524,12 @@ class ClusteredSersicSP(SersicSP):
             mass = spec.masses if spec.masses is not None else spec.weights
             # sites: a fresh ring draw for every complex, replaced by an offset
             # from an earlier (younger) complex with probability site_reuse
-            if self.centre_mode == 'locus':
+            halo = np.zeros(n_c, dtype=bool)
+            if self.centre_mode == 'disk':
+                halo = rng.uniform(size=n_c) < self.disk_halo_fraction
+                disk = sersic_disk_offsets(n_c, r_eff_px, rng, float(self.xy_kw['n']),
+                                           self.disk_max_reff)
+            elif self.centre_mode == 'locus':
                 disk = locus_disk_offsets(n_c, r_eff_px, rng, self.locus_phi,
                                           self.locus_offset_reff, self.locus_spread_reff,
                                           self.max_reff)
@@ -512,7 +546,13 @@ class ClusteredSersicSP(SersicSP):
                                       self.drift_kms * KMS_PC_PER_MYR * age) * ppc
                     disk[linked] = (site_disk[parent[linked]]
                                     + rng.normal(0.0, sig_px, size=(int(linked.sum()), 2)))
-            centres = disk_to_sky(disk, self._theta_rad, self._ellip)
+                    halo[linked] = site_halo[parent[linked]]
+            if self.centre_mode == 'disk':
+                # halo sites on the old light (centred, its q); disc sites on the young disc
+                centres = np.where(halo[:, None], disk_to_sky(disk, self._theta_rad, self._ellip),
+                                   disk_to_sky(disk, self._theta_rad, ellip_disk) + off_sky)
+            else:
+                centres = disk_to_sky(disk, self._theta_rad, self._ellip)
             if spec.a_sigma_dex > 0:
                 a_pc = spec.a_pc * 10 ** (spec.a_sigma_dex * rng.normal(size=n_c))
             else:
@@ -543,6 +583,7 @@ class ClusteredSersicSP(SersicSP):
                     mass=None if spec.masses is None else float(spec.masses[c]),
                     age_myr=spec.age_myr,
                     site=int(parent[c]) if parent[c] < 0 else int(site_ids[parent[c]]),
+                    kind=(('halo' if halo[c] else 'disk') if self.centre_mode == 'disk' else None),
                     n_stars=int(members.size),
                     q_h=float(q_star[members].sum() + w_smooth * q_smooth)))
             # diffuse stars on the smoothed layout of this bin's complexes
@@ -559,6 +600,7 @@ class ClusteredSersicSP(SersicSP):
             site_disk = np.vstack([site_disk, disk])
             site_mass = np.concatenate([site_mass, np.asarray(mass, dtype=float)])
             site_ids = np.concatenate([site_ids, np.arange(first_id, first_id + n_c)])
+            site_halo = np.concatenate([site_halo, halo])
 
         xy_dim = check_xy_dim(self.xy_kw['xy_dim'])
         outside = ((pos[:, 0] < 0) | (pos[:, 0] > xy_dim[0] - 1) |
