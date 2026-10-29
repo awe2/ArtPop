@@ -285,13 +285,17 @@ class BPASSIsochrone:
     def __init__(self, kind, feh, lo_yr, hi_yr, phot_system, redshift=0.0, a_v_host=0.0,
                  a_v_mw=0.0, r_v=3.1, extinction_law='F99', kcorr_grid=None, kcorr_kw=None,
                  nebular=None, bolometric='teff', cool_giants='marcs', z_sun=0.0142,
-                 jitter=True, path=None):
+                 jitter=True, path=None, p_present=None):
         from ..filters import get_filter_names, phot_system_lookup
         from ..nebular import NebularConfig
         from ..nebular import is_active as nebular_active
         self.star_list = sl = BPASSStarList(kind, feh, lo_yr, hi_yr, z_sun=z_sun, path=path)
         self.kind, self.feh = kind, float(feh)
         self.lo_yr, self.hi_yr = float(lo_yr), float(hi_yr)
+        # present-day mass (with remnants) per formed Msun in the caller's
+        # convention (ALVISS: MIST v2.5 + Kroupa, per bin); None: total_mass is
+        # the formed mass
+        self.p_present = None if p_present is None else float(p_present)
         # the bin's mean age at constant SFR (what young_row_mask compares to t_bc)
         self.log_age = float(np.log10(0.5 * (self.lo_yr + self.hi_yr)))
         n = len(sl)
@@ -423,6 +427,14 @@ class BPASSIsochrone:
             w = w * self.mact
         return w / w.sum()
 
+    def ssp_surviving_mass(self, imf=None, m_min=None, m_max=None, add_remnants=True, **kwargs):
+        """Per formed Msun: the listed live mass, or (``add_remnants``) the
+        caller's ``p_present`` (1 without it), so ArtPop's remnant factor is
+        live / p_present and ``total_mass`` keeps the caller's convention."""
+        if add_remnants:
+            return 1.0 if self.p_present is None else self.p_present
+        return self.star_list.live_mass_per_msun
+
     def imf_bin_edges(self, m_min_norm=None):
         i = np.arange(self.n_rows, dtype=float)
         return i, i + 1.0
@@ -474,9 +486,11 @@ def _bpass_ssp_class():
 
         def __init__(self, kind, feh, lo_yr, hi_yr, phot_system, total_mass=None,
                      num_stars=None, p_present=None, distance=None, a_lam=0.0,
-                     mag_limit=None, mag_limit_band=None, random_state=None, **iso_kw):
+                     mag_limit=None, mag_limit_band=None, random_state=None, isochrone=None,
+                     **iso_kw):
             from astropy import units as u
-            iso = BPASSIsochrone(kind, feh, lo_yr, hi_yr, phot_system, **iso_kw)
+            iso = isochrone if isochrone is not None else BPASSIsochrone(
+                kind, feh, lo_yr, hi_yr, phot_system, p_present=p_present, **iso_kw)
             self.kind, self.feh, self.log_age = kind, float(feh), iso.log_age
             self.lo_yr, self.hi_yr = float(lo_yr), float(hi_yr)
             self.phot_system = phot_system
@@ -491,13 +505,6 @@ def _bpass_ssp_class():
                              random_state=random_state, sampling='lf')
             self._r.update({'BPASS': f'v2.2.1 {kind}', 'bin (Myr)': f'{lo_yr / 1e6:g}-{hi_yr / 1e6:g}',
                             '[Fe/H]': self.feh})
-
-        def _remnants_factor(self, **kwargs):
-            """Listed live mass per unit of `total_mass`: BPASS's own live mass per
-            formed Msun over ``p_present`` (1 without it). The few stars below
-            the L grid (< 0.3 Msun, no light) count with the remnants."""
-            p = 1.0 if self.p_present is None else self.p_present
-            return self.isochrone.star_list.live_mass_per_msun / p
 
         def _attach_nebular(self):
             """Per-star nebular share and photons from the star's own row (the
