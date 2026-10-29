@@ -593,6 +593,8 @@ class MappingsLineTable:
 SOURCE_C3K, SOURCE_C3K_BB, SOURCE_BB = 0, 1, 2
 # 3: TLUSTY 2025 (only with ARTPOP_HOT_STARS=tlusty; the 2026-10-16 evaluation)
 SOURCE_TLUSTY = 3
+# 4-6: the 'full' set (ARTPOP_HOT_STARS=full, 2026-10-29; `artpop.hotstars`)
+SOURCE_POWR_OB, SOURCE_POWR_WN, SOURCE_GOTBERG = 4, 5, 6
 _TLUSTY_BLOCKS = {}
 
 
@@ -677,7 +679,46 @@ def _c3k_block(lib, feh):
     return _C3K_BLOCKS[key]
 
 
-def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
+def _hot_source(family):
+    name = family[0][0] if isinstance(family, tuple) else family
+    return (SOURCE_TLUSTY if name == 'tlusty' else SOURCE_POWR_OB if name.startswith('powr_ob')
+            else SOURCE_POWR_WN if name.startswith('powr_wn') else SOURCE_GOTBERG)
+
+
+def _hot_rows(lt, lg, feh, hot):
+    """The 'full' hot-star set on the rows the router serves: groups of
+    ``(rows, lam, f_lam)`` (unit bolometric flux) and the per-row source."""
+    from .hotstars import route, families, family_spectra
+    from .kcorrect import TlustyLibrary
+    hk = dict(hot or {})
+    avail = list(families()) + (['tlusty'] if TlustyLibrary().available else [])
+    plan = route(lt, lg, feh, h_class=hk.get('h_class'), log_l=hk.get('log_l'),
+                 mass=hk.get('mass'), x_h=hk.get('x_h'), available=avail)
+    served = np.zeros(lt.size, dtype=bool)
+    src = np.full(lt.size, -1, dtype=np.int8)
+    groups = []
+    for c in sorted(plan, key=lambda c: c['rank']):
+        keep = ~served[c['rows']]
+        rows, ax2 = c['rows'][keep], c['ax2'][keep]
+        if not rows.size:
+            continue
+        if c['family'] == 'tlusty':
+            hit = _tlusty_rows(lt[rows], ax2, feh)
+            if hit is None:
+                continue
+            ok_rows, lam, f = rows[hit[0]], hit[1], hit[2]
+        else:
+            lam, f = family_spectra(c['family'], feh, ax2, lt[rows])
+            ok = np.isfinite(f).all(axis=1)
+            ok_rows, f = rows[ok], f[ok]
+        if ok_rows.size:
+            groups.append((ok_rows, lam, f))
+            served[ok_rows] = True
+            src[ok_rows] = _hot_source(c['family'])
+    return groups, served, src
+
+
+def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None, hot=None):
     """
     One spectrum per row, **normalised to unit bolometric flux**.
 
@@ -707,7 +748,12 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
     in_hull = ((lt >= t_lo) & (lt <= t_hi)
                & (lg >= C3K_HULL['logg'][0]) & (lg <= C3K_HULL['logg'][1]))
     from .kcorrect import hot_stars_mode
-    if hot_stars_mode() == 'tlusty':
+    if hot_stars_mode() == 'full' or hot is not None:
+        hgroups, served, hsrc = _hot_rows(lt, lg, feh, hot)
+        groups.extend(hgroups)
+        source[served] = hsrc[served]
+        in_hull[served] = False
+    elif hot_stars_mode() == 'tlusty':
         hit = _tlusty_rows(lt, lg, feh)
         if hit is not None:
             groups.append(hit)
@@ -763,7 +809,7 @@ def ionizing_photons_per_erg(lam, f_lam):
 
 
 def ionizing_rate(log_teff, log_g, log_l, feh, resolution='c3k_hr',
-                  spectra=None):
+                  spectra=None, hot=None):
     """
     Hydrogen-ionizing photon rate ``Q_H`` (photons / s) of each row, before
     any capture by the nebula (no knob, no Teff threshold).
@@ -774,7 +820,7 @@ def ionizing_rate(log_teff, log_g, log_l, feh, resolution='c3k_hr',
     ll = np.atleast_1d(np.asarray(log_l, dtype=float))
     q_h = np.zeros(lt.size)
     groups, source = row_spectra(lt, log_g, feh, resolution=resolution,
-                                 spectra=spectra)
+                                 spectra=spectra, hot=hot)
     for idx, lam, f in groups:
         q_h[idx] = ionizing_photons_per_erg(lam, f) * 10 ** ll[idx] * L_SUN
     return q_h, source
@@ -1018,9 +1064,11 @@ def young_row_mask(log_age, log_teff, cfg):
 
 def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
                   redshift=0.0, a_v_host=0.0, a_v_mw=0.0, extinction_law='F99',
-                  r_v=3.1, resolution='c3k_hr', spectra=None):
+                  r_v=3.1, resolution='c3k_hr', spectra=None, hot=None):
     """
-    The nebular correction for one isochrone's magnitude columns.
+    The nebular correction for one isochrone's magnitude columns. ``hot``:
+    per-row ``h_class`` / ``log_l`` / ``mass`` for the 'full' hot-star set
+    (`artpop.hotstars.route`); None treats every row as H-rich.
 
     Parameters
     ----------
@@ -1054,9 +1102,11 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
     info['n_line_rows'] = int((rows & ob).sum()) if k > 0 else 0
     ext = extinction_curve(extinction_law, r_v)
     idx_all = np.flatnonzero(rows)
+    hot_rows = None if hot is None else {
+        key: (np.asarray(v)[rows] if np.ndim(v) else v) for key, v in hot.items()}
     groups, source = row_spectra(np.asarray(log_teff)[rows],
                                  np.asarray(log_g)[rows], feh,
-                                 resolution=resolution, spectra=spectra)
+                                 resolution=resolution, spectra=spectra, hot=hot_rows)
     info['source'][idx_all] = source
 
     # gas: MAPPINGS ratios at (O/H, U, P); Hbeta from each row's Q_H

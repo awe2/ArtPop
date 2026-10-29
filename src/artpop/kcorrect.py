@@ -84,14 +84,21 @@ def tlusty_path():
 
 
 def hot_stars_mode():
-    """The hot-star library: ``'tlusty'`` when ``$ARTPOP_HOT_STARS`` says so,
-    else None (C3K, blackbody-filled, and blackbodies above 50 kK; the
-    production behaviour). An evaluation switch (2026-10-16), not a config key."""
+    """The hot-star library set, from ``$ARTPOP_HOT_STARS``:
+
+    * empty / ``none`` / ``c3k``: None -- C3K, blackbody-filled, and
+      blackbodies above 50 kK (the production behaviour);
+    * ``tlusty``: the 2026-10-16 evaluation, TLUSTY swapped in for every row
+      inside its hull whatever the star is;
+    * ``full`` (2026-10-29): TLUSTY + PoWR + Götberg, routed per star by
+      hydrogen class, temperature and wind (`artpop.hotstars.route`).
+
+    An evaluation switch, not a config key."""
     v = (os.environ.get('ARTPOP_HOT_STARS') or '').strip().lower()
     if v in ('', 'none', 'c3k'):
         return None
-    if v != 'tlusty':
-        raise ValueError(f"ARTPOP_HOT_STARS must be 'tlusty' or empty, got {v!r}")
+    if v not in ('tlusty', 'full'):
+        raise ValueError(f"ARTPOP_HOT_STARS must be 'tlusty', 'full' or empty, got {v!r}")
     return v
 
 
@@ -222,8 +229,23 @@ _N_LAM = {'c3k_hr': 10992, 'c3k_lr': 1936}
 # Source of the K value at a node, recorded alongside every interpolation so a
 # fallback is never silent (test B5).
 SOURCE_C3K, SOURCE_WD, SOURCE_BB, SOURCE_MARCS, SOURCE_TLUSTY = 0, 1, 2, 3, 4
+# the 'full' hot-star set (2026-10-29, `artpop.hotstars`)
+SOURCE_POWR_OB, SOURCE_POWR_WN, SOURCE_GOTBERG = 5, 6, 7
 SOURCE_NAMES = {SOURCE_C3K: 'C3K', SOURCE_WD: 'Tremblay', SOURCE_BB: 'blackbody',
-                SOURCE_MARCS: 'MARCS', SOURCE_TLUSTY: 'TLUSTY'}
+                SOURCE_MARCS: 'MARCS', SOURCE_TLUSTY: 'TLUSTY', SOURCE_POWR_OB: 'PoWR-OB',
+                SOURCE_POWR_WN: 'PoWR-WN', SOURCE_GOTBERG: 'Götberg'}
+
+
+def hot_source_code(family):
+    """The SOURCE_* code of a hot-star family (or a Götberg X_H mix)."""
+    name = family[0][0] if isinstance(family, tuple) else family
+    if name == 'tlusty':
+        return SOURCE_TLUSTY
+    if name.startswith('powr_ob'):
+        return SOURCE_POWR_OB
+    if name.startswith('powr_wn'):
+        return SOURCE_POWR_WN
+    return SOURCE_GOTBERG
 
 # TLUSTY 2025 (Hubeny et al. 2025): BSTAR 15-30 kK (log g 1.75-4.75), OSTAR
 # 27.5-55 kK (log g 3.0-4.75), Z/Z_sun 0.01-2. NLTE, line-blanketed. Inside
@@ -1482,9 +1504,13 @@ class KCorrectionGrid:
 
     @classmethod
     def cached(cls, phot_system, cache_dir=None, rebuild=False, persist=True,
-               **kwargs):
+               hot_stars=None, **kwargs):
         """
         Load the grid for these arguments, building and caching it if absent.
+
+        ``hot_stars`` ('tlusty' / 'full') attaches those companions whatever
+        ``$ARTPOP_HOT_STARS`` says (BPASS star lists need the 'full' set: their
+        templates follow the hydrogen class); None follows the environment.
 
         A table is also kept in memory (the last `_MEMO_MAX` of them), so every
         isochrone of a render does not re-read it. ``persist=False`` builds
@@ -1494,12 +1520,16 @@ class KCorrectionGrid:
         key = cls.cache_key(phot_system, **kwargs)
         path = os.path.join(cache_dir or kcorr_cache_dir(), key)
         mtime = os.path.getmtime(path) if os.path.isfile(path) else None
+        mode = hot_stars or hot_stars_mode()
         hit = cls._MEMO.get(path)
         if hit is not None and not rebuild and hit[0] == mtime:
             cls._MEMO.move_to_end(path)
-            if hot_stars_mode() == 'tlusty' and hit[1].tlusty is None:
+            if mode in ('tlusty', 'full') and hit[1].tlusty is None:
                 hit[1].attach_tlusty(phot_system, cache_dir=cache_dir, persist=persist,
                                      main_key=key, **kwargs)
+            if mode == 'full' and not hit[1].hot:
+                hit[1].attach_hotstars(phot_system, cache_dir=cache_dir, persist=persist,
+                                       main_key=key, **kwargs)
             return hit[1]
         grid = None
         if mtime is not None and not rebuild:
@@ -1523,9 +1553,12 @@ class KCorrectionGrid:
         cls._MEMO.move_to_end(path)
         while len(cls._MEMO) > cls._MEMO_MAX:
             cls._MEMO.popitem(last=False)
-        if hot_stars_mode() == 'tlusty' and grid.tlusty is None:
+        if mode in ('tlusty', 'full') and grid.tlusty is None:
             grid.attach_tlusty(phot_system, cache_dir=cache_dir, persist=persist,
                                main_key=key, **kwargs)
+        if mode == 'full' and not grid.hot:
+            grid.attach_hotstars(phot_system, cache_dir=cache_dir, persist=persist,
+                                 main_key=key, **kwargs)
         return grid
 
     # -- the TLUSTY hot-star companion (evaluation, 2026-10-16) -------------
@@ -1549,6 +1582,49 @@ class KCorrectionGrid:
                                     f'{lib.root} (tools/stage_tlusty.py)')
         path = os.path.join(cache_dir or kcorr_cache_dir(),
                             f'tlusty1_{main_key[:-4]}_{lib.manifest_sha()[:8]}.npz')
+        arr = self._companion_table(lib, path, phot_system, persist, bands, z_grid, a_v_host,
+                                    a_v_mw, extinction_law, r_v, curve_dir, a_v_host_grid,
+                                    a_v_mw_grid, bolometric)
+        self.tlusty_feh, self.tlusty_logg, self.tlusty_logt = arr['feh'], arr['logg'], arr['logt']
+        self.tlusty, self.tlusty_rest = arr['table'], arr['rest']
+        self.meta = dict(self.meta, hot_stars=f'TLUSTY 2025 (naive swap inside {TLUSTY_HULL}; '
+                                              f'{path})')
+        return self
+
+    # -- the 'full' hot-star set (2026-10-29): PoWR + Götberg ---------------
+    hot = {}
+
+    def attach_hotstars(self, phot_system, cache_dir=None, persist=True, main_key='',
+                        bands=None, z_grid=None, a_v_host=0.0, a_v_mw=0.0,
+                        extinction_law='F99', r_v=3.1, curve_dir=None, a_v_host_grid=None,
+                        a_v_mw_grid=None, bolometric=DEFAULT_BOLOMETRIC, **_unused):
+        """
+        One companion table per staged `artpop.hotstars` family, on the same
+        bands, z grid, dust axes, curves and bolometric convention as this
+        table (the TLUSTY recipe). Cached beside the main table as
+        ``hot1_<family>_<main key minus .npz>_<manifest>.npz``.
+        """
+        from .hotstars import HotStarFamily, families, manifest_sha
+        sha = manifest_sha()[:8]
+        hot = {}
+        for fam in sorted(families()):
+            lib = HotStarFamily(fam)
+            path = os.path.join(cache_dir or kcorr_cache_dir(),
+                                f'hot1_{fam}_{main_key[:-4]}_{sha}.npz')
+            arr = self._companion_table(lib, path, phot_system, persist, bands, z_grid, a_v_host,
+                                        a_v_mw, extinction_law, r_v, curve_dir, a_v_host_grid,
+                                        a_v_mw_grid, bolometric)
+            hot[fam] = (arr['feh'], arr['logg'], arr['logt'], arr['table'], arr['rest'])
+        self.hot = hot
+        self.meta = dict(self.meta, hot_stars_full=dict(
+            families=sorted(hot), manifest=sha,
+            routing='artpop.hotstars.route: H class, T, Sander & Vink 2020 Mdot -> R_t'))
+        return self
+
+    def _companion_table(self, lib, path, phot_system, persist, bands, z_grid, a_v_host,
+                         a_v_mw, extinction_law, r_v, curve_dir, a_v_host_grid, a_v_mw_grid,
+                         bolometric):
+        """Build (or load) one library's K table on this table's axes."""
         if os.path.isfile(path):
             with np.load(path) as z:
                 arr = {k: z[k] for k in z.files}
@@ -1585,11 +1661,7 @@ class KCorrectionGrid:
                 with open(tmp, 'wb') as fh:
                     np.savez(fh, **arr)
                 os.replace(tmp, path)
-        self.tlusty_feh, self.tlusty_logg, self.tlusty_logt = arr['feh'], arr['logg'], arr['logt']
-        self.tlusty, self.tlusty_rest = arr['table'], arr['rest']
-        self.meta = dict(self.meta, hot_stars=f'TLUSTY 2025 (naive swap inside {TLUSTY_HULL}; '
-                                              f'{path})')
-        return self
+        return arr
 
     @classmethod
     def for_dust(cls, phot_system, a_v_host=0.0, a_v_mw=0.0,
@@ -1647,6 +1719,9 @@ class KCorrectionGrid:
         if which == 'tlusty':
             return ((self.tlusty_rest if rest else self.tlusty),
                     (self.tlusty_feh, self.tlusty_logg, self.tlusty_logt))
+        if which.startswith('hot:'):
+            fe_, a2, lt_, tab, rst = self.hot[which[4:]]
+            return (rst if rest else tab), (fe_, a2, lt_)
         return (self.bb_rest if rest else self.bb), (self.bb_logt,)
 
     @property
@@ -1716,7 +1791,7 @@ class KCorrectionGrid:
         return hit
 
     def interpolate(self, log_teff, log_g, feh, redshift, a_v_host=None,
-                    a_v_mw=None, quantity='absolute', method='cubic'):
+                    a_v_mw=None, quantity='absolute', method='cubic', hot=None):
         """
         Per-star magnitudes, plus which backend served each star.
 
@@ -1746,6 +1821,12 @@ class KCorrectionGrid:
             ``interp_linear`` (bool: interpolated linearly in the stellar axes)
             and the tallies. Nothing is served silently: every row outside the
             production hull is flagged here, which is what test B5 asserts on.
+
+        ``hot``: per-star ``h_class``, ``log_l``, ``mass`` and optionally
+        ``x_h`` for `artpop.hotstars.route`. Given (and the companions are
+        attached), the rows are routed whatever ``$ARTPOP_HOT_STARS`` says; with
+        ``ARTPOP_HOT_STARS=full`` and None, every row is routed as H-rich with no
+        wind information.
         """
         if quantity not in ('absolute', 'offset', 'rest'):
             raise ValueError(f"quantity must be 'absolute', 'offset' or 'rest', got {quantity!r}")
@@ -1812,6 +1893,17 @@ class KCorrectionGrid:
                                      tuple(self.meta.get('marcs_blend', {}).get('teff', MARCS_BLEND_TEFF)),
                                      tuple(self.meta.get('marcs_blend', {}).get('logg', MARCS_BLEND_LOGG)))
 
+        plan = None
+        self._hot_partial = np.zeros(lt.size, dtype=bool)
+        routed = ((hot_stars_mode() == 'full' or hot is not None)
+                  and (bool(self.hot) or self.tlusty is not None))
+        if routed:
+            from .hotstars import route
+            hk = dict(hot or {})
+            avail = list(self.hot) + (['tlusty'] if self.tlusty is not None else [])
+            plan = route(lt, lg, fe, h_class=hk.get('h_class'), log_l=hk.get('log_l'),
+                         mass=hk.get('mass'), x_h=hk.get('x_h'), available=avail)
+
         def evaluate(zz, dd, ref):
             out = np.full((n, n_b), np.nan)
             linear = np.zeros(n, dtype=bool)
@@ -1840,9 +1932,13 @@ class KCorrectionGrid:
                 linear[sel] |= lin_m & ok
                 hole[sel] = ~ok
                 src[np.flatnonzero(sel)[w == 1.0]] = SOURCE_MARCS
+            # the 'full' hot-star set: candidates per star from the router,
+            # first finite by rank wins; rows nobody serves keep their backend
+            if routed:
+                self._apply_hot(plan, out, linear, src, fe, lt, zz, dd, ref)
             # the TLUSTY hot-star swap: every row inside its hull whose linear
             # cell has a model at all corners; the rest keep their backend
-            if self.tlusty is not None and hot_stars_mode() == 'tlusty':
+            elif self.tlusty is not None and hot_stars_mode() == 'tlusty':
                 sel = ((lt >= self.tlusty_logt[0] - 1e-12) & (lt <= self.tlusty_logt[-1] + 1e-12)
                        & (lg >= self.tlusty_logg[0]) & (lg <= self.tlusty_logg[-1]) & ~in_wd)
                 if sel.any():
@@ -1892,6 +1988,11 @@ class KCorrectionGrid:
                     n_c3k=int((source == SOURCE_C3K).sum()),
                     n_wd=int((source == SOURCE_WD).sum()),
                     n_tlusty=int((source == SOURCE_TLUSTY).sum()),
+                    n_powr_ob=int((source == SOURCE_POWR_OB).sum()),
+                    n_powr_wn=int((source == SOURCE_POWR_WN).sum()),
+                    n_gotberg=int((source == SOURCE_GOTBERG).sum()),
+                    hot_partial=self._hot_partial.copy(),
+                    n_hot_partial=int(self._hot_partial.sum()),
                     n_fallback=int((source == SOURCE_BB).sum()),
                     n_feh_clipped=int(feh_clipped.sum()),
                     redshift=z, bands=list(self.bands),
@@ -1899,17 +2000,81 @@ class KCorrectionGrid:
                     a_v_mw=dust[1] if dust else self.meta.get('a_v_mw'))
         return out, info
 
+    def _apply_hot(self, plan, out, linear, src, fe, lt, zz, dd, ref):
+        """
+        Evaluate the router's candidates and overwrite each star with its
+        best-ranked finite one. Linear in [Fe/H]; in (ax2, log T) a **masked
+        bilinear** on the family's mesh: the four corners of the star's cell,
+        weights renormalised over the corners that have a model (PoWR's grids
+        are triangular). A star outside the mesh, or whose cell has no model at
+        all, is not served by that family (never extrapolated).
+        """
+        n = out.shape[0]
+        best = np.full(n, np.inf)
+        partial = getattr(self, '_hot_partial', None)
+        for c in plan:
+            fam, rows, ax2 = c['family'], c['rows'], c['ax2']
+            mix = fam if isinstance(fam, tuple) else ((fam, 1.0),)
+            acc = np.zeros((rows.size, out.shape[1]))
+            wsum = np.zeros(rows.size)
+            part = np.zeros(rows.size, bool)
+            for name, w in mix:
+                key = 'tlusty' if name == 'tlusty' else f'hot:{name}'
+                if key == 'tlusty' and self.tlusty is None or key != 'tlusty' and name not in self.hot:
+                    continue
+                v, ok, pt = self._masked_bilinear(key, fe[rows], ax2, lt[rows], zz, dd, ref)
+                acc[ok] += w * v[ok]
+                wsum[ok] += w
+                part |= pt & ok
+            good = (wsum > 0) & (c['rank'] < best[rows])
+            ii = rows[good]
+            out[ii] = acc[good] / wsum[good, None]
+            linear[ii] = True
+            src[ii] = hot_source_code(fam)
+            best[ii] = c['rank']
+            if partial is not None:
+                partial[ii] = part[good]
+
+    def _masked_bilinear(self, key, fe, ax2, lt, zz, dd, ref):
+        """``(values, ok, partial)`` of one companion at (fe, ax2, lt)."""
+        fe_ax, a2_ax, lt_ax = self._backend(key)[1]
+        m = ax2.size
+        inside = ((ax2 >= a2_ax[0] - 1e-9) & (ax2 <= a2_ax[-1] + 1e-9)
+                  & (lt >= lt_ax[0] - 1e-9) & (lt <= lt_ax[-1] + 1e-9))
+        ig = np.clip(np.searchsorted(a2_ax, ax2) - 1, 0, a2_ax.size - 2)
+        it = np.clip(np.searchsorted(lt_ax, lt) - 1, 0, lt_ax.size - 2)
+        fg = np.clip((ax2 - a2_ax[ig]) / (a2_ax[ig + 1] - a2_ax[ig]), 0.0, 1.0)
+        ft = np.clip((lt - lt_ax[it]) / (lt_ax[it + 1] - lt_ax[it]), 0.0, 1.0)
+        fe_c = np.clip(fe, fe_ax[0], fe_ax[-1])
+        acc = np.zeros((m, len(self.bands)))
+        wsum = np.zeros(m)
+        wall = np.zeros(m)
+        for dg, wg in ((0, 1 - fg), (1, fg)):
+            for dt, wt in ((0, 1 - ft), (1, ft)):
+                w = wg * wt
+                v, _ = self._eval(key, (fe_c, a2_ax[ig + dg], lt_ax[it + dt]), zz, dd, 'linear', ref)
+                fin = np.isfinite(v).all(axis=1) & (w > 0)
+                acc[fin] += w[fin, None] * v[fin]
+                wsum[fin] += w[fin]
+                wall += w
+        ok = inside & (wsum > 0)
+        vals = np.full((m, len(self.bands)), np.nan)
+        vals[ok] = acc[ok] / wsum[ok, None]
+        partial = ok & (wsum < wall - 1e-9)
+        return vals, ok, partial
+
     def magnitudes(self, log_teff, log_g, feh, redshift, log_l=0.0, bands=None,
-                   a_v_host=None, a_v_mw=None, method='cubic', rest=False):
+                   a_v_host=None, a_v_mw=None, method='cubic', rest=False, hot=None):
         """
         Absolute AB magnitudes ``{band: array}`` of stars with ``log10(L/L_sun)
         = log_l``: the table value minus ``2.5 log_l``. ``rest=True`` gives the
-        z = 0, dust-free ones (what `offsets` is measured from).
+        z = 0, dust-free ones (what `offsets` is measured from). ``hot``: see
+        `interpolate`.
         """
         out, info = self.interpolate(log_teff, log_g, feh, redshift,
                                      a_v_host=a_v_host, a_v_mw=a_v_mw,
                                      quantity='rest' if rest else 'absolute',
-                                     method=method)
+                                     method=method, hot=hot)
         out = out - 2.5 * np.asarray(log_l, dtype=float).reshape(-1, 1)
         want = self.bands if bands is None else list(bands)
         return {b: out[:, self.bands.index(b)] for b in want}, info

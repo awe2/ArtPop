@@ -1007,6 +1007,7 @@ class MISTIsochrone(Isochrone):
         log_g = np.asarray(self._iso_full['log_g'], dtype=float)
         log_l = np.asarray(self._iso_full['log_L'], dtype=float)
         feh_star = self.feh_star
+        hot = self._hot_rows()
 
         by_system = {}
         lookup = phot_system_lookup()
@@ -1036,13 +1037,13 @@ class MISTIsochrone(Isochrone):
                 dust_kw = (dict(a_v_host=self.a_v_host, a_v_mw=self.a_v_mw)
                            if grid.has_dust_axes else {})
             mags, inf = grid.magnitudes(log_teff, log_g, feh_star, self.redshift,
-                                        log_l=log_l, bands=bands, **dust_kw)
+                                        log_l=log_l, bands=bands, hot=hot, **dust_kw)
             # the z = 0, dust-free reference every table carries
             if self.redshift == 0.0 and not dusty:
                 ref = mags
             else:
                 ref, _ = grid.magnitudes(log_teff, log_g, feh_star, 0.0, log_l=log_l,
-                                         bands=bands, rest=True, **dust_kw)
+                                         bands=bands, rest=True, hot=hot, **dust_kw)
             info[system] = inf
             meta[system] = {k: grid.meta.get(k) for k in (
                 'library', 'curves', 'bolometric', 'l_sun_erg_s', 'extinction_law',
@@ -1061,6 +1062,22 @@ class MISTIsochrone(Isochrone):
             'flagged per row in kcorr_info',
             frame=dict(redshift=self.redshift, a_v_host=self.a_v_host,
                        a_v_mw=self.a_v_mw))
+
+    def _hot_rows(self):
+        """Per-row inputs of the 'full' hot-star router (None otherwise): the
+        hydrogen class from MIST's phase (9 = WR, which MIST defines as surface
+        X < 0.4 above 10^4 K: H-poor, X taken as `hotstars.X_ASSUMED`), log L
+        and the present mass for the wind."""
+        from ..kcorrect import hot_stars_mode
+        if hot_stars_mode() != 'full':
+            return None
+        from ..hotstars import H_RICH, H_POOR
+        names = self._iso_full.colnames if hasattr(self._iso_full, 'colnames') else self._iso_full.dtype.names
+        phase = (np.asarray(self._iso_full['phase'], dtype=float) if 'phase' in names
+                 else np.zeros(len(self._iso_full)))
+        return dict(h_class=np.where(np.isclose(phase, 9.0), H_POOR, H_RICH).astype(np.int8),
+                    log_l=np.asarray(self._iso_full['log_L'], dtype=float),
+                    mass=np.asarray(self._iso_full['star_mass'], dtype=float))
 
     def _reset_nebular(self, filters):
         """The no-nebular state: nothing moved, no blob."""
@@ -1101,7 +1118,7 @@ class MISTIsochrone(Isochrone):
             self._iso_full['log_Teff'], self._iso_full['log_g'],
             self._iso_full['log_L'], redshift=self.redshift,
             a_v_host=self.a_v_host, a_v_mw=self.a_v_mw,
-            extinction_law=self.extinction_law, r_v=self.r_v)
+            extinction_law=self.extinction_law, r_v=self.r_v, hot=self._hot_rows())
         for filt in filters:
             self.nebular_delta_mag[filt] = new[filt] - mags[filt]
             self._iso_full[filt] = new[filt]
