@@ -591,6 +591,58 @@ class MappingsLineTable:
 # as MIST v2.5's BC table and the K table (table v2, ledger S-51) serve it; 2: a
 # blackbody at the row's own Teff (outside C3K's rectangle: > 50 kK, log g > 5.5)
 SOURCE_C3K, SOURCE_C3K_BB, SOURCE_BB = 0, 1, 2
+# 3: TLUSTY 2025 (only with ARTPOP_HOT_STARS=tlusty; the 2026-10-16 evaluation)
+SOURCE_TLUSTY = 3
+_TLUSTY_BLOCKS = {}
+
+
+def _tlusty_rows(lt, lg, feh):
+    """
+    TLUSTY spectra for the rows inside its hull whose cells have a model at
+    every corner at both bracketing [Z/H] nodes: bilinear in (log g, log Teff),
+    linear in [Z/H], each corner normalised to unit bolometric flux. Returns
+    ``(rows, lam, f_lam)`` or None.
+    """
+    from .kcorrect import TlustyLibrary
+    lib = TlustyLibrary()
+    if lib.root not in _TLUSTY_BLOCKS:
+        blocks = {}
+        for z in lib.feh_grid:
+            g_ax, t_ax, flux = lib.grid(z)
+            f = np.asarray(flux, dtype=float)
+            bol = np.sum(f * _trapz_weights(lib.wave), axis=-1)
+            blocks[float(z)] = f / bol[..., None]
+        _TLUSTY_BLOCKS[lib.root] = (g_ax, t_ax, np.asarray(lib.wave, float), lib.feh_grid, blocks)
+    g_ax, t_ax, lam, zgrid, blocks = _TLUSTY_BLOCKS[lib.root]
+    zf = float(np.clip(feh, zgrid[0], zgrid[-1]))
+    iz = int(np.clip(np.searchsorted(zgrid, zf) - 1, 0, zgrid.size - 2))
+    fz = (zf - zgrid[iz]) / (zgrid[iz + 1] - zgrid[iz])
+    cand = np.flatnonzero((lt >= t_ax[0] - 1e-12) & (lt <= t_ax[-1] + 1e-12)
+                          & (lg >= g_ax[0]) & (lg <= g_ax[-1]))
+    rows, out = [], []
+    for r in cand:
+        ig = int(np.clip(np.searchsorted(g_ax, lg[r]) - 1, 0, g_ax.size - 2))
+        it = int(np.clip(np.searchsorted(t_ax, lt[r]) - 1, 0, t_ax.size - 2))
+        fg = float(np.clip((lg[r] - g_ax[ig]) / (g_ax[ig + 1] - g_ax[ig]), 0, 1))
+        ft = float(np.clip((lt[r] - t_ax[it]) / (t_ax[it + 1] - t_ax[it]), 0, 1))
+        acc = np.zeros(lam.size)
+        good = True
+        for dz, wz in ((0, 1 - fz), (1, fz)):
+            for dg, wg in ((0, 1 - fg), (1, fg)):
+                for dt, wt in ((0, 1 - ft), (1, ft)):
+                    w = wz * wg * wt
+                    if w > 0:
+                        s = blocks[float(zgrid[iz + dz])][ig + dg, it + dt]
+                        if not np.isfinite(s[0]):
+                            good = False
+                            break
+                        acc += w * s
+        if good:
+            rows.append(r)
+            out.append(acc)
+    if not rows:
+        return None
+    return np.array(rows), lam, np.array(out)
 _BB_WAVE = np.geomspace(10.0, 1.0e6, 20000)      # Angstrom
 _SIGMA_SB = 5.670374419e-5                        # erg / s / cm^2 / K^4
 
@@ -654,6 +706,13 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
     t_lo, t_hi = np.log10(C3K_HULL['teff'][0]), np.log10(C3K_HULL['teff'][1])
     in_hull = ((lt >= t_lo) & (lt <= t_hi)
                & (lg >= C3K_HULL['logg'][0]) & (lg <= C3K_HULL['logg'][1]))
+    from .kcorrect import hot_stars_mode
+    if hot_stars_mode() == 'tlusty':
+        hit = _tlusty_rows(lt, lg, feh)
+        if hit is not None:
+            groups.append(hit)
+            source[hit[0]] = SOURCE_TLUSTY
+            in_hull[hit[0]] = False
     if in_hull.any() and lib.available:
         feh_node = float(lib.feh_grid[np.argmin(np.abs(lib.feh_grid - float(feh)))])
         g_ax, t_ax, lam, flux, to_flam, bol, filled = _c3k_block(lib, feh_node)
