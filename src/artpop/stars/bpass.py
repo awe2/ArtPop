@@ -337,6 +337,27 @@ class BPASSIsochrone:
             star_list=sl.summary(), templates="'full' hot-star set (artpop.hotstars.route)",
             frame=dict(redshift=self.redshift, a_v_host=self.a_v_host, a_v_mw=self.a_v_mw))
 
+    # -- copies ---------------------------------------------------------------
+    _SHARED = ('_grids', 'star_list')
+
+    def __deepcopy__(self, memo):
+        """Share the K-correction grids (GB-size, read-only) and the star list:
+        ArtPop's ``SSP.__add__`` deep-copies the left population, isochrones
+        included, so copying them per added bin cost ~8 GB per build
+        (2026-10-29: 9.5 GB vs MIST's 1.6 GB for the same object; the Slurm
+        runs died of it)."""
+        from copy import deepcopy
+        new = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new
+        for k, v in self.__dict__.items():
+            if k in self._SHARED:
+                setattr(new, k, v)
+            elif k == '_jit_cache':
+                setattr(new, k, (None, None))
+            else:
+                setattr(new, k, deepcopy(v, memo))
+        return new
+
     # -- photometry ---------------------------------------------------------
     def _grid(self, system, bands, kcorr_grid):
         from ..kcorrect import KCorrectionGrid
