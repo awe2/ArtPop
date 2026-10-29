@@ -343,6 +343,20 @@ class ClusteredSersicSP(SersicSP):
     disk_halo_fraction, disk_offset_pc, disk_phi, disk_q_factor, disk_max_reff : float
         The 'disk' layout's parameters (the caller draws the offset, angle and
         q factor per galaxy).
+    disk_reff_scale : float
+        'disk' layout (2026-10-24, user: concentrate the young light): the young
+        disc's sites follow the Sersic of ``disk_reff_scale`` x r_eff (same n),
+        still cut at ``disk_max_reff`` x r_eff; halo sites keep the galaxy's
+        own r_eff. 1 (default): unchanged.
+    disk_sersic_n : float or None
+        'disk' layout (2026-10-25): the Sersic index of the young disc's sites
+        (None, the default: the galaxy's ``n``), so the old light's n can be
+        changed without moving the young disc; halo sites keep the galaxy's n.
+    disk_reuse_within : bool
+        'disk' layout (2026-10-24, user: no complexes in the periphery): a
+        reused site's drift offset is redrawn (up to 20 times, then the
+        parent's own site) until it lies inside ``disk_max_reff`` r_eff, so
+        reuse cannot carry complexes past the cut. False (default): unchanged.
     diffuse_mode : {'sersic', 'complexes'}
         Where the clustered SSPs' ``f_diffuse`` share (its stars and smooth
         light) and the diffuse ionized gas go. ``'sersic'`` (default): on the
@@ -376,7 +390,7 @@ class ClusteredSersicSP(SersicSP):
                  ssp_reff_scale=None, centre_mode='ring', locus_offset_reff=0.75,
                  locus_spread_reff=0.25, diffuse_mode='sersic', diffuse_smooth_reff=0.25,
                  disk_halo_fraction=0.1, disk_offset_pc=0.0, disk_phi=0.0, disk_q_factor=1.0,
-                 disk_max_reff=4.0, ssp_profile=None, num_r_eff=10, dx=0, dy=0, labels=None, eta=1.0,
+                 disk_max_reff=4.0, disk_reuse_within=False, disk_reff_scale=1.0, disk_sersic_n=None, ssp_profile=None, num_r_eff=10, dx=0, dy=0, labels=None, eta=1.0,
                  distance_angular=None):
         from .space.clusters import ClusterSpec
         self.cluster_specs = [ClusterSpec.coerce(c) for c in (clusters or [])]
@@ -420,6 +434,13 @@ class ClusteredSersicSP(SersicSP):
         self.disk_phi = float(disk_phi)
         self.disk_q_factor = float(disk_q_factor)
         self.disk_max_reff = float(disk_max_reff)
+        self.disk_reuse_within = bool(disk_reuse_within)
+        self.disk_reff_scale = float(disk_reff_scale)
+        self.disk_sersic_n = None if disk_sersic_n is None else float(disk_sersic_n)
+        if self.disk_sersic_n is not None and not self.disk_sersic_n > 0:
+            raise ValueError(f'disk_sersic_n must be > 0, got {disk_sersic_n}')
+        if not self.disk_reff_scale > 0:
+            raise ValueError(f'disk_reff_scale must be > 0, got {disk_reff_scale}')
         if not (0.0 <= self.disk_halo_fraction <= 1.0 and self.disk_offset_pc >= 0
                 and 0.0 < self.disk_q_factor <= 1.0 and self.disk_max_reff > 0):
             raise ValueError('need disk_halo_fraction in [0, 1], disk_offset_pc >= 0, '
@@ -529,6 +550,13 @@ class ClusteredSersicSP(SersicSP):
                 halo = rng.uniform(size=n_c) < self.disk_halo_fraction
                 disk = sersic_disk_offsets(n_c, r_eff_px, rng, float(self.xy_kw['n']),
                                            self.disk_max_reff)
+                n_disk = float(self.xy_kw['n']) if self.disk_sersic_n is None else self.disk_sersic_n
+                if self.disk_reff_scale != 1.0 or n_disk != float(self.xy_kw['n']):
+                    # disc sites on the young disc (s_y r_eff, its own n), same cut in the galaxy's r_eff
+                    s_y = self.disk_reff_scale
+                    dsk = ~halo
+                    disk[dsk] = sersic_disk_offsets(int(dsk.sum()), r_eff_px * s_y, rng,
+                                                    n_disk, self.disk_max_reff / s_y)
             elif self.centre_mode == 'locus':
                 disk = locus_disk_offsets(n_c, r_eff_px, rng, self.locus_phi,
                                           self.locus_offset_reff, self.locus_spread_reff,
@@ -546,6 +574,17 @@ class ClusteredSersicSP(SersicSP):
                                       self.drift_kms * KMS_PC_PER_MYR * age) * ppc
                     disk[linked] = (site_disk[parent[linked]]
                                     + rng.normal(0.0, sig_px, size=(int(linked.sum()), 2)))
+                    if self.centre_mode == 'disk' and self.disk_reuse_within:
+                        r_cut = self.disk_max_reff * r_eff_px
+                        li = np.flatnonzero(linked)
+                        for _ in range(20):
+                            bad = li[np.hypot(*disk[li].T) > r_cut]
+                            if not bad.size:
+                                break
+                            disk[bad] = (site_disk[parent[bad]]
+                                         + rng.normal(0.0, sig_px, size=(bad.size, 2)))
+                        bad = li[np.hypot(*disk[li].T) > r_cut]
+                        disk[bad] = site_disk[parent[bad]]
                     halo[linked] = site_halo[parent[linked]]
             if self.centre_mode == 'disk':
                 # halo sites on the old light (centred, its q); disc sites on the young disc
