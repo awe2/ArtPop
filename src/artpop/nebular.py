@@ -685,10 +685,12 @@ def _hot_source(family):
             else SOURCE_POWR_WN if name.startswith('powr_wn') else SOURCE_GOTBERG)
 
 
-def _hot_rows(lt, lg, feh, hot):
+def _hot_rows(lt, lg, feh, hot, q_only=False):
     """The 'full' hot-star set on the rows the router serves: groups of
-    ``(rows, lam, f_lam)`` (unit bolometric flux) and the per-row source."""
-    from .hotstars import route, families, family_spectra
+    ``(rows, lam, f_lam)`` (unit bolometric flux) and the per-row source.
+    ``q_only`` (2026-10-30): for the staged families, groups ``(rows, None,
+    Q_H / L_bol)`` from `hotstars.family_q` instead of spectra."""
+    from .hotstars import route, families, family_spectra, family_q
     from .kcorrect import TlustyLibrary
     hk = dict(hot or {})
     avail = list(families()) + (['tlusty'] if TlustyLibrary().available else [])
@@ -707,6 +709,10 @@ def _hot_rows(lt, lg, feh, hot):
             if hit is None:
                 continue
             ok_rows, lam, f = rows[hit[0]], hit[1], hit[2]
+        elif q_only:
+            q = family_q(c['family'], feh, ax2, lt[rows])
+            ok = np.isfinite(q)
+            ok_rows, lam, f = rows[ok], None, q[ok]
         else:
             lam, f = family_spectra(c['family'], feh, ax2, lt[rows])
             ok = np.isfinite(f).all(axis=1)
@@ -718,7 +724,7 @@ def _hot_rows(lt, lg, feh, hot):
     return groups, served, src
 
 
-def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None, hot=None):
+def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None, hot=None, q_only=False):
     """
     One spectrum per row, **normalised to unit bolometric flux**.
 
@@ -749,7 +755,7 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None, hot=Non
                & (lg >= C3K_HULL['logg'][0]) & (lg <= C3K_HULL['logg'][1]))
     from .kcorrect import hot_stars_mode
     if hot_stars_mode() == 'full' or hot is not None:
-        hgroups, served, hsrc = _hot_rows(lt, lg, feh, hot)
+        hgroups, served, hsrc = _hot_rows(lt, lg, feh, hot, q_only=q_only)
         groups.extend(hgroups)
         source[served] = hsrc[served]
         in_hull[served] = False
@@ -820,9 +826,10 @@ def ionizing_rate(log_teff, log_g, log_l, feh, resolution='c3k_hr',
     ll = np.atleast_1d(np.asarray(log_l, dtype=float))
     q_h = np.zeros(lt.size)
     groups, source = row_spectra(lt, log_g, feh, resolution=resolution,
-                                 spectra=spectra, hot=hot)
+                                 spectra=spectra, hot=hot, q_only=True)
     for idx, lam, f in groups:
-        q_h[idx] = ionizing_photons_per_erg(lam, f) * 10 ** ll[idx] * L_SUN
+        # lam None: a hot-star group already reduced to Q_H / L_bol (hotstars.family_q)
+        q_h[idx] = (f if lam is None else ionizing_photons_per_erg(lam, f)) * 10 ** ll[idx] * L_SUN
     return q_h, source
 
 

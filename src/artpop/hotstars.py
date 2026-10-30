@@ -94,6 +94,9 @@ def _spectral_library_base():
     return SpectralLibrary
 
 
+_LOADED = {}
+
+
 class HotStarFamily(_spectral_library_base()):
     """
     One staged family: surface F_lambda (erg/s/cm^2/A; ``surface_scale = 1``)
@@ -113,13 +116,18 @@ class HotStarFamily(_spectral_library_base()):
         self._blocks = None
 
     def _load(self):
+        # shared across instances (2026-10-30): the router builds a HotStarFamily per lookup, and each re-read the
+        # npz nodes from disk -- 600 loads, ~10 s of a 24 s BPASS population build
         if self._blocks is None:
-            self._blocks = {}
-            for zh in self.info['nodes']:
-                with np.load(os.path.join(self.root, f'{self.family}_zh{zh:+.2f}.npz')) as z:
-                    self._blocks[round(float(zh), 2)] = (z['ax2'], z['logt'], z['flux'])
-            self._feh = np.array(sorted(self._blocks))
-            self._wave = np.load(os.path.join(self.root, 'hotstars_wave_vac.npy'))
+            key = (self.root, self.family)
+            if key not in _LOADED:
+                blocks = {}
+                for zh in self.info['nodes']:
+                    with np.load(os.path.join(self.root, f'{self.family}_zh{zh:+.2f}.npz')) as z:
+                        blocks[round(float(zh), 2)] = (z['ax2'], z['logt'], z['flux'])
+                _LOADED[key] = (blocks, np.array(sorted(blocks)),
+                                np.load(os.path.join(self.root, 'hotstars_wave_vac.npy')))
+            self._blocks, self._feh, self._wave = _LOADED[key]
         return self._blocks
 
     @property
@@ -346,6 +354,36 @@ def _unit_blocks(family, path=None):
     return _SPEC[key]
 
 
+_QGRID = {}
+
+
+def _unit_q(family, path=None):
+    """Per node: (ax2, logt, Q_H / L_bol per model, shape (n_ax2, n_logt, 1)); NaN where no model."""
+    key = (path or hotstars_path(), family)
+    if key not in _QGRID:
+        from .nebular import ionizing_photons_per_erg
+        lam, zg, nodes = _unit_blocks(family, path)
+        qn = {}
+        for z, (ax, tx, f) in nodes.items():
+            q = ionizing_photons_per_erg(lam, f.reshape(-1, lam.size)).reshape(f.shape[:2])
+            q[~np.isfinite(f[:, :, 0])] = np.nan
+            qn[z] = (ax, tx, q[:, :, None])
+        _QGRID[key] = (zg, qn)
+    return _QGRID[key]
+
+
+def family_q(family, feh, ax2, log_teff, path=None):
+    """
+    ``Q_H / L_bol`` (photons per erg) per row, from the same masked bilinear
+    in (ax2, log T), linear-in-[Fe/H] and X_H-mix weights as `family_spectra`
+    applied to per-model photon rates (2026-10-30). Integration over
+    wavelength is linear, so this equals ``ionizing_photons_per_erg`` of
+    ``family_spectra`` to rounding, without interpolating ~10^4-point spectra
+    per row. NaN where `family_spectra` gives NaN.
+    """
+    return _family_interp(family, feh, ax2, log_teff, lambda name: _unit_q(name, path))[1][:, 0]
+
+
 def family_spectra(family, feh, ax2, log_teff, path=None):
     """
     Spectra of one family (or a Götberg X_H mix) at (ax2, log T) per row,
@@ -353,12 +391,24 @@ def family_spectra(family, feh, ax2, log_teff, path=None):
     normalised to INT f dlam = 1. NaN rows where a needed corner has no model.
     Returns ``(lam, f (n, n_lam))``.
     """
+    return _family_interp(family, feh, ax2, log_teff, lambda name: _unit_blocks(name, path)[1:],
+                          lam=lambda name: _unit_blocks(name, path)[0])
+
+
+def _family_interp(family, feh, ax2, log_teff, nodes_of, lam=None):
+    """The interpolation behind `family_spectra` / `family_q`: ``nodes_of(name)`` gives ``(feh nodes, {z: (ax2,
+    logt, values (n_ax2, n_logt, k))})``; returns ``(lam or None, values (n_row, k))``, NaN rows where a needed
+    corner has no model."""
     mix = family if isinstance(family, tuple) else ((family, 1.0),)
     a2 = np.atleast_1d(np.asarray(ax2, float))
     lt = np.atleast_1d(np.asarray(log_teff, float))
-    acc, wsum, lam = None, np.zeros(lt.size), None
+    acc, wsum = None, np.zeros(lt.size)
+    lam_out = None
     for name, w in mix:
-        lam, zg, nodes = _unit_blocks(name, path)
+        zg, nodes = nodes_of(name)
+        if lam is not None:
+            lam_out = lam(name)
+        nk = next(iter(nodes.values()))[2].shape[-1]
         zf = float(np.clip(feh, zg[0], zg[-1]))
         if zg.size == 1:
             zw = ((float(zg[0]), 1.0),)
@@ -366,7 +416,7 @@ def family_spectra(family, feh, ax2, log_teff, path=None):
             iz = int(np.clip(np.searchsorted(zg, zf) - 1, 0, zg.size - 2))
             fz = (zf - zg[iz]) / (zg[iz + 1] - zg[iz])
             zw = tuple((float(zg[iz + d]), ww) for d, ww in ((0, 1 - fz), (1, fz)) if ww > 0)
-        out = np.zeros((lt.size, lam.size))
+        out = np.zeros((lt.size, nk))
         for z, wz in zw:
             ax, tx, f = nodes[z]
             ig = np.clip(np.searchsorted(ax, a2) - 1, 0, ax.size - 2)
@@ -378,7 +428,7 @@ def family_spectra(family, feh, ax2, log_teff, path=None):
             # with a model: PoWR's grids are triangular), as in the K table
             inside = ((a2 >= ax[0] - 1e-9) & (a2 <= ax[-1] + 1e-9)
                       & (lt >= tx[0] - 1e-9) & (lt <= tx[-1] + 1e-9))
-            node = np.zeros((lt.size, lam.size))
+            node = np.zeros((lt.size, nk))
             wn = np.zeros(lt.size)
             for dg, wg in ((0, 1 - fg), (1, fg)):
                 for dt, wt in ((0, 1 - ft), (1, ft)):
@@ -398,4 +448,4 @@ def family_spectra(family, feh, ax2, log_teff, path=None):
     res = np.full_like(acc, np.nan)
     g = wsum > 0
     res[g] = acc[g] / wsum[g, None]
-    return lam, res
+    return lam_out, res
