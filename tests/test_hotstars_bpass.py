@@ -179,3 +179,31 @@ class TierB(TestCase):
             self.assertLess(abs(2.5 * np.log10(got / exp)), 0.03, b)
         self.assertAlmostEqual(ssp.total_mass.value / 1e8, 1.0, delta=0.02)
         self.assertGreater(ssp.dig_q_h, 1e51)        # 10-30 Myr binaries: ~8e50 / 1e6 Msun formed
+
+    @skipUnless(_HAVE_HOT, 'hot-star libraries not staged')
+    def test_BP5_star_lists_reach_hot_libraries(self):
+        """The BPASS rows are served by the new atmospheres, not the blackbody:
+        in a 10-30 Myr binary bin at [Fe/H] -1 Götberg stripped stars carry
+        > 30 % of Q_H (measured 0.56, 2026-10-30), PoWR WN rows exist in both
+        the photometry and the ionizing budget, the hydrogen-free rows hotter
+        than 50 kK are never on C3K / TLUSTY, and the blackbody fallback keeps
+        < 5 % of Q_H (measured 0.03; 0-10 Myr: 0.02)."""
+        from artpop import kcorrect as K
+        from artpop import nebular as N
+        for lo, hi, got_min in ((1e7, 3e7, 0.3), (0.0, 1e7, 0.05)):
+            iso = B.BPASSIsochrone('bin', -1.0, lo, hi, 'LSST', jitter=False, p_present=0.9)
+            hot = dict(h_class=iso.h_class, log_l=iso.log_L, mass=iso.mact)
+            # the ionizing budget (nebular's own source codes)
+            q, src_q = N.ionizing_rate(iso.log_Teff, iso.log_g, iso.log_L, -1.0, hot=hot)
+            nq = iso.star_list.n_per_msun * q
+            share = {k: float(nq[src_q == k].sum() / nq.sum()) for k in np.unique(src_q)}
+            self.assertGreater(share.get(N.SOURCE_GOTBERG, 0.0), got_min, (lo, share))
+            self.assertGreater(share.get(N.SOURCE_POWR_WN, 0.0), 0.0, (lo, share))
+            self.assertLess(share.get(N.SOURCE_BB, 0.0), 0.05, (lo, share))
+            # the photometry (K-table source codes)
+            src = iso.kcorr_info['LSST']['source']
+            self.assertTrue(np.isin([K.SOURCE_GOTBERG, K.SOURCE_POWR_WN], src).all(), np.unique(src))
+            h_free_hot = (iso.h_class == H.H_FREE) & (iso.log_Teff > np.log10(5e4))
+            self.assertTrue(h_free_hot.any())
+            self.assertFalse(np.isin(src[h_free_hot], [K.SOURCE_C3K, K.SOURCE_TLUSTY]).any())
+            self.assertFalse(np.isin(src_q[h_free_hot], [N.SOURCE_C3K, N.SOURCE_TLUSTY]).any())
