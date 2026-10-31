@@ -207,3 +207,39 @@ class TierB(TestCase):
             self.assertTrue(h_free_hot.any())
             self.assertFalse(np.isin(src[h_free_hot], [K.SOURCE_C3K, K.SOURCE_TLUSTY]).any())
             self.assertFalse(np.isin(src_q[h_free_hot], [N.SOURCE_C3K, N.SOURCE_TLUSTY]).any())
+
+    @skipUnless(_HAVE_HOT, 'hot-star libraries not staged')
+    def test_BP6_agb_swap(self):
+        """The AGB swap (2026-10-31; ALVISS wiki prior-corner-check 13.54): in a
+        100-500 Myr bin the cool luminous H-rich region comes from MIST -- no
+        BPASS cell is left there, the red (g - r > 0.8) stars brighter than
+        M_r = -5 fall to MIST's window average (measured 61 -> 3 per 10^6 Msun at
+        [Fe/H] -1), the rest of the bin is untouched, and a bin younger than
+        min_age_yr is not swapped."""
+        import os as _os
+        if not _os.environ.get('MIST_PATH'):
+            self.skipTest('MIST isochrones not available (MIST_PATH)')
+        agb = dict(model='mist', min_age_yr=1e8)
+        base = B.BPASSIsochrone('bin', -1.0, 1e8, 5e8, 'LSST', jitter=False, p_present=0.736)
+        sw = B.BPASSIsochrone('bin', -1.0, 1e8, 5e8, 'LSST', jitter=False, p_present=0.736, agb=agb)
+        info = sw.star_list.agb_info
+        self.assertIsNotNone(info)
+        sl = sw.star_list
+        bp = sl.source == 0
+        region = (sl.h_class == 0) & (sl.log_teff < sl.AGB_LOGT_MAX) & (sl.log_l > info['l_cut'])
+        self.assertFalse((region & bp).any())
+        self.assertTrue((sl.source == 1).any())
+
+        def bright_red(iso):
+            n = np.asarray(iso.star_list.n_per_msun)
+            g, r = np.asarray(iso.mag_table['LSST_g']), np.asarray(iso.mag_table['LSST_r'])
+            return 1e6 * n[(g - r > 0.8) & (r < -5)].sum()
+        self.assertGreater(bright_red(base), 30)
+        self.assertLess(bright_red(sw), 10)
+        # everything outside the region is BPASS's, unchanged
+        b0 = base.star_list
+        out = ~((b0.h_class == 0) & (b0.log_teff < sl.AGB_LOGT_MAX) & (b0.log_l > info['l_cut']))
+        self.assertAlmostEqual(float(b0.n_per_msun[out].sum()), float(sl.n_per_msun[bp].sum()), places=12)
+        y3 = B.BPASSIsochrone('bin', -1.0, 3e7, 1e8, 'LSST', jitter=False, p_present=0.8, agb=agb)
+        self.assertIsNone(y3.star_list.agb_info)
+

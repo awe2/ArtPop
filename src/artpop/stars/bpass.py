@@ -175,7 +175,7 @@ class BPASSStarList:
     n_per_msun : expected number of stars per Msun FORMED in the bin
     """
 
-    def __init__(self, kind, feh, lo_yr, hi_yr, z_sun=0.0142, path=None, imf='imf135_100'):
+    def __init__(self, kind, feh, lo_yr, hi_yr, z_sun=0.0142, path=None, imf='imf135_100', agb=None):
         self.kind, self.feh, self.lo_yr, self.hi_yr = kind, float(feh), float(lo_yr), float(hi_yr)
         self.z = float(z_sun) * 10.0 ** self.feh
         self.z_sun = float(z_sun)
@@ -216,6 +216,82 @@ class BPASSStarList:
         # stars per Msun formed below the L grid (mass only; no light)
         n_g_tot = ng.sum() / 1e6
         self.n_unlisted_per_msun = max(n_g_tot - self.n_per_msun.sum(), 0.0)
+        # 0: a BPASS cell; 1: a MIST AGB row (agb swap; no in-cell jitter)
+        self.source = np.zeros(self.h_class.size, np.int8)
+        self.agb_info = None
+        if agb is not None and self.lo_yr >= float(agb.get('min_age_yr', 1e8)) * (1 - 1e-9):
+            self._swap_agb(agb)
+
+    # -- the AGB swap (2026-10-31) -------------------------------------------
+    AGB_LOGT_MAX = 3.75
+
+    def _swap_agb(self, agb):
+        """
+        The cool, luminous H-rich region of this bin's HR diagram -- log T_eff
+        < `AGB_LOGT_MAX` and log L above the top of MIST's core-He-burning
+        sequence (phase 3) anywhere in the bin's age window -- taken from MIST
+        instead of BPASS: BPASS's rows there are dropped, MIST's isochrone points
+        there are added, averaged over the window at constant SFR (log-age
+        steps of 0.05 dex weighted by dt), per FORMED Msun (MIST's Kroupa IMF,
+        number per living star x living mass per formed Msun).
+
+        Why (ALVISS wiki prior-corner-check 13.52-13.54): at 100-500 Myr BPASS
+        v2.2.1 holds ~15x MIST's luminous (M_r < -5) red giants at every [M/H],
+        in its own SED as in these lists; the real red-knot luminosity function
+        of the farther ELVES dwarfs matches MIST's. A declared empirical
+        substitution of the AGB treatment, the rest of the bin stays BPASS.
+
+        ``agb``: dict(model='mist', min_age_yr=1e8, mist_kw={...MISTIsochrone
+        keywords}, phot_system='LSST' (any: only the physical columns are used),
+        step=0.05).
+        """
+        from .isochrones import MISTIsochrone
+        if agb.get('model', 'mist') != 'mist':
+            raise ValueError(f"agb.model {agb.get('model')!r}: only 'mist'")
+        step = float(agb.get('step', 0.05))
+        lo, hi = np.log10(self.lo_yr), np.log10(self.hi_yr)
+        ages = np.arange(lo + step / 2, hi, step)
+        dt = 10 ** (ages + step / 2) - 10 ** (ages - step / 2)
+        frac = dt / dt.sum()
+        isos = [MISTIsochrone(round(float(a), 4), self.feh, agb.get('phot_system', 'LSST'),
+                              **dict(agb.get('mist_kw') or {})) for a in ages]
+        l_cut = -np.inf
+        for iso in isos:
+            ph = np.asarray(iso._iso_full['phase'], float)
+            m = np.isclose(ph, 3.0)
+            if m.any():
+                l_cut = max(l_cut, float(np.max(np.asarray(iso.log_L, float)[m])))
+        if not np.isfinite(l_cut):
+            raise RuntimeError('agb swap: MIST has no core-He-burning rows in the window')
+        tmax = self.AGB_LOGT_MAX
+        drop = (self.h_class == 0) & (self.log_teff < tmax) & (self.log_l > l_cut)
+        n_drop, l_drop = float(self.n_per_msun[drop].sum()), float(np.sum((self.n_per_msun * 10 ** self.log_l)[drop]))
+        add = dict(log_teff=[], log_l=[], log_g=[], mass=[], n=[])
+        for iso, fr in zip(isos, frac):
+            w = np.asarray(iso.imf_weights('kroupa', m_max_norm=iso.m_max, norm_type='number'), float)
+            mact = np.asarray(iso.mact, float)
+            n = w * float(iso.ssp_surviving_mass('kroupa', add_remnants=False)) / float(np.sum(w * mact)) * fr
+            lt, ll = np.asarray(iso.log_Teff, float), np.asarray(iso.log_L, float)
+            sel = (lt < tmax) & (ll > l_cut) & (n > 0)
+            add['log_teff'].append(lt[sel])
+            add['log_l'].append(ll[sel])
+            add['log_g'].append(np.asarray(iso.log_g, float)[sel])
+            add['mass'].append(mact[sel])
+            add['n'].append(n[sel])
+        add = {k: np.concatenate(v) for k, v in add.items()}
+        keep = ~drop
+        self.h_class = np.concatenate([self.h_class[keep], np.zeros(add['n'].size, np.int8)])
+        self.log_teff = np.concatenate([self.log_teff[keep], add['log_teff']])
+        self.log_l = np.concatenate([self.log_l[keep], add['log_l']])
+        self.log_g = np.concatenate([self.log_g[keep], add['log_g']])
+        self.mass = np.concatenate([self.mass[keep], add['mass']])
+        self.n_per_msun = np.concatenate([self.n_per_msun[keep], add['n']])
+        self.logg_filled = np.concatenate([self.logg_filled[keep], np.zeros(add['n'].size, bool)])
+        self.source = np.concatenate([self.source[keep], np.ones(add['n'].size, np.int8)])
+        self.agb_info = dict(model='mist', l_cut=l_cut, logt_max=tmax, n_ages=int(ages.size),
+                             bpass_rows_dropped=int(drop.sum()), bpass_n_dropped=n_drop, bpass_lbol_dropped=l_drop,
+                             mist_rows_added=int(add['n'].size), mist_n_added=float(add['n'].sum()),
+                             mist_lbol_added=float(np.sum(add['n'] * 10 ** add['log_l'])))
 
     @staticmethod
     def mass_of(log_g, log_l, log_teff):
@@ -247,7 +323,7 @@ class BPASSStarList:
                     lbol_per_msun=self.lbol_per_msun,
                     lbol_by_class=[float(np.sum((n * 10 ** self.log_l)[self.h_class == c]))
                                    for c in range(3)],
-                    n_logg_filled=int(self.logg_filled.sum()))
+                    n_logg_filled=int(self.logg_filled.sum()), agb=self.agb_info)
 
 
 # ----------------------------------------------------------------------------
@@ -285,11 +361,12 @@ class BPASSIsochrone:
     def __init__(self, kind, feh, lo_yr, hi_yr, phot_system, redshift=0.0, a_v_host=0.0,
                  a_v_mw=0.0, r_v=3.1, extinction_law='F99', kcorr_grid=None, kcorr_kw=None,
                  nebular=None, bolometric='teff', cool_giants='marcs', z_sun=0.0142,
-                 jitter=True, path=None, p_present=None):
+                 jitter=True, path=None, p_present=None, agb=None):
         from ..filters import get_filter_names, phot_system_lookup
         from ..nebular import NebularConfig
         from ..nebular import is_active as nebular_active
-        self.star_list = sl = BPASSStarList(kind, feh, lo_yr, hi_yr, z_sun=z_sun, path=path)
+        # agb: BPASSStarList's AGB swap (MIST's cool luminous H-rich rows in bins >= min_age_yr), or None
+        self.star_list = sl = BPASSStarList(kind, feh, lo_yr, hi_yr, z_sun=z_sun, path=path, agb=agb)
         self.kind, self.feh = kind, float(feh)
         self.lo_yr, self.hi_yr = float(lo_yr), float(hi_yr)
         # present-day mass (with remnants) per formed Msun in the caller's
@@ -473,8 +550,10 @@ class BPASSIsochrone:
             return self._jit_cache[1]
         r, u1 = self._rows(x)
         u2 = np.mod(u1 * JITTER_MIX, 1.0)
-        dt = (u1 - 0.5) * 0.1 if self.jitter else 0.0 * u1
-        dl = (u2 - 0.5) * 0.1 if self.jitter else 0.0 * u2
+        # a MIST AGB row (source 1) is a point, not a 0.1 dex cell: never jittered
+        cell = (np.asarray(self.star_list.source)[r] == 0) if self.jitter else np.zeros(r.size, bool)
+        dt = (u1 - 0.5) * 0.1 * cell
+        dl = (u2 - 0.5) * 0.1 * cell
         lt, ll = self.log_Teff[r] + dt, self.log_L[r] + dl
         lg = self.log_g[r] + 4.0 * dt - dl
         mags, _ = self._evaluate(lt, lg, ll, self.h_class[r], self.mact[r]) if x.size else (
