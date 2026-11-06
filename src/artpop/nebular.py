@@ -591,6 +591,60 @@ class MappingsLineTable:
 # as MIST v2.5's BC table and the K table (table v2, ledger S-51) serve it; 2: a
 # blackbody at the row's own Teff (outside C3K's rectangle: > 50 kK, log g > 5.5)
 SOURCE_C3K, SOURCE_C3K_BB, SOURCE_BB = 0, 1, 2
+# 3: TLUSTY 2025 (only with ARTPOP_HOT_STARS=tlusty; the 2026-10-16 evaluation)
+SOURCE_TLUSTY = 3
+# 4-6: the 'full' set (ARTPOP_HOT_STARS=full, 2026-10-29; `artpop.hotstars`)
+SOURCE_POWR_OB, SOURCE_POWR_WN, SOURCE_GOTBERG = 4, 5, 6
+_TLUSTY_BLOCKS = {}
+
+
+def _tlusty_rows(lt, lg, feh):
+    """
+    TLUSTY spectra for the rows inside its hull whose cells have a model at
+    every corner at both bracketing [Z/H] nodes: bilinear in (log g, log Teff),
+    linear in [Z/H], each corner normalised to unit bolometric flux. Returns
+    ``(rows, lam, f_lam)`` or None.
+    """
+    from .kcorrect import TlustyLibrary
+    lib = TlustyLibrary()
+    if lib.root not in _TLUSTY_BLOCKS:
+        blocks = {}
+        for z in lib.feh_grid:
+            g_ax, t_ax, flux = lib.grid(z)
+            f = np.asarray(flux, dtype=float)
+            bol = np.sum(f * _trapz_weights(lib.wave), axis=-1)
+            blocks[float(z)] = f / bol[..., None]
+        _TLUSTY_BLOCKS[lib.root] = (g_ax, t_ax, np.asarray(lib.wave, float), lib.feh_grid, blocks)
+    g_ax, t_ax, lam, zgrid, blocks = _TLUSTY_BLOCKS[lib.root]
+    zf = float(np.clip(feh, zgrid[0], zgrid[-1]))
+    iz = int(np.clip(np.searchsorted(zgrid, zf) - 1, 0, zgrid.size - 2))
+    fz = (zf - zgrid[iz]) / (zgrid[iz + 1] - zgrid[iz])
+    cand = np.flatnonzero((lt >= t_ax[0] - 1e-12) & (lt <= t_ax[-1] + 1e-12)
+                          & (lg >= g_ax[0]) & (lg <= g_ax[-1]))
+    rows, out = [], []
+    for r in cand:
+        ig = int(np.clip(np.searchsorted(g_ax, lg[r]) - 1, 0, g_ax.size - 2))
+        it = int(np.clip(np.searchsorted(t_ax, lt[r]) - 1, 0, t_ax.size - 2))
+        fg = float(np.clip((lg[r] - g_ax[ig]) / (g_ax[ig + 1] - g_ax[ig]), 0, 1))
+        ft = float(np.clip((lt[r] - t_ax[it]) / (t_ax[it + 1] - t_ax[it]), 0, 1))
+        acc = np.zeros(lam.size)
+        good = True
+        for dz, wz in ((0, 1 - fz), (1, fz)):
+            for dg, wg in ((0, 1 - fg), (1, fg)):
+                for dt, wt in ((0, 1 - ft), (1, ft)):
+                    w = wz * wg * wt
+                    if w > 0:
+                        s = blocks[float(zgrid[iz + dz])][ig + dg, it + dt]
+                        if not np.isfinite(s[0]):
+                            good = False
+                            break
+                        acc += w * s
+        if good:
+            rows.append(r)
+            out.append(acc)
+    if not rows:
+        return None
+    return np.array(rows), lam, np.array(out)
 _BB_WAVE = np.geomspace(10.0, 1.0e6, 20000)      # Angstrom
 _SIGMA_SB = 5.670374419e-5                        # erg / s / cm^2 / K^4
 
@@ -625,7 +679,52 @@ def _c3k_block(lib, feh):
     return _C3K_BLOCKS[key]
 
 
-def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
+def _hot_source(family):
+    name = family[0][0] if isinstance(family, tuple) else family
+    return (SOURCE_TLUSTY if name == 'tlusty' else SOURCE_POWR_OB if name.startswith('powr_ob')
+            else SOURCE_POWR_WN if name.startswith('powr_wn') else SOURCE_GOTBERG)
+
+
+def _hot_rows(lt, lg, feh, hot, q_only=False):
+    """The 'full' hot-star set on the rows the router serves: groups of
+    ``(rows, lam, f_lam)`` (unit bolometric flux) and the per-row source.
+    ``q_only`` (2026-10-30): for the staged families, groups ``(rows, None,
+    Q_H / L_bol)`` from `hotstars.family_q` instead of spectra."""
+    from .hotstars import route, families, family_spectra, family_q
+    from .kcorrect import TlustyLibrary
+    hk = dict(hot or {})
+    avail = list(families()) + (['tlusty'] if TlustyLibrary().available else [])
+    plan = route(lt, lg, feh, h_class=hk.get('h_class'), log_l=hk.get('log_l'),
+                 mass=hk.get('mass'), x_h=hk.get('x_h'), available=avail)
+    served = np.zeros(lt.size, dtype=bool)
+    src = np.full(lt.size, -1, dtype=np.int8)
+    groups = []
+    for c in sorted(plan, key=lambda c: c['rank']):
+        keep = ~served[c['rows']]
+        rows, ax2 = c['rows'][keep], c['ax2'][keep]
+        if not rows.size:
+            continue
+        if c['family'] == 'tlusty':
+            hit = _tlusty_rows(lt[rows], ax2, feh)
+            if hit is None:
+                continue
+            ok_rows, lam, f = rows[hit[0]], hit[1], hit[2]
+        elif q_only:
+            q = family_q(c['family'], feh, ax2, lt[rows])
+            ok = np.isfinite(q)
+            ok_rows, lam, f = rows[ok], None, q[ok]
+        else:
+            lam, f = family_spectra(c['family'], feh, ax2, lt[rows])
+            ok = np.isfinite(f).all(axis=1)
+            ok_rows, f = rows[ok], f[ok]
+        if ok_rows.size:
+            groups.append((ok_rows, lam, f))
+            served[ok_rows] = True
+            src[ok_rows] = _hot_source(c['family'])
+    return groups, served, src
+
+
+def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None, hot=None, q_only=False):
     """
     One spectrum per row, **normalised to unit bolometric flux**.
 
@@ -654,6 +753,18 @@ def row_spectra(log_teff, log_g, feh, resolution='c3k_hr', spectra=None):
     t_lo, t_hi = np.log10(C3K_HULL['teff'][0]), np.log10(C3K_HULL['teff'][1])
     in_hull = ((lt >= t_lo) & (lt <= t_hi)
                & (lg >= C3K_HULL['logg'][0]) & (lg <= C3K_HULL['logg'][1]))
+    from .kcorrect import hot_stars_mode
+    if hot_stars_mode() == 'full' or hot is not None:
+        hgroups, served, hsrc = _hot_rows(lt, lg, feh, hot, q_only=q_only)
+        groups.extend(hgroups)
+        source[served] = hsrc[served]
+        in_hull[served] = False
+    elif hot_stars_mode() == 'tlusty':
+        hit = _tlusty_rows(lt, lg, feh)
+        if hit is not None:
+            groups.append(hit)
+            source[hit[0]] = SOURCE_TLUSTY
+            in_hull[hit[0]] = False
     if in_hull.any() and lib.available:
         feh_node = float(lib.feh_grid[np.argmin(np.abs(lib.feh_grid - float(feh)))])
         g_ax, t_ax, lam, flux, to_flam, bol, filled = _c3k_block(lib, feh_node)
@@ -704,7 +815,7 @@ def ionizing_photons_per_erg(lam, f_lam):
 
 
 def ionizing_rate(log_teff, log_g, log_l, feh, resolution='c3k_hr',
-                  spectra=None):
+                  spectra=None, hot=None):
     """
     Hydrogen-ionizing photon rate ``Q_H`` (photons / s) of each row, before
     any capture by the nebula (no knob, no Teff threshold).
@@ -715,9 +826,10 @@ def ionizing_rate(log_teff, log_g, log_l, feh, resolution='c3k_hr',
     ll = np.atleast_1d(np.asarray(log_l, dtype=float))
     q_h = np.zeros(lt.size)
     groups, source = row_spectra(lt, log_g, feh, resolution=resolution,
-                                 spectra=spectra)
+                                 spectra=spectra, hot=hot, q_only=True)
     for idx, lam, f in groups:
-        q_h[idx] = ionizing_photons_per_erg(lam, f) * 10 ** ll[idx] * L_SUN
+        # lam None: a hot-star group already reduced to Q_H / L_bol (hotstars.family_q)
+        q_h[idx] = (f if lam is None else ionizing_photons_per_erg(lam, f)) * 10 ** ll[idx] * L_SUN
     return q_h, source
 
 
@@ -959,9 +1071,11 @@ def young_row_mask(log_age, log_teff, cfg):
 
 def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
                   redshift=0.0, a_v_host=0.0, a_v_mw=0.0, extinction_law='F99',
-                  r_v=3.1, resolution='c3k_hr', spectra=None):
+                  r_v=3.1, resolution='c3k_hr', spectra=None, hot=None):
     """
-    The nebular correction for one isochrone's magnitude columns.
+    The nebular correction for one isochrone's magnitude columns. ``hot``:
+    per-row ``h_class`` / ``log_l`` / ``mass`` for the 'full' hot-star set
+    (`artpop.hotstars.route`); None treats every row as H-rich.
 
     Parameters
     ----------
@@ -995,9 +1109,11 @@ def apply_to_rows(cfg, mags, curves, log_age, feh, log_teff, log_g, log_l,
     info['n_line_rows'] = int((rows & ob).sum()) if k > 0 else 0
     ext = extinction_curve(extinction_law, r_v)
     idx_all = np.flatnonzero(rows)
+    hot_rows = None if hot is None else {
+        key: (np.asarray(v)[rows] if np.ndim(v) else v) for key, v in hot.items()}
     groups, source = row_spectra(np.asarray(log_teff)[rows],
                                  np.asarray(log_g)[rows], feh,
-                                 resolution=resolution, spectra=spectra)
+                                 resolution=resolution, spectra=spectra, hot=hot_rows)
     info['source'][idx_all] = source
 
     # gas: MAPPINGS ratios at (O/H, U, P); Hbeta from each row's Q_H
