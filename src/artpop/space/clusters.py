@@ -33,7 +33,8 @@ import numpy as np
 
 __all__ = ['cluster_weights', 'sample_cmf_to_budget', 'cmf_mass_fraction',
            'complex_scale_pc', 'ring_surface_density', 'ring_disk_offsets',
-           'sersic_disk_offsets', 'disk_to_sky', 'cluster_centres', 'plummer_offsets', 'plummer_stamp',
+           'sersic_disk_offsets', 'cascade_levels', 'cascade_weights', 'cascade_alpha_for_d2', 'cascade_shares', 'cascade_combine', 'cascade_disk_offsets', 'sersic_seed_grid', 'sersic_cell_envelope',
+           'grid_offsets', 'disk_to_sky', 'cluster_centres', 'plummer_offsets', 'plummer_stamp',
            'paint_stamp', 'ClusterSpec', 'KMS_PC_PER_MYR']
 
 # 1 km/s in pc/Myr
@@ -235,6 +236,173 @@ def sersic_disk_offsets(n, r_eff_px, rng, sersic_n=1.0, max_reff=4.0):
     r = float(r_eff_px) * (gammaincinv(k, u) / b_n) ** float(sersic_n)
     phi = rng.uniform(0.0, 2.0 * np.pi, size=n)
     return np.column_stack([r * np.cos(phi), r * np.sin(phi)])
+
+
+def cascade_levels(box_px, min_cell_px, max_levels=11):
+    """Number of 2 x 2 subdivisions of a ``box_px`` square until a cell side is
+    at most ``min_cell_px`` (capped at ``max_levels``: 2048^2 cells)."""
+    if not (box_px > 0 and min_cell_px > 0):
+        return 0
+    return int(np.clip(np.ceil(np.log2(float(box_px) / float(min_cell_px))), 0, max_levels))
+
+
+def cascade_weights(n_levels, alpha, rng, w0=None):
+    """
+    A 2-D multiplicative cascade (2026-10-23, user: young complexes sit in a
+    hierarchy of larger star-forming complexes): a square split into 2 x 2
+    cells, each cell's share of its parent drawn from a symmetric Dirichlet of
+    concentration ``alpha``, and every cell split again with fresh draws, for
+    ``n_levels`` levels. Returns the (2^L, 2^L) cell weights, the product of the
+    shares down the tree (sum 1). Small ``alpha``: a few cells take the light
+    (clumpy); large: smooth. The measure's correlation dimension is
+    D2 = 2 - log2(4 (alpha + 1) / (4 alpha + 1)) (alpha 1.5: 1.49).
+    ``w0`` (ny, nx): start from these seed cells' weights instead of one cell
+    (`sersic_seed_grid`); returns (ny 2^L, nx 2^L).
+    """
+    w = np.ones((1, 1)) if w0 is None else np.asarray(w0, dtype=float)
+    return cascade_combine(w, cascade_shares(n_levels, alpha, rng, w.shape))
+
+
+def cascade_alpha_for_d2(d2):
+    """
+    The symmetric-Dirichlet concentration of a 2 x 2 multiplicative cascade
+    whose measure has correlation dimension ``d2`` (2026-11-10): with shares
+    p ~ Dir(alpha, alpha, alpha, alpha), E[sum p^2] = (alpha + 1) / (4 alpha + 1)
+    = 2^-D2, so alpha = (2^D2 - 1) / (4 - 2^D2). D2 = 2 is the smooth limit
+    (alpha -> inf); D2 1.5 (young stars in the LMC / SMC and LEGUS dwarfs:
+    Sun+2018, Miller+2022, Menon+2021) gives alpha 1.56. Needs 0 < d2 < 2.
+    """
+    d2 = float(d2)
+    if not 0.0 < d2 < 2.0:
+        raise ValueError(f"cascade D2 must be in (0, 2), got {d2}")
+    t = 2.0 ** d2
+    return (t - 1.0) / (4.0 - t)
+
+
+def cascade_shares(n_levels, alpha, rng, shape0=(1, 1)):
+    """
+    The per-level child shares of a 2 x 2 Dirichlet cascade started from a
+    ``shape0`` grid of seed cells: a list of ``n_levels`` arrays, level l of
+    shape (ny 2^l, nx 2^l, 4), the shares of each level-l cell's 4 children
+    (sum 1 per cell). Drawn in the same order as the original loop, so
+    `cascade_weights` is unchanged; kept separately so that some levels can be
+    redrawn while the others are shared (`cascade_combine`).
+    """
+    ny, nx = (int(s) for s in shape0)
+    out = []
+    for lev in range(int(n_levels)):
+        g = rng.gamma(float(alpha), size=(ny * 2 ** lev, nx * 2 ** lev, 4))
+        out.append(g / g.sum(axis=-1, keepdims=True))
+    return out
+
+
+def cascade_combine(w0, shares):
+    """Cell weights (sum 1) of seed weights ``w0`` refined by the per-level
+    ``shares`` (`cascade_shares`): each cell's weight times its children's
+    shares, level by level."""
+    w = np.asarray(w0, dtype=float)
+    for d in shares:
+        sy, sx = w.shape
+        out = np.empty((2 * sy, 2 * sx))
+        out[0::2, 0::2] = w * d[..., 0]
+        out[0::2, 1::2] = w * d[..., 1]
+        out[1::2, 0::2] = w * d[..., 2]
+        out[1::2, 1::2] = w * d[..., 3]
+        w = out
+    return w / w.sum()
+
+
+def cascade_disk_offsets(n, r_eff_px, rng, weights, sersic_n=1.0, max_reff=4.0, envelope=True):
+    """
+    ``n`` centres as disk-plane offsets (pixels) drawn from a cascade
+    (`cascade_weights`) laid on the square [-R, R]^2, R = ``max_reff`` r_eff,
+    which `disk_to_sky` projects onto the rectangle circumscribing the young
+    disc's truncation ellipse. With ``envelope`` (default) each cell's weight is
+    multiplied by the Sersic surface density (index ``sersic_n``) at its centre,
+    cut at ``max_reff`` r_eff, so the cascade reshuffles light within the young
+    disc and its ensemble mean is `sersic_disk_offsets`; without, the cascade
+    alone is the pdf over the box. A cell is drawn by weight, the point uniform
+    inside it.
+    """
+    from scipy.special import gammaincinv
+    n = int(n)
+    if n == 0:
+        return np.zeros((0, 2))
+    w = np.asarray(weights, dtype=float)
+    m = w.shape[0]
+    big_r = float(max_reff) * float(r_eff_px)
+    cell = 2.0 * big_r / m
+    c = -big_r + cell * (np.arange(m) + 0.5)
+    if envelope:
+        k = float(sersic_n)
+        b_n = gammaincinv(2.0 * k, 0.5)
+        rr = np.hypot(c[None, :], c[:, None]) / float(r_eff_px)
+        w = w * np.where(rr <= float(max_reff), np.exp(-b_n * rr ** (1.0 / k)), 0.0)
+    p = w.ravel() / w.sum()
+    idx = rng.choice(p.size, size=n, p=p)
+    iy, ix = np.divmod(idx, m)
+    return np.column_stack([c[ix], c[iy]]) + rng.uniform(-0.5 * cell, 0.5 * cell, size=(n, 2))
+
+
+def sersic_seed_grid(r_eff_px, q, seed_cell_px, sersic_n=1.0, max_reff=2.0):
+    """
+    The seed cells of a Sersic-seeded cascade (2026-10-23, user: "take a Sersic
+    model, create an initial set of square cells that tile the Sersic profile
+    (up to 2 r_e) ... an initial value ... from the Sersic ... at the cell
+    center ... re-normalize to 1"): squares of side ``seed_cell_px`` on the sky,
+    in the frame of the ellipse's major axis, centred on it, covering the
+    ellipse of elliptical radius ``max_reff`` r_eff and axis ratio ``q``; each
+    weighted by the Sersic surface density at its centre (0 for a centre beyond
+    ``max_reff``), summing to 1. Returns the (ny, nx) weights.
+    """
+    from scipy.special import gammaincinv
+    s = float(seed_cell_px)
+    hx = float(max_reff) * float(r_eff_px)
+    nx = 2 * max(int(np.ceil(hx / s)), 1)
+    ny = 2 * max(int(np.ceil(float(q) * hx / s)), 1)
+    cx = (np.arange(nx) + 0.5 - nx / 2) * s
+    cy = (np.arange(ny) + 0.5 - ny / 2) * s
+    rr = np.hypot(cx[None, :], cy[:, None] / float(q)) / float(r_eff_px)
+    k = float(sersic_n)
+    w = np.where(rr <= float(max_reff), np.exp(-gammaincinv(2.0 * k, 0.5) * rr ** (1.0 / k)), 0.0)
+    if not w.sum() > 0:                      # the ellipse inside one cell: the central cells
+        w = np.where(rr <= rr.min() * (1 + 1e-9), 1.0, 0.0)
+    return w / w.sum()
+
+
+def sersic_cell_envelope(shape, cell_px, r_eff_px, q, sersic_n=1.0, max_reff=2.0):
+    """
+    The Sersic surface density (index ``sersic_n``, effective radius
+    ``r_eff_px``, axis ratio ``q``, cut at elliptical radius ``max_reff``
+    r_eff) at the centres of a ``shape`` grid of ``cell_px`` cells centred on 0
+    in the ellipse's major-axis frame (the `grid_offsets` convention). The
+    cascade layout multiplies its FINEST cells by this (2026-11-10): seeding the
+    cascade with Sersic-weighted seed cells instead smears each seed cell's
+    weight uniformly over the cell and moves the mean profile outward (median
+    radius +18 % at seed cell ~ r_eff; test K2).
+    """
+    from scipy.special import gammaincinv
+    ny, nx = (int(s) for s in shape)
+    cx = (np.arange(nx) + 0.5 - nx / 2) * float(cell_px)
+    cy = (np.arange(ny) + 0.5 - ny / 2) * float(cell_px)
+    rr = np.hypot(cx[None, :], cy[:, None] / float(q)) / float(r_eff_px)
+    k = float(sersic_n)
+    return np.where(rr <= float(max_reff), np.exp(-gammaincinv(2.0 * k, 0.5) * rr ** (1.0 / k)), 0.0)
+
+
+def grid_offsets(n, rng, weights, cell_px):
+    """``n`` points from a grid of ``cell_px`` cells centred on 0 (x along the
+    columns): a cell drawn by weight, the point uniform inside it."""
+    n = int(n)
+    if n == 0:
+        return np.zeros((0, 2))
+    w = np.asarray(weights, dtype=float)
+    ny, nx = w.shape
+    idx = rng.choice(w.size, size=n, p=w.ravel() / w.sum())
+    iy, ix = np.divmod(idx, nx)
+    xy = np.column_stack([(ix + 0.5 - nx / 2), (iy + 0.5 - ny / 2)]) * float(cell_px)
+    return xy + rng.uniform(-0.5 * cell_px, 0.5 * cell_px, size=(n, 2))
+
 
 def disk_to_sky(xy_disk, theta_rad, ellip):
     """Disk-plane offsets -> sky offsets (y squashed by 1 - ellip, rotated by theta)."""

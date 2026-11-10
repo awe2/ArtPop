@@ -357,6 +357,37 @@ class ClusteredSersicSP(SersicSP):
         reused site's drift offset is redrawn (up to 20 times, then the
         parent's own site) until it lies inside ``disk_max_reff`` r_eff, so
         reuse cannot carry complexes past the cut. False (default): unchanged.
+        ``'cascade'`` (2026-11-10, user: "re-work our approach to heirarchical
+        modeling. We need more, often smaller sites"; prototype 2026-10-23): the
+        'disk' layout (halo share, disc offset, axis ratio, disc size and n, the
+        cut), but each disc site is drawn from a multiplicative cascade x the
+        young disc's Sersic (a Cox process): square seed cells of
+        ``cascade_seed_cell_pc`` (the outer scale -- above it the density is the
+        smooth Sersic, so the correlation vanishes there) tile the disc out to
+        ``disk_max_reff`` r_eff, each weighted by the disc's Sersic at its centre
+        (`artpop.space.clusters.sersic_seed_grid`), and are split 2 x 2 with
+        Dirichlet(``cascade_alpha``) shares down to ``cascade_min_cell_pc``
+        (`cascade_shares`; D2 = log2((4 alpha + 1) / (alpha + 1))). One cascade
+        per galaxy, shared by the young bins. With ``cascade_age_coeff_myr``
+        (age-separation, Efremov & Elmegreen 1998: dt = A (S / pc)^s), a bin
+        dt older than the youngest keeps the shared shares only at levels whose
+        cells are >= S(dt) = (dt / A)^(1/s) pc and redraws the finer ones, so
+        populations decorrelate on ever larger scales with age. With
+        ``cascade_drift_kms`` every disc site then drifts by a Gaussian of
+        sigma = v t (redrawn inside the cut; site reuse is meant to be off).
+    cascade_alpha, cascade_min_cell_px : float
+        The 'cascade' layout's Dirichlet concentration and finest cell (pixels).
+    cascade_min_cell_pc, cascade_seed_cell_pc : float or None
+        The finest cell and the seed (outer-scale) cell in pc (None: the finest
+        cell in pixels, the seed cell ``cascade_seed_cell_reff`` r_eff).
+    cascade_seed : int or None
+        Seed of the cascade's own random state (None: drawn from the source's).
+    cascade_seed_cell_reff : float
+        The seed cell in r_eff when ``cascade_seed_cell_pc`` is None.
+    cascade_age_coeff_myr, cascade_age_slope : float or None
+        The age-separation relation (None: every bin shares the whole cascade).
+    cascade_drift_kms : float or None
+        The disc sites' drift speed (None / 0: none).
     diffuse_mode : {'sersic', 'complexes'}
         Where the clustered SSPs' ``f_diffuse`` share (its stars and smooth
         light) and the diffuse ionized gas go. ``'sersic'`` (default): on the
@@ -390,7 +421,11 @@ class ClusteredSersicSP(SersicSP):
                  ssp_reff_scale=None, centre_mode='ring', locus_offset_reff=0.75,
                  locus_spread_reff=0.25, diffuse_mode='sersic', diffuse_smooth_reff=0.25,
                  disk_halo_fraction=0.1, disk_offset_pc=0.0, disk_phi=0.0, disk_q_factor=1.0,
-                 disk_max_reff=4.0, disk_reuse_within=False, disk_reff_scale=1.0, disk_sersic_n=None, ssp_profile=None, num_r_eff=10, dx=0, dy=0, labels=None, eta=1.0,
+                 disk_max_reff=4.0, disk_reuse_within=False, disk_reff_scale=1.0, disk_sersic_n=None,
+                 cascade_alpha=1.56, cascade_min_cell_px=1.0, cascade_min_cell_pc=None, cascade_seed_cell_pc=None,
+                 cascade_seed=None,
+                 cascade_seed_cell_reff=0.5, cascade_age_coeff_myr=None, cascade_age_slope=0.33,
+                 cascade_drift_kms=None, ssp_profile=None, num_r_eff=10, dx=0, dy=0, labels=None, eta=1.0,
                  distance_angular=None):
         from .space.clusters import ClusterSpec
         self.cluster_specs = [ClusterSpec.coerce(c) for c in (clusters or [])]
@@ -415,8 +450,25 @@ class ClusteredSersicSP(SersicSP):
             raise ValueError(f'site_reuse must be in [0, 1], got {site_reuse}')
         self.site_s0_pc = float(site_s0_pc)
         self.drift_kms = float(drift_kms)
-        if centre_mode not in ('ring', 'locus', 'disk'):
-            raise ValueError(f"centre_mode must be 'ring', 'locus' or 'disk', got {centre_mode!r}")
+        if centre_mode not in ('ring', 'locus', 'disk', 'cascade'):
+            raise ValueError(f"centre_mode must be 'ring', 'locus', 'disk' or 'cascade', got {centre_mode!r}")
+        self.cascade_alpha = float(cascade_alpha)
+        self.cascade_min_cell_px = float(cascade_min_cell_px)
+        self.cascade_min_cell_pc = None if cascade_min_cell_pc is None else float(cascade_min_cell_pc)
+        self.cascade_seed_cell_pc = None if cascade_seed_cell_pc is None else float(cascade_seed_cell_pc)
+        self.cascade_seed = None if cascade_seed is None else int(cascade_seed)
+        self.cascade_seed_cell_reff = float(cascade_seed_cell_reff)
+        self.cascade_age_coeff_myr = None if cascade_age_coeff_myr is None else float(cascade_age_coeff_myr)
+        self.cascade_age_slope = float(cascade_age_slope)
+        self.cascade_drift_kms = float(cascade_drift_kms or 0.0)
+        if not (self.cascade_alpha > 0 and self.cascade_min_cell_px > 0 and self.cascade_seed_cell_reff > 0
+                and (self.cascade_seed_cell_pc is None or self.cascade_seed_cell_pc > 0)
+                and (self.cascade_min_cell_pc is None or self.cascade_min_cell_pc > 0)
+                and (self.cascade_age_coeff_myr is None or self.cascade_age_coeff_myr > 0)
+                and self.cascade_age_slope > 0 and self.cascade_drift_kms >= 0):
+            raise ValueError('need cascade_alpha, cascade_min_cell_px / _pc, cascade_seed_cell_pc / _reff, '
+                             'cascade_age_coeff_myr and cascade_age_slope > 0, cascade_drift_kms >= 0')
+        self.cascade = None
         if diffuse_mode not in ('sersic', 'complexes'):
             raise ValueError(f"diffuse_mode must be 'sersic' or 'complexes', got {diffuse_mode!r}")
         self.centre_mode = centre_mode
@@ -537,6 +589,33 @@ class ClusteredSersicSP(SersicSP):
         # random stream is untouched)
         if self.centre_mode == 'locus':
             self.locus_phi = float(rng.uniform(0.0, 2.0 * np.pi))
+        disk_like = self.centre_mode in ('disk', 'cascade')
+        n_disk = float(self.xy_kw['n']) if self.disk_sersic_n is None else self.disk_sersic_n
+        s_y = self.disk_reff_scale
+        r_cut = self.disk_max_reff * r_eff_px
+        if self.centre_mode == 'cascade' and specs:
+            # one cascade per galaxy (its own random state): equal seed cells tile the young disc's cut ellipse (a grid
+            # on the sky in the major-axis frame, axis ratio q_disk), each split 2 x 2 down to the finest cell; the
+            # young disc's Sersic (s_y r_eff, its n, the disk_max_reff cut) multiplies the FINEST cells, so the
+            # ensemble mean is that Sersic exactly (test K2); the per-level shares are kept so older bins can redraw
+            # the fine levels
+            from .space.clusters import (cascade_levels, cascade_shares, sersic_seed_grid, sersic_cell_envelope)
+            seed = self.cascade_seed if self.cascade_seed is not None else int(rng.randint(0, 2 ** 31 - 1))
+            seed_px = (self.cascade_seed_cell_pc * ppc if self.cascade_seed_cell_pc is not None
+                       else self.cascade_seed_cell_reff * r_eff_px)
+            min_px = (self.cascade_min_cell_pc * ppc if self.cascade_min_cell_pc is not None
+                      else self.cascade_min_cell_px)
+            q_disk = 1.0 - ellip_disk
+            w0 = np.ones(sersic_seed_grid(r_eff_px * s_y, q_disk, seed_px, n_disk, self.disk_max_reff / s_y).shape)
+            n_lev = cascade_levels(seed_px, min_px)
+            shares = cascade_shares(n_lev, self.cascade_alpha, np.random.RandomState(seed), w0.shape)
+            fine = (w0.shape[0] * 2 ** n_lev, w0.shape[1] * 2 ** n_lev)
+            env = sersic_cell_envelope(fine, seed_px / 2 ** n_lev, r_eff_px * s_y, q_disk, n_disk,
+                                       self.disk_max_reff / s_y)
+            ages = [float(s.age_myr or 0.0) for s in specs if s.n_clusters > 0]
+            self.cascade = dict(w0=w0, env=env, shares=shares, levels=n_lev, seed_px=seed_px,
+                                cell_px=seed_px / 2 ** n_lev, seed=seed, age_min=min(ages) if ages else 0.0,
+                                kept_levels={})
         sig_diff_px = self.diffuse_smooth_reff * r_eff_px
         for si in order:
             spec = specs[si]
@@ -557,6 +636,41 @@ class ClusteredSersicSP(SersicSP):
                     dsk = ~halo
                     disk[dsk] = sersic_disk_offsets(int(dsk.sum()), r_eff_px * s_y, rng,
                                                     n_disk, self.disk_max_reff / s_y)
+            elif self.centre_mode == 'cascade':
+                from .space.clusters import cascade_combine, cascade_shares, grid_offsets
+                cz = self.cascade
+                halo = rng.uniform(size=n_c) < self.disk_halo_fraction
+                sh = cz['shares']
+                keep = len(sh)
+                if self.cascade_age_coeff_myr is not None and age > cz['age_min'] and sh:
+                    # age-separation: decorrelated below S(dt); level l splits cells of side seed_px / 2^l
+                    s_px = ((age - cz['age_min']) / self.cascade_age_coeff_myr) ** (1.0 / self.cascade_age_slope) * ppc
+                    keep = int(sum(cz['seed_px'] / 2 ** lev >= s_px for lev in range(len(sh))))
+                    if keep < len(sh):
+                        fresh = cascade_shares(len(sh), self.cascade_alpha,
+                                               np.random.RandomState((cz['seed'] + 7919 * (si + 1)) % 2 ** 31),
+                                               cz['w0'].shape)
+                        sh = sh[:keep] + fresh[keep:]
+                cz['kept_levels'][int(si)] = keep
+                # the grid is on the sky (major-axis frame): back to the disc plane (y / q_disk)
+                disk = grid_offsets(n_c, rng, cascade_combine(cz['w0'], sh) * cz['env'], cz['cell_px'])
+                disk[:, 1] /= 1.0 - ellip_disk
+                if halo.any():
+                    disk[halo] = sersic_disk_offsets(int(halo.sum()), r_eff_px, rng, float(self.xy_kw['n']),
+                                                     self.disk_max_reff)
+                sig_px = self.cascade_drift_kms * KMS_PC_PER_MYR * age * ppc
+                if sig_px > 0:
+                    # the disc sites drift by v t from where they formed, kept inside the cut
+                    dsk = np.flatnonzero(~halo)
+                    base = disk[dsk].copy()
+                    disk[dsk] = base + rng.normal(0.0, sig_px, size=base.shape)
+                    for _ in range(20):
+                        bad = np.flatnonzero(np.hypot(*disk[dsk].T) > r_cut)
+                        if not bad.size:
+                            break
+                        disk[dsk[bad]] = base[bad] + rng.normal(0.0, sig_px, size=(bad.size, 2))
+                    bad = np.flatnonzero(np.hypot(*disk[dsk].T) > r_cut)
+                    disk[dsk[bad]] = base[bad]
             elif self.centre_mode == 'locus':
                 disk = locus_disk_offsets(n_c, r_eff_px, rng, self.locus_phi,
                                           self.locus_offset_reff, self.locus_spread_reff,
@@ -574,8 +688,7 @@ class ClusteredSersicSP(SersicSP):
                                       self.drift_kms * KMS_PC_PER_MYR * age) * ppc
                     disk[linked] = (site_disk[parent[linked]]
                                     + rng.normal(0.0, sig_px, size=(int(linked.sum()), 2)))
-                    if self.centre_mode == 'disk' and self.disk_reuse_within:
-                        r_cut = self.disk_max_reff * r_eff_px
+                    if disk_like and self.disk_reuse_within:
                         li = np.flatnonzero(linked)
                         for _ in range(20):
                             bad = li[np.hypot(*disk[li].T) > r_cut]
@@ -586,7 +699,7 @@ class ClusteredSersicSP(SersicSP):
                         bad = li[np.hypot(*disk[li].T) > r_cut]
                         disk[bad] = site_disk[parent[bad]]
                     halo[linked] = site_halo[parent[linked]]
-            if self.centre_mode == 'disk':
+            if disk_like:
                 # halo sites on the old light (centred, its q); disc sites on the young disc
                 centres = np.where(halo[:, None], disk_to_sky(disk, self._theta_rad, self._ellip),
                                    disk_to_sky(disk, self._theta_rad, ellip_disk) + off_sky)
@@ -622,7 +735,7 @@ class ClusteredSersicSP(SersicSP):
                     mass=None if spec.masses is None else float(spec.masses[c]),
                     age_myr=spec.age_myr,
                     site=int(parent[c]) if parent[c] < 0 else int(site_ids[parent[c]]),
-                    kind=(('halo' if halo[c] else 'disk') if self.centre_mode == 'disk' else None),
+                    kind=(('halo' if halo[c] else 'disk') if disk_like else None),
                     n_stars=int(members.size),
                     q_h=float(q_star[members].sum() + w_smooth * q_smooth)))
             # diffuse stars on the smoothed layout of this bin's complexes
