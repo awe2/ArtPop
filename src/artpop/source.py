@@ -865,7 +865,12 @@ class ClusteredSersicSP(SersicSP):
                                 st * xx + ct * yy + (xy_dim[1] // 2 + self.xy_kw['dy'])])
 
     def _profile_unit_image(self, shape, label):
-        """SSP ``label``'s tabulated profile on the smooth model's grid, unit sum."""
+        """SSP ``label``'s tabulated profile on the smooth model's grid at unit TOTAL flux.
+
+        Normalised to the profile's analytic total, 2 pi (1 - ellip) r_eff^2 int sigma(x) x dx (2026-11-12), like
+        ``_sersic_unit_image``: the light beyond the grid is lost, not packed into it. (Until 2026-11-12 the image
+        was divided by its own sum, which put an extended profile's out-of-box light back inside the box and
+        reddened the smooth light of extended old bins relative to the Sersic path.)"""
         key = ('profile', int(label), tuple(shape))
         if key not in self._cache:
             x, sig = self.ssp_profile[label]
@@ -876,9 +881,12 @@ class ClusteredSersicSP(SersicSP):
             ct, st = np.cos(th), np.sin(th)
             xm = (xx - x0) * ct + (yy - y0) * st
             xn = -(xx - x0) * st + (yy - y0) * ct
-            z = np.hypot(xm, xn / (1.0 - ell)) / float(mdl.r_eff.value)
+            r_eff = float(mdl.r_eff.value)
+            z = np.hypot(xm, xn / (1.0 - ell)) / r_eff
             img = np.interp(z, x, sig, right=0.0)
-            tot = img.sum()
+            xs, ss = np.asarray(x, float), np.asarray(sig, float)
+            tot = 2.0 * np.pi * (1.0 - ell) * r_eff ** 2 * float(np.sum(0.5 * (ss[1:] * xs[1:] + ss[:-1] * xs[:-1])
+                                                                          * np.diff(xs)))
             self._cache[key] = img / tot if tot > 0 else img
         return self._cache[key]
 
