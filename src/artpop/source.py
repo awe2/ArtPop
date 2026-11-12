@@ -400,6 +400,10 @@ class ClusteredSersicSP(SersicSP):
         weighted by their captured photons ``q_h``, smoothed the same way. A
         source without complexes (or without ``q_h`` for the DIG) keeps the
         Sersic.
+    diffuse_stars_mode : {None, 'sersic', 'complexes'}
+        (2026-11-12, ALVISS: "moving young list off the halo and into the cascade") where the clustered SSPs'
+        ``f_diffuse`` STARS and their smooth light go, independently of the diffuse ionized gas, which keeps
+        ``diffuse_mode``. None (default): follow ``diffuse_mode`` (the pre-feature behaviour, bit-identical).
     diffuse_smooth_reff : float
         The smoothing Gaussian's sigma, in r_eff.
     ssp_profile : dict or None
@@ -420,6 +424,7 @@ class ClusteredSersicSP(SersicSP):
                  site_reuse=0.0, site_s0_pc=20.0, drift_kms=5.0, width_out_reff=None,
                  ssp_reff_scale=None, centre_mode='ring', locus_offset_reff=0.75,
                  locus_spread_reff=0.25, diffuse_mode='sersic', diffuse_smooth_reff=0.25,
+                 diffuse_stars_mode=None,
                  disk_halo_fraction=0.1, disk_offset_pc=0.0, disk_phi=0.0, disk_q_factor=1.0,
                  disk_max_reff=4.0, disk_reuse_within=False, disk_reff_scale=1.0, disk_sersic_n=None,
                  cascade_alpha=1.56, cascade_min_cell_px=1.0, cascade_min_cell_pc=None, cascade_seed_cell_pc=None,
@@ -475,6 +480,10 @@ class ClusteredSersicSP(SersicSP):
         self.locus_offset_reff = float(locus_offset_reff)
         self.locus_spread_reff = float(locus_spread_reff)
         self.diffuse_mode = diffuse_mode
+        if diffuse_stars_mode not in (None, 'sersic', 'complexes'):
+            raise ValueError(f"diffuse_stars_mode must be None, 'sersic' or 'complexes', not {diffuse_stars_mode!r}")
+        # the stars' placement; the DIG keeps diffuse_mode
+        self.diffuse_stars_mode = diffuse_mode if diffuse_stars_mode is None else diffuse_stars_mode
         self.diffuse_smooth_reff = float(diffuse_smooth_reff)
         if not (0.0 <= self.locus_offset_reff < self.max_reff and self.locus_spread_reff > 0
                 and self.diffuse_smooth_reff > 0):
@@ -740,7 +749,7 @@ class ClusteredSersicSP(SersicSP):
                     q_h=float(q_star[members].sum() + w_smooth * q_smooth)))
             # diffuse stars on the smoothed layout of this bin's complexes
             diffuse = idx[comp == 0]
-            if self.diffuse_mode == 'complexes' and n_c > 0 and diffuse.size:
+            if self.diffuse_stars_mode == 'complexes' and n_c > 0 and diffuse.size:
                 w = np.asarray(spec.weights, dtype=float)
                 host = rng.choice(n_c, size=diffuse.size, p=w / w.sum())
                 for c in np.unique(host):
@@ -944,7 +953,7 @@ class ClusteredSersicSP(SersicSP):
             s_lab = self.ssp_reff_scale.get(label, 1.0)
             share = flux if spec is None else spec.f_diffuse * flux
             layout = (self._layout_unit_image(shape, label)
-                      if spec is not None and self.diffuse_mode == 'complexes' else None)
+                      if spec is not None and self.diffuse_stars_mode == 'complexes' else None)
             if layout is not None:
                 stars = stars + share * layout
             elif label in self.ssp_profile:
