@@ -1,4 +1,5 @@
 # Standard library
+import os
 from copy import deepcopy
 
 # Third-party
@@ -799,21 +800,73 @@ class ClusteredSersicSP(SersicSP):
             paint_stamp(image, kern, kern.shape[0] // 2, cl['x'], cl['y'], s)
         return image
 
+    def _paint_complexes(self, shape):
+        """Paint every complex's Plummer stamp, computed ONCE, into each image
+        that uses it (2026-11-16: ~80 % of a v1 render was these stamps, each
+        computed 2-3x, once per image). The images, all band-independent:
+
+        - ``('unit', label)``: SSP ``label``'s complexes x ``smooth_weight``;
+        - ``('layout_raw', label)``: its complexes x weight / sum (only with
+          ``diffuse_stars_mode='complexes'``);
+        - ``('layout_raw', None)``: every complex x q_h / sum, the DIG (only
+          with ``diffuse_mode='complexes'``).
+
+        Each image sees the same weights and the same painting order (the
+        order of ``self.clusters``) as when it was painted on its own, so the
+        result is bit-identical; the Gaussian of the layouts is applied when
+        one is asked for (`_layout_unit_image`)."""
+        from .space.clusters import plummer_stamp, paint_stamp
+        done = ('painted', tuple(shape))
+        if done in self._cache:
+            return
+        targets = {}                 # complex index -> [(image key, weight)]
+        imgs = {}
+
+        def add(key, idx, wts):
+            for i, wc in zip(idx, wts):
+                if not wc > 0:
+                    continue
+                if key not in imgs:
+                    imgs[key] = np.zeros(shape)
+                targets.setdefault(i, []).append((key, wc))
+
+        labels = sorted({int(c['label']) for c in self.clusters})
+        for label in labels:
+            idx = [i for i, c in enumerate(self.clusters) if c['label'] == label]
+            add(('unit', label), idx, [self.clusters[i]['smooth_weight'] for i in idx])
+            imgs.setdefault(('unit', label), np.zeros(shape))
+        lay = []
+        if self.diffuse_stars_mode == 'complexes':
+            lay += [(label, [i for i, c in enumerate(self.clusters) if c['label'] == label])
+                    for label in labels]
+        if self.diffuse_mode == 'complexes':
+            lay.append((None, list(range(len(self.clusters)))))
+        for label, idx in lay:
+            w = np.array([self.clusters[i]['weight'] if label is not None else self.clusters[i]['q_h']
+                          for i in idx], dtype=float)
+            if not idx or not np.sum(w) > 0:
+                self._cache[('layout', label, tuple(shape))] = None
+                continue
+            add(('layout_raw', label), idx, w / w.sum())
+        for i, cl in enumerate(self.clusters):
+            if i not in targets:
+                continue
+            ix, iy = np.floor(cl['x'] + 0.5), np.floor(cl['y'] + 0.5)
+            stamp, half = plummer_stamp(cl['a_px'], cl['x'] - ix, cl['y'] - iy, max_half=max(shape))
+            for key, wc in targets[i]:
+                paint_stamp(imgs[key], stamp, half, cl['x'], cl['y'], wc)
+        for (kind, label), img in imgs.items():
+            self._cache[(kind, label, tuple(shape))] = img
+        self._cache[done] = True
+
     def _cluster_unit_image(self, label, shape):
         """Sum over the complexes of SSP ``label`` of smooth_weight x its
         Plummer stamp: band-independent, so built once per source and shape."""
-        from .space.clusters import plummer_stamp, paint_stamp
         key = ('unit', int(label), tuple(shape))
         if key not in self._cache:
-            img = np.zeros(shape)
-            for cl in self.clusters:
-                if cl['label'] != label or not cl['smooth_weight'] > 0:
-                    continue
-                ix, iy = np.floor(cl['x'] + 0.5), np.floor(cl['y'] + 0.5)
-                stamp, half = plummer_stamp(cl['a_px'], cl['x'] - ix, cl['y'] - iy,
-                                            max_half=max(shape))
-                paint_stamp(img, stamp, half, cl['x'], cl['y'], cl['smooth_weight'])
-            self._cache[key] = img
+            self._paint_complexes(shape)
+        if key not in self._cache:               # a label with no complex
+            self._cache[key] = np.zeros(shape)
         return self._cache[key]
 
     def _layout_unit_image(self, shape, label=None):
@@ -824,25 +877,37 @@ class ClusteredSersicSP(SersicSP):
         ``diffuse_smooth_reff`` r_eff; light beyond the frame is lost, as the
         Sersic's is. None when there is nothing to weight."""
         from scipy.ndimage import gaussian_filter
-        from .space.clusters import plummer_stamp, paint_stamp
         key = ('layout', label, tuple(shape))
         if key not in self._cache:
-            cls = [c for c in self.clusters if (c['label'] == label if label is not None else True)]
-            w = np.array([c['weight'] if label is not None else c['q_h'] for c in cls], dtype=float)
-            if not cls or not np.sum(w) > 0:
+            self._paint_complexes(shape)
+        if key not in self._cache:
+            raw = self._cache.pop(('layout_raw', label, tuple(shape)), None)
+            if raw is None:
+                # not painted by _paint_complexes (its mode is off): paint it alone, as before
+                raw = self._paint_layout_alone(shape, label)
+            if raw is None:
                 self._cache[key] = None
             else:
-                img = np.zeros(shape)
-                for cl, wc in zip(cls, w / w.sum()):
-                    if not wc > 0:
-                        continue
-                    ix, iy = np.floor(cl['x'] + 0.5), np.floor(cl['y'] + 0.5)
-                    stamp, half = plummer_stamp(cl['a_px'], cl['x'] - ix, cl['y'] - iy,
-                                                max_half=max(shape))
-                    paint_stamp(img, stamp, half, cl['x'], cl['y'], wc)
                 sig = self.diffuse_smooth_reff * self._r_eff_kpc * 1e3 * self.px_per_pc
-                self._cache[key] = gaussian_filter(img, sig, mode='constant')
+                self._cache[key] = gaussian_filter(raw, sig, mode='constant')
         return self._cache[key]
+
+    def _paint_layout_alone(self, shape, label):
+        """One layout painted on its own (the pre-2026-11-16 path), for a mode
+        `_paint_complexes` did not anticipate."""
+        from .space.clusters import plummer_stamp, paint_stamp
+        cls = [c for c in self.clusters if (c['label'] == label if label is not None else True)]
+        w = np.array([c['weight'] if label is not None else c['q_h'] for c in cls], dtype=float)
+        if not cls or not np.sum(w) > 0:
+            return None
+        img = np.zeros(shape)
+        for cl, wc in zip(cls, w / w.sum()):
+            if not wc > 0:
+                continue
+            ix, iy = np.floor(cl['x'] + 0.5), np.floor(cl['y'] + 0.5)
+            stamp, half = plummer_stamp(cl['a_px'], cl['x'] - ix, cl['y'] - iy, max_half=max(shape))
+            paint_stamp(img, stamp, half, cl['x'], cl['y'], wc)
+        return img
 
     def _galaxy_r_eff_px(self):
         """The galaxy's r_eff in position (xy_dim) pixels, as sersic_xy computes it."""

@@ -457,9 +457,13 @@ def plummer_stamp(a_px, frac_x=0.0, frac_y=0.0, extent=_PLUMMER_EXTENT, oversamp
         half = int(max_half)
     n = 2 * half + 1
     sub = (np.arange(n * oversample) + 0.5) / oversample - (half + 0.5)
-    yy, xx = np.meshgrid(sub - frac_y, sub - frac_x, indexing='ij')
-    prof = (1.0 + (xx ** 2 + yy ** 2) / a ** 2) ** -2
-    prof[(xx ** 2 + yy ** 2) > (extent * a) ** 2] = 0.0
+    # broadcast (row, column) offsets instead of two dense meshgrid copies: the same
+    # element-wise arithmetic, so the stamp is bit-identical (2026-11-16, render cost)
+    yy = (sub - frac_y)[:, None]
+    xx = (sub - frac_x)[None, :]
+    r2 = xx ** 2 + yy ** 2
+    prof = (1.0 + r2 / a ** 2) ** -2
+    prof[r2 > (extent * a) ** 2] = 0.0
     stamp = prof.reshape(n, oversample, n, oversample).sum(axis=(1, 3))
     if cut:
         # surface density (1 + R^2/a^2)^-2 / (pi a^2) per unit area, sub-pixel
